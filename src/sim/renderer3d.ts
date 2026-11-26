@@ -22,12 +22,15 @@ import {
   createSurfacePropMesh,
 } from './models3d';
 import { FormicariumEnvironment3D } from './terrain3d';
+import { resetLegs } from './legs';
 import {
   AntCaste,
   BroodStage,
   CELL_SIZE,
   GRID_W,
   PayloadType,
+  WORLD_H,
+  WORLD_W,
 } from './types';
 
 // Pre-allocated math helpers (zero GC inside frame loop)
@@ -44,6 +47,7 @@ const _upHead = new THREE.Vector3();
 const _posTail = new THREE.Vector3();
 const _upTail = new THREE.Vector3();
 const _deltaVec = new THREE.Vector3();
+const _footUp = new THREE.Vector3();
 const _tfOut = {
   x: 0,
   y: 0,
@@ -87,6 +91,14 @@ export class Formicarium3DRenderer {
   private readonly bank: MaterialBank;
   private readonly geo: GeometryBank;
   private readonly env3d: FormicariumEnvironment3D;
+  private groundSim: AntColonySimulation | null = null;
+  /** Terrain sampler handed to the procedural leg solver: world point -> nearest surface contact point. */
+  private readonly sampleGround = (wx: number, wy: number, wz: number, out: THREE.Vector3): void => {
+    if (!this.groundSim) return;
+    const sx = wx / WORLD_SCALE + WORLD_W * 0.5;
+    const sy = WORLD_H * 0.5 - wy / WORLD_SCALE;
+    this.env3d.sampleSurfaceContact(this.groundSim, sx, sy, wz, out, _footUp);
+  };
   private readonly envMapTex: THREE.Texture;
 
   private readonly sunLight: THREE.DirectionalLight;
@@ -473,13 +485,25 @@ export class Formicarium3DRenderer {
       const tf = this.compute3DSurfaceTransform(sim, ant.x, ant.y, ant.angle, effectiveZ, probeDist);
       _targetPos.set(tf.x, tf.y, tf.z);
 
+      let justSnapped = false;
       if (!rig.hasInitPos || rig.smoothPos.distanceToSquared(_targetPos) > 2.25) {
         rig.smoothPos.copy(_targetPos);
         rig.hasInitPos = true;
+        justSnapped = true;
       } else {
         rig.smoothPos.lerp(_targetPos, posBlend);
       }
       rig.root.position.copy(rig.smoothPos);
+
+      // Body world velocity (low-passed) drives stride length / swing speed of the planted-foot leg solver.
+      if (justSnapped) {
+        rig.worldVel.set(0, 0, 0);
+        resetLegs(rig.legSet);
+      } else if (dt > 1e-4) {
+        _deltaVec.subVectors(rig.smoothPos, rig.prevWorldPos).multiplyScalar(1 / dt);
+        rig.worldVel.lerp(_deltaVec, Math.min(1, dt * 14));
+      }
+      rig.prevWorldPos.copy(rig.smoothPos);
 
       if (!rig.hasInitOrientation) {
         rig.currentQuat.copy(tf.quat);
@@ -495,7 +519,8 @@ export class Formicarium3DRenderer {
       rig.smoothTailYaw += (tf.tailYaw - rig.smoothTailYaw) * flexBlend;
       rig.smoothBodyDip += (tf.bodyDip - rig.smoothBodyDip) * flexBlend;
 
-      animateAntRig(rig, ant, sim.simTime, this.bank);
+      this.groundSim = sim;
+      animateAntRig(rig, ant, sim.simTime, this.bank, dt, rig.worldVel, this.sampleGround);
     }
 
     for (const [id, rig] of this.antRigs) {

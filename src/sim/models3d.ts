@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { createLegSet, updateLegs, type GroundSampler, type Leg, type LegSet } from './legs';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { MaterialBank, WORLD_SCALE } from './materials3d';
 import { Ant, AntCaste, AntTask, Intruder, PayloadType, PlantSprout, SurfaceProp } from './types';
@@ -195,14 +196,6 @@ export function createGeometryBank(): GeometryBank {
   };
 }
 
-interface LegPivot {
-  hip: THREE.Group;
-  knee: THREE.Group;
-  side: -1 | 1;
-  index: 0 | 1 | 2;
-  baseYaw: number;
-}
-
 export interface AntRig {
   root: THREE.Group;
   bodyGroup: THREE.Group;
@@ -217,7 +210,7 @@ export interface AntRig {
   rightMandible: THREE.Mesh;
   leftAntenna: THREE.Group;
   rightAntenna: THREE.Group;
-  legs: LegPivot[];
+  legSet: LegSet;
   payloadGroup: THREE.Group;
   payloadMeshes: Record<number, THREE.Object3D>;
   caste: AntCaste;
@@ -236,6 +229,9 @@ export interface AntRig {
   smoothHeadYaw: number;
   smoothTailYaw: number;
   smoothBodyDip: number;
+  /** smoothed world-space body velocity (units/s) used by the leg solver */
+  worldVel: THREE.Vector3;
+  prevWorldPos: THREE.Vector3;
 }
 
 export function createAntRig(
@@ -394,42 +390,42 @@ export function createAntRig(
   const rightAntenna = makeAntenna(1);
   headGroup.add(leftAntenna, rightAntenna);
 
-  // 8. Six Articulated 2-Segment Legs
-  const legs: LegPivot[] = [];
+  // 8. Six procedurally-stepped legs (femur / tibia / tarsus). Posed every frame by the IK foot-planting solver.
+  const legSet = createLegSet();
   const legAttachX = [0.045, 0.01, -0.025];
-  const baseYaws = [0.55, 0.0, -0.58];
-  const legReach = [0.068, 0.072, 0.088];
+  const legRestX = [0.082, 0.012, -0.066];
+  const legRestZ = [0.074, 0.088, 0.082];
+  const femurLen = [0.057, 0.06, 0.066];
+  const tibiaLen = [0.06, 0.064, 0.076];
+  const tarsusLen = [0.024, 0.026, 0.03];
 
   for (let idx = 0; idx < 3; idx++) {
     for (const side of [-1, 1] as const) {
-      const hip = new THREE.Group();
-      hip.position.set(legAttachX[idx], -0.005, side * 0.022);
-      hip.rotation.y = side * baseYaws[idx];
-      bodyGroup.add(hip);
-
       const femur = new THREE.Mesh(geo.cyl6, bank.antLeg);
-      femur.scale.set(0.0055, legReach[idx] * 0.55, 0.0055);
-      femur.rotation.x = side * 0.85;
-      femur.position.set(0, 0.012, side * legReach[idx] * 0.22);
-      hip.add(femur);
-
-      const knee = new THREE.Group();
-      knee.position.set(0, 0.022, side * legReach[idx] * 0.44);
-      hip.add(knee);
-
       const tibia = new THREE.Mesh(geo.cyl6, bank.antLeg);
-      tibia.scale.set(0.004, legReach[idx] * 0.72, 0.004);
-      tibia.rotation.x = side * 0.35;
-      tibia.position.set(0, -0.034, side * 0.014);
-      knee.add(tibia);
-
-      legs.push({
-        hip,
-        knee,
+      const tarsus = new THREE.Mesh(geo.cyl6, bank.antLeg);
+      bodyGroup.add(femur, tibia, tarsus);
+      // Tripod A = (L0, R1, L2); tripod B = (R0, L1, R2)
+      const groupA = (side === -1 && idx !== 1) || (side === 1 && idx === 1);
+      const leg: Leg = {
         side,
         index: idx as 0 | 1 | 2,
-        baseYaw: side * baseYaws[idx],
-      });
+        group: groupA ? 0 : 1,
+        hip: new THREE.Vector3(legAttachX[idx], -0.005, side * 0.02),
+        restX: legRestX[idx],
+        restZ: side * legRestZ[idx],
+        femurLen: femurLen[idx],
+        tibiaLen: tibiaLen[idx],
+        tarsusLen: tarsusLen[idx],
+        femur,
+        tibia,
+        tarsus,
+        foot: new THREE.Vector3(),
+        stepFrom: new THREE.Vector3(),
+        stepT: -1,
+        stepDur: 0.1,
+      };
+      legSet.legs.push(leg);
     }
   }
 
@@ -499,7 +495,7 @@ export function createAntRig(
     rightMandible,
     leftAntenna,
     rightAntenna,
-    legs,
+    legSet,
     payloadGroup,
     payloadMeshes,
     caste,
@@ -518,10 +514,20 @@ export function createAntRig(
     smoothHeadYaw: 0,
     smoothTailYaw: 0,
     smoothBodyDip: 0,
+    worldVel: new THREE.Vector3(),
+    prevWorldPos: new THREE.Vector3(),
   };
 }
 
-export function animateAntRig(rig: AntRig, ant: Ant, time: number, bank: MaterialBank): void {
+export function animateAntRig(
+  rig: AntRig,
+  ant: Ant,
+  time: number,
+  bank: MaterialBank,
+  dt = 1 / 60,
+  worldVel?: THREE.Vector3,
+  ground?: GroundSampler
+): void {
   // Update callow -> mature coloration seamlessly when callow timer expires
   if (rig.isCallow !== ant.isCallow) {
     rig.isCallow = ant.isCallow;
@@ -534,23 +540,6 @@ export function animateAntRig(rig: AntRig, ant: Ant, time: number, bank: Materia
       rig.gaster.material = bank.callowBody;
       rig.gasterTip.material = bank.callowBody;
     }
-  }
-
-  const speed = Math.hypot(ant.vx, ant.vy);
-  const moving = speed > 1.5;
-  const tripodPhase = ant.gaitPhase;
-
-  // Alternating tripod gait: (L0, R1, L2) vs (R0, L1, R2) + subtle leg reach adaptation to curvature
-  for (const leg of rig.legs) {
-    const groupA = (leg.side === -1 && leg.index !== 1) || (leg.side === 1 && leg.index === 1);
-    const p = tripodPhase + (groupA ? 0 : Math.PI);
-    const swing = moving ? Math.sin(p) * 0.42 : Math.sin(time * 2 + ant.id + leg.index) * 0.04;
-    const lift = moving ? Math.max(0, Math.cos(p)) * 0.28 : 0;
-    const slopeReach = leg.index === 0 ? rig.smoothHeadPitch * 0.28 : leg.index === 2 ? -rig.smoothTailPitch * 0.28 : 0;
-
-    leg.hip.rotation.y = leg.baseYaw + swing * leg.side;
-    leg.hip.rotation.x = (lift - slopeReach) * leg.side;
-    leg.knee.rotation.x = (-lift * 0.65 + slopeReach * 0.5) * leg.side;
   }
 
   // Antennae sweep faster during social greeting, trophallaxis, food signaling, or defending
@@ -589,6 +578,9 @@ export function animateAntRig(rig: AntRig, ant: Ant, time: number, bank: Materia
   rig.petiolePivot.rotation.y = rig.smoothTailYaw * 0.45;
   rig.gasterPivot.rotation.z = rig.smoothTailPitch * 0.52 + gasterBob;
   rig.gasterPivot.rotation.y = rig.smoothTailYaw * 0.55;
+
+  // Legs last: they depend on the final body pose (root transform, body dip) this frame.
+  if (ground && worldVel) updateLegs(rig.legSet, rig.bodyGroup, worldVel, dt, ground);
 
   // Sync visible 3D payload
   for (const key in rig.payloadMeshes) {
