@@ -232,6 +232,8 @@ export interface AntRig {
   /** smoothed world-space body velocity (units/s) used by the leg solver */
   worldVel: THREE.Vector3;
   prevWorldPos: THREE.Vector3;
+  /** smoothed ratio of 3D surface path length to 2D sim distance (fed back to the sim to slow corner turns) */
+  stretch: number;
 }
 
 export function createAntRig(
@@ -516,6 +518,7 @@ export function createAntRig(
     smoothBodyDip: 0,
     worldVel: new THREE.Vector3(),
     prevWorldPos: new THREE.Vector3(),
+    stretch: 1,
   };
 }
 

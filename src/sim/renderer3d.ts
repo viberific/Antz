@@ -49,6 +49,7 @@ const _upTail = new THREE.Vector3();
 const _deltaVec = new THREE.Vector3();
 const _footUp = new THREE.Vector3();
 const _tfOut = {
+  stretch: 1,
   x: 0,
   y: 0,
   z: 0,
@@ -379,8 +380,12 @@ export class Formicarium3DRenderer {
     const vx = dirX;
     const vy = -dirY;
 
-    // Build orthonormal basis where +X = projected forward along surface, +Y = continuous normal, +Z = right
-    _fwd.set(vx, vy, 0);
+    // Build orthonormal basis where +X = projected forward along surface, +Y = continuous normal, +Z = right.
+    // Forward follows the *actual walking path over the surface* (head probe minus tail probe), not the flat 2D
+    // heading: walking off a tunnel wall is heading along that wall's normal, which projects to nothing and used to
+    // make ants spin as they went around the corner onto the back wall.
+    _fwd.subVectors(_posHead, _posTail);
+    if (_fwd.lengthSq() < 4e-4) _fwd.set(vx, vy, 0);
     const dot = _fwd.dot(_avgUp);
     _fwd.addScaledVector(_avgUp, -dot);
 
@@ -447,6 +452,8 @@ export class Formicarium3DRenderer {
     _tfOut.headSide = headSide;
     _tfOut.tailSide = tailSide;
     _tfOut.bodyDip = bodyDip;
+    // 3D length of the surface chord head->tail over the 2D distance it spans: >1 around corners / on steep faces
+    _tfOut.stretch = _posHead.distanceTo(_posTail) / Math.max(1e-6, 2 * probeSimDist * WORLD_SCALE);
     return _tfOut;
   }
 
@@ -495,6 +502,14 @@ export class Formicarium3DRenderer {
         rig.smoothPos.lerp(_targetPos, posBlend);
       }
       rig.root.position.copy(rig.smoothPos);
+
+      // How much longer the 3D route over the surface is than the 2D sim step that produced it (>1 when rolling
+      // around a tunnel corner onto the back wall, or climbing steeply). Measured from the geometry just ahead and
+      // behind the ant, so it reacts before the ant reaches the corner. The sim slows the ant by this factor so it
+      // walks the longer route at a natural pace instead of rocketing around the corner.
+      const targetStretch = justSnapped ? 1 : clamp(tf.stretch, 1, 4);
+      rig.stretch += (targetStretch - rig.stretch) * Math.min(1, dt * 20);
+      ant.surfaceStretch = rig.stretch;
 
       // Body world velocity (low-passed) drives stride length / swing speed of the planted-foot leg solver.
       if (justSnapped) {

@@ -2735,7 +2735,8 @@ export class AntColonySimulation {
 
     const speedFactor = ant.payload !== PayloadType.NONE ? 0.84 : 1.0;
     const pace = this.updatePace(ant, dt, turnErr);
-    const stepDist = ant.speed * speedFactor * pace * dt;
+    // Rolling around a tunnel corner onto the back wall is a much longer walk in 3D than in the 2D sim: slow down to match.
+    const stepDist = (ant.speed * speedFactor * pace * dt) / clamp(ant.surfaceStretch ?? 1, 1, 3.5);
 
     let nx = ant.x + Math.cos(ant.angle) * stepDist;
     let ny = ant.y + Math.sin(ant.angle) * stepDist;

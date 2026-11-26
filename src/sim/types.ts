@@ -134,6 +134,8 @@ export interface Ant {
   restCooldown?: number;
   /** chamber an ant is walking to in order to rest */
   restChamberId?: number;
+  /** >=1: how much longer the rendered 3D walking route is than the 2D sim step (set by the renderer) */
+  surfaceStretch?: number;
 }
 
 export interface BroodItem {
