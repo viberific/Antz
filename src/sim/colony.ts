@@ -1304,9 +1304,11 @@ export class AntColonySimulation {
       }
 
       const overlap = minDist - dist;
-      const push = Math.min(2.6, overlap * strength * Math.min(1, dt * 18));
+      // Keep the shove well below walking speed (~37 u/s) so a few neighbours can never pin an ant in place;
+      // ants should ease around each other (tangential dodge) rather than get bulldozed backwards.
+      const push = Math.min(0.9 * dt * 60, overlap * strength * Math.min(1, dt * 18));
       const sign = a.id < b.id ? 1 : -1;
-      const dodge = allowDodge ? push * 0.55 * sign : 0;
+      const dodge = allowDodge ? push * 0.9 * sign : 0;
 
       const ax = a.x - dx * push - dy * dodge;
       const ay = a.y - dy * push + dx * dodge;
@@ -1926,7 +1928,17 @@ export class AntColonySimulation {
     ant.stateTimer -= dt;
     if (pL > 0.05 || pR > 0.05) {
       ant.task = AntTask.FOLLOWING_FOOD_TRAIL;
-      const dir = pR > pL ? 1 : -1;
+      // Commit to a direction for a while. Re-deciding every tick made ants flip left/right and shuffle in place
+      // wherever both sides smelled alike (old, fading trails around food that was already carried off).
+      ant.trailCommit = (ant.trailCommit ?? 0) - dt;
+      if (ant.trailDir === undefined || ant.trailCommit <= 0) {
+        const hi = Math.max(pL, pR);
+        const clearlyRight = pR > pL + hi * 0.15;
+        const clearlyLeft = pL > pR + hi * 0.15;
+        ant.trailDir = clearlyRight ? 1 : clearlyLeft ? -1 : Math.cos(ant.angle) >= 0 ? 1 : -1;
+        ant.trailCommit = 1.2 + Math.random() * 1.4;
+      }
+      const dir = ant.trailDir;
       const tx = clamp(ant.x + dir * 34, CASE_LEFT + 28, CASE_RIGHT - 28);
       const gx = clamp(Math.floor(tx / CELL_SIZE), 0, GRID_W - 1);
       ant.targetPos = { x: tx, y: this.grid.surfaceY[gx] - 2 };
@@ -2414,6 +2426,40 @@ export class AntColonySimulation {
     }
   }
 
+  /**
+   * If the ant is blocked by a wall in its direction of travel and the face is climbable (open space overhead
+   * and an open cell beside the wall top within `MAX_CLIMB_CELLS`), returns the y to crawl up to; else null.
+   */
+  private findFaceClimb(
+    ant: Ant,
+    stepDist: number,
+    moveTarget: Vec2 | null,
+    isOpen: (px: number, py: number) => boolean
+  ): number | null {
+    const MAX_CLIMB_CELLS = 3;
+    // Don't climb away from a goal that is mostly *below* us (e.g. a path heading down a shaft);
+    // a goal that is mostly sideways with a wall in between is exactly when we should climb.
+    if (moveTarget) {
+      const dy = moveTarget.y - ant.y;
+      if (dy > CELL_SIZE && dy > Math.abs(moveTarget.x - ant.x)) return null;
+    }
+    const heading = Math.cos(ant.angle);
+    if (Math.abs(heading) < 0.25) return null; // mostly vertical travel: normal vertical logic handles it
+    const dirX = heading >= 0 ? 1 : -1;
+    const cg = this.grid.worldToGrid(ant.x, ant.y);
+    const openCell = (gx: number, gy: number) => !this.grid.isSolid(gx, gy) && this.grid.isNavigable(gx, gy);
+    // the wall must really be right ahead of us
+    if (openCell(cg.gx + dirX, cg.gy)) return null;
+    for (let k = 1; k <= MAX_CLIMB_CELLS; k++) {
+      if (!openCell(cg.gx, cg.gy - k)) return null; // blocked overhead: not a climbable face
+      if (openCell(cg.gx + dirX, cg.gy - k)) {
+        const climbY = ant.y - Math.max(2.6, stepDist * 1.1);
+        return isOpen(ant.x, climbY) ? climbY : null;
+      }
+    }
+    return null;
+  }
+
   private moveAnt(ant: Ant, dt: number): void {
     let moveTarget: Vec2 | null = null;
     const followingPath = ant.path.length > 0 && ant.pathIndex < ant.path.length;
@@ -2458,13 +2504,22 @@ export class AntColonySimulation {
       return !this.grid.isSolid(g.gx, g.gy) && this.grid.isNavigable(g.gx, g.gy);
     };
 
+    let climbing = false;
     if (!isOpen(nx, ny)) {
       const gStepUp = this.grid.worldToGrid(nx, ant.y - CELL_SIZE);
       const stepUpY = Math.min(ant.y - Math.max(2.4, stepDist * 1.25), (gStepUp.gy + 0.78) * CELL_SIZE);
       const stepUp2Y = ant.y - CELL_SIZE * 1.35;
       const straightUpY = ant.y - Math.max(2.6, stepDist * 1.25);
 
-      if (isOpen(nx, ant.y)) {
+      // Real ants scale vertical faces. If a wall blocks the way forward and its top is within a few cells,
+      // crawl up it. (Sliding along a wall we are heading straight into means "don't move" - that is how
+      // ants used to freeze at the foot of soil mounds.)
+      const climbY = this.findFaceClimb(ant, stepDist, moveTarget, isOpen);
+      if (climbY !== null) {
+        nx = ant.x;
+        ny = climbY;
+        climbing = true;
+      } else if (isOpen(nx, ant.y)) {
         ny = ant.y;
       } else if (isOpen(ant.x, ny)) {
         nx = ant.x;
@@ -2531,7 +2586,10 @@ export class AntColonySimulation {
         ? this.grid.terrain[this.grid.idx(finalG.gx, finalG.gy + 1)]
         : CellType.AIR;
       // Only seat walkers onto surface contour when roaming freely (never pull down an active A* climb out of a tunnel)
-      if (ant.path.length === 0 && belowT !== CellType.TUNNEL && ny <= surfY + 3) {
+      // (not while scaling a face: the column we are in is lower than the wall we are climbing)
+      if (climbing) {
+        // keep the climb height
+      } else if (ant.path.length === 0 && belowT !== CellType.TUNNEL && ny <= surfY + 3) {
         ny = surfY - 1.5;
       } else if (ny < surfY - 14) {
         ny = surfY - 2.0;
@@ -2568,11 +2626,18 @@ export class AntColonySimulation {
 
     if (Math.hypot(ant.x - ant.prevX, ant.y - ant.prevY) < 0.3 * dt * 20) {
       ant.stuckTimer += dt;
-      if (ant.stuckTimer > 1.0) {
+      if (ant.stuckTimer > 0.8) {
+        const hadPath = ant.path.length > 0;
         ant.path = [];
         ant.targetPos = null;
-        ant.angle = wrapAngle(ant.angle + Math.PI * (0.55 + Math.random() * 0.6));
         ant.stuckTimer = 0;
+        if (hadPath) {
+          // The route was planned against terrain that has since changed (e.g. a fresh soil deposit). Re-plan from
+          // right here immediately rather than turning around and walking away from the goal.
+          ant.lastPathCalcTime = -10;
+        } else {
+          ant.angle = wrapAngle(ant.angle + Math.PI * (0.55 + Math.random() * 0.6));
+        }
       }
     } else {
       ant.stuckTimer = 0;

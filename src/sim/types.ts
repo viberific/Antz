@@ -122,6 +122,9 @@ export interface Ant {
   greetCooldown: number;
   recruitFoodPos?: Vec2 | null;
   signalCooldown?: number;
+  /** committed surface trail-following direction (-1 left / +1 right) and seconds left before re-deciding */
+  trailDir?: number;
+  trailCommit?: number;
 }
 
 export interface BroodItem {

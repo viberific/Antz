@@ -237,7 +237,7 @@ export class Formicarium3DRenderer {
       return im;
     };
 
-    const dustMat = new THREE.MeshBasicMaterial({ color: 0xf7e7c4, transparent: true, opacity: 0.42 });
+    const dustMat = new THREE.MeshBasicMaterial({ color: 0xf2e6cc, transparent: true, opacity: 0.3, depthWrite: false });
     const rainMat = new THREE.MeshBasicMaterial({ color: 0xbae6fd, transparent: true, opacity: 0.52 });
     const sparkMat = new THREE.MeshBasicMaterial({ color: 0xfef08a });
     this.extraMats.push(dustMat, rainMat, sparkMat);
@@ -251,7 +251,8 @@ export class Formicarium3DRenderer {
     this.fungusMesh = makeInst(new THREE.IcosahedronGeometry(0.095, 1), this.bank.fungusMat, 60);
     this.dropletMesh = makeInst(new THREE.IcosahedronGeometry(0.045, 1), this.bank.waterMat, 140, false);
     this.fallenMesh = makeInst(this.geo.fallenAntGeo, this.bank.fallenAntMat, 40, true, false);
-    this.dustMesh = makeInst(new THREE.IcosahedronGeometry(0.032, 0), dustMat, 140, false);
+    // Real dust motes are specks, not pebbles: keep them far smaller than an ant's head (~0.04 across).
+    this.dustMesh = makeInst(new THREE.IcosahedronGeometry(0.011, 1), dustMat, 140, false);
     this.rainMesh = makeInst(new THREE.BoxGeometry(0.014, 0.24, 0.014), rainMat, 120, false);
     this.crumbMesh = makeInst(new THREE.SphereGeometry(0.036, 6, 4), this.bank.soilCrumbMat, 120, false);
     this.sparkMesh = makeInst(new THREE.IcosahedronGeometry(0.038, 0), sparkMat, 80, false);

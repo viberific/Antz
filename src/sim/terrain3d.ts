@@ -420,8 +420,11 @@ export class FormicariumEnvironment3D {
 
     const airW = smoothstep(0.24, 0.62, airBlend);
     const extZ = clamp(zLane, SOIL_BACK_Z + 0.10, SOLID_FRONT_Z - 0.13);
-    const tunnelWallZ = Math.max(zBack + 0.025, clamp(zLane, zBack + 0.025, SOLID_FRONT_Z - 0.12));
-    const undergroundZ = (zBack + 0.022) * (1 - wallW) + tunnelWallZ * wallW;
+    // Tunnel walls are studded with decorative soil granules that stand up to ~0.042 off the wall. Walkers ride just
+    // above that gravel layer, otherwise feet and bellies sink into the pebbles and ants look snagged on them.
+    const WALK_CLEARANCE = 0.056;
+    const tunnelWallZ = Math.max(zBack + WALK_CLEARANCE, clamp(zLane, zBack + WALK_CLEARANCE, SOLID_FRONT_Z - 0.12));
+    const undergroundZ = (zBack + WALK_CLEARANCE) * (1 - wallW) + tunnelWallZ * wallW;
     const wz = clamp(undergroundZ * (1 - airW) + extZ * airW, SOIL_BACK_Z - 0.14, SOLID_FRONT_Z - 0.09);
 
     const wallNz = 0.16 * (1 - airW);
