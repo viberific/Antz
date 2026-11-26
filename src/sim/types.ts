@@ -51,6 +51,7 @@ export enum AntTask {
   FLEEING = 'Evading Intruder',
   SIGNALING_FOOD = 'Signaling Food Discovery',
   TENDING_FUNGUS = 'Tending Fungus Garden',
+  SEEKING_REST = 'Heading Home to Rest',
 }
 
 export enum PayloadType {
@@ -122,6 +123,19 @@ export interface Ant {
   greetCooldown: number;
   recruitFoodPos?: Vec2 | null;
   signalCooldown?: number;
+  /** committed surface trail-following direction (-1 left / +1 right) and seconds left before re-deciding */
+  trailDir?: number;
+  trailCommit?: number;
+  /** locomotion pace multiplier (0 = stopped, 1 = full stride), eased toward a task-dependent target */
+  pace?: number;
+  /** seconds left in a brief stop (sampling the air, antennating food, ...) */
+  pauseTimer?: number;
+  /** seconds until this ant may next settle down for a rest */
+  restCooldown?: number;
+  /** chamber an ant is walking to in order to rest */
+  restChamberId?: number;
+  /** >=1: how much longer the rendered 3D walking route is than the 2D sim step (set by the renderer) */
+  surfaceStretch?: number;
 }
 
 export interface BroodItem {

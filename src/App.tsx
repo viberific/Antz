@@ -13,6 +13,7 @@ export default function App() {
     const sim = new AntColonySimulation();
     const renderer3d = new Formicarium3DRenderer(container, sim);
     renderer3dRef.current = renderer3d;
+    if (import.meta.env.DEV) (window as unknown as { __antz?: unknown }).__antz = { sim, renderer3d };
 
     let rafId = 0;
     let timerId = 0;

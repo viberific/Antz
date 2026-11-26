@@ -22,12 +22,15 @@ import {
   createSurfacePropMesh,
 } from './models3d';
 import { FormicariumEnvironment3D } from './terrain3d';
+import { resetLegs } from './legs';
 import {
   AntCaste,
   BroodStage,
   CELL_SIZE,
   GRID_W,
   PayloadType,
+  WORLD_H,
+  WORLD_W,
 } from './types';
 
 // Pre-allocated math helpers (zero GC inside frame loop)
@@ -44,7 +47,9 @@ const _upHead = new THREE.Vector3();
 const _posTail = new THREE.Vector3();
 const _upTail = new THREE.Vector3();
 const _deltaVec = new THREE.Vector3();
+const _footUp = new THREE.Vector3();
 const _tfOut = {
+  stretch: 1,
   x: 0,
   y: 0,
   z: 0,
@@ -87,6 +92,14 @@ export class Formicarium3DRenderer {
   private readonly bank: MaterialBank;
   private readonly geo: GeometryBank;
   private readonly env3d: FormicariumEnvironment3D;
+  private groundSim: AntColonySimulation | null = null;
+  /** Terrain sampler handed to the procedural leg solver: world point -> nearest surface contact point. */
+  private readonly sampleGround = (wx: number, wy: number, wz: number, out: THREE.Vector3): void => {
+    if (!this.groundSim) return;
+    const sx = wx / WORLD_SCALE + WORLD_W * 0.5;
+    const sy = WORLD_H * 0.5 - wy / WORLD_SCALE;
+    this.env3d.sampleSurfaceContact(this.groundSim, sx, sy, wz, out, _footUp);
+  };
   private readonly envMapTex: THREE.Texture;
 
   private readonly sunLight: THREE.DirectionalLight;
@@ -225,7 +238,7 @@ export class Formicarium3DRenderer {
       return im;
     };
 
-    const dustMat = new THREE.MeshBasicMaterial({ color: 0xf7e7c4, transparent: true, opacity: 0.42 });
+    const dustMat = new THREE.MeshBasicMaterial({ color: 0xf2e6cc, transparent: true, opacity: 0.3, depthWrite: false });
     const rainMat = new THREE.MeshBasicMaterial({ color: 0xbae6fd, transparent: true, opacity: 0.52 });
     const sparkMat = new THREE.MeshBasicMaterial({ color: 0xfef08a });
     this.extraMats.push(dustMat, rainMat, sparkMat);
@@ -239,7 +252,8 @@ export class Formicarium3DRenderer {
     this.fungusMesh = makeInst(new THREE.IcosahedronGeometry(0.095, 1), this.bank.fungusMat, 60);
     this.dropletMesh = makeInst(new THREE.IcosahedronGeometry(0.045, 1), this.bank.waterMat, 140, false);
     this.fallenMesh = makeInst(this.geo.fallenAntGeo, this.bank.fallenAntMat, 40, true, false);
-    this.dustMesh = makeInst(new THREE.IcosahedronGeometry(0.032, 0), dustMat, 140, false);
+    // Real dust motes are specks, not pebbles: keep them far smaller than an ant's head (~0.04 across).
+    this.dustMesh = makeInst(new THREE.IcosahedronGeometry(0.011, 1), dustMat, 140, false);
     this.rainMesh = makeInst(new THREE.BoxGeometry(0.014, 0.24, 0.014), rainMat, 120, false);
     this.crumbMesh = makeInst(new THREE.SphereGeometry(0.036, 6, 4), this.bank.soilCrumbMat, 120, false);
     this.sparkMesh = makeInst(new THREE.IcosahedronGeometry(0.038, 0), sparkMat, 80, false);
@@ -366,8 +380,12 @@ export class Formicarium3DRenderer {
     const vx = dirX;
     const vy = -dirY;
 
-    // Build orthonormal basis where +X = projected forward along surface, +Y = continuous normal, +Z = right
-    _fwd.set(vx, vy, 0);
+    // Build orthonormal basis where +X = projected forward along surface, +Y = continuous normal, +Z = right.
+    // Forward follows the *actual walking path over the surface* (head probe minus tail probe), not the flat 2D
+    // heading: walking off a tunnel wall is heading along that wall's normal, which projects to nothing and used to
+    // make ants spin as they went around the corner onto the back wall.
+    _fwd.subVectors(_posHead, _posTail);
+    if (_fwd.lengthSq() < 4e-4) _fwd.set(vx, vy, 0);
     const dot = _fwd.dot(_avgUp);
     _fwd.addScaledVector(_avgUp, -dot);
 
@@ -434,6 +452,8 @@ export class Formicarium3DRenderer {
     _tfOut.headSide = headSide;
     _tfOut.tailSide = tailSide;
     _tfOut.bodyDip = bodyDip;
+    // 3D length of the surface chord head->tail over the 2D distance it spans: >1 around corners / on steep faces
+    _tfOut.stretch = _posHead.distanceTo(_posTail) / Math.max(1e-6, 2 * probeSimDist * WORLD_SCALE);
     return _tfOut;
   }
 
@@ -473,13 +493,33 @@ export class Formicarium3DRenderer {
       const tf = this.compute3DSurfaceTransform(sim, ant.x, ant.y, ant.angle, effectiveZ, probeDist);
       _targetPos.set(tf.x, tf.y, tf.z);
 
+      let justSnapped = false;
       if (!rig.hasInitPos || rig.smoothPos.distanceToSquared(_targetPos) > 2.25) {
         rig.smoothPos.copy(_targetPos);
         rig.hasInitPos = true;
+        justSnapped = true;
       } else {
         rig.smoothPos.lerp(_targetPos, posBlend);
       }
       rig.root.position.copy(rig.smoothPos);
+
+      // How much longer the 3D route over the surface is than the 2D sim step that produced it (>1 when rolling
+      // around a tunnel corner onto the back wall, or climbing steeply). Measured from the geometry just ahead and
+      // behind the ant, so it reacts before the ant reaches the corner. The sim slows the ant by this factor so it
+      // walks the longer route at a natural pace instead of rocketing around the corner.
+      const targetStretch = justSnapped ? 1 : clamp(tf.stretch, 1, 4);
+      rig.stretch += (targetStretch - rig.stretch) * Math.min(1, dt * 20);
+      ant.surfaceStretch = rig.stretch;
+
+      // Body world velocity (low-passed) drives stride length / swing speed of the planted-foot leg solver.
+      if (justSnapped) {
+        rig.worldVel.set(0, 0, 0);
+        resetLegs(rig.legSet);
+      } else if (dt > 1e-4) {
+        _deltaVec.subVectors(rig.smoothPos, rig.prevWorldPos).multiplyScalar(1 / dt);
+        rig.worldVel.lerp(_deltaVec, Math.min(1, dt * 14));
+      }
+      rig.prevWorldPos.copy(rig.smoothPos);
 
       if (!rig.hasInitOrientation) {
         rig.currentQuat.copy(tf.quat);
@@ -495,7 +535,8 @@ export class Formicarium3DRenderer {
       rig.smoothTailYaw += (tf.tailYaw - rig.smoothTailYaw) * flexBlend;
       rig.smoothBodyDip += (tf.bodyDip - rig.smoothBodyDip) * flexBlend;
 
-      animateAntRig(rig, ant, sim.simTime, this.bank);
+      this.groundSim = sim;
+      animateAntRig(rig, ant, sim.simTime, this.bank, dt, rig.worldVel, this.sampleGround);
     }
 
     for (const [id, rig] of this.antRigs) {
