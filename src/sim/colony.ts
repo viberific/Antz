@@ -42,11 +42,87 @@ function lerpAngle(a: number, b: number, t: number): number {
   return a + diff * t;
 }
 
-/**
- * Sustainable colony size: roughly what the surface food supply can feed. A larger cap just overshoots, starves the
- * brood and cycles back down.
- */
-const MAX_COLONY = 150;
+/** Sustainable colony size: roughly what the surface food supply (and the renderer) can carry. */
+const MAX_COLONY = 160;
+const MAX_BROOD = 60;
+const SIDE_ENTRANCE_X = 405;
+/** seconds per full day/night cycle */
+const DAY_LENGTH = 200;
+const INF = 1e6;
+const N_CELLS = GRID_W * GRID_H;
+/** world units: radius of the open crater kept clear around each entrance hole */
+const CRATER_MAIN = 7;
+const CRATER_SIDE = 6;
+
+const HASH_CELL = 32;
+const HASH_W = Math.ceil(1440 / HASH_CELL);
+const HASH_H = Math.ceil(880 / HASH_CELL);
+
+type FieldKey =
+  | 'surface'
+  | 'mound'
+  | 'midden'
+  | 'royal'
+  | 'nursery'
+  | 'granary'
+  | 'fungus'
+  | 'store'
+  | 'dig'
+  | 'threat';
+
+const STATIC_FIELDS: FieldKey[] = ['surface', 'mound', 'midden', 'royal', 'nursery', 'granary', 'fungus', 'store'];
+
+/** A planned excavation: a tunnel leading to (optionally) a new chamber. Cells to dig live in `digPlan`. */
+interface DigProject {
+  id: number;
+  kind: 'chamber' | 'gallery';
+  type: ChamberType;
+  x: number;
+  y: number;
+  rx: number;
+  ry: number;
+  totalCells: number;
+}
+
+export interface ColonyEvent {
+  time: number;
+  text: string;
+  kind: 'info' | 'danger' | 'good';
+}
+
+export interface ColonyStats {
+  population: number;
+  queenAlive: boolean;
+  castes: Record<string, number>;
+  eggs: number;
+  larvae: number;
+  pupae: number;
+  storedFood: number;
+  chambers: number;
+  tunnelCells: number;
+  moundSoil: number;
+  intruders: number;
+  day: number;
+  isNight: boolean;
+  weather: string;
+  busy: Record<string, number>;
+}
+
+const isFoodPayload = (p: PayloadType) =>
+  p === PayloadType.SEED || p === PayloadType.HONEYDEW || p === PayloadType.PROTEIN || p === PayloadType.FUNGUS;
+const isBroodPayload = (p: PayloadType) => p === PayloadType.EGG || p === PayloadType.LARVA || p === PayloadType.PUPA;
+
+/** tasks where the ant stands still for `stateTimer` seconds */
+const BUSY_TASKS = new Set<AntTask>([
+  AntTask.IDLE,
+  AntTask.GREETING,
+  AntTask.TROPHALLAXIS,
+  AntTask.GROOMING,
+  AntTask.TENDING_FUNGUS,
+  AntTask.SIGNALING_FOOD,
+  AntTask.EATING,
+  AntTask.DRINKING_DEW,
+]);
 
 export class AntColonySimulation {
   public grid: ColonyGrid;
@@ -61,41 +137,104 @@ export class AntColonySimulation {
   public sprouts: PlantSprout[] = [];
   public surfaceProps: SurfaceProp[] = [];
   public rootPolylines: Vec2[][] = [];
+  public events: ColonyEvent[] = [];
 
   public simTime: number = 0;
-  public timeOfDay: number = 0.34;
+  public timeOfDay: number = 0.3;
   public dayCount: number = 1;
   public weather: 'Clear' | 'Misty' | 'Light Rain' = 'Clear';
   public windStrength: number = 0.35;
-  private weatherTimer: number = 38;
+  private weatherTimer: number = 70;
 
   public entrancePos: Vec2 = { x: 700, y: SURFACE_BASE_Y };
   public middenPos: Vec2 = { x: 1290, y: SURFACE_BASE_Y };
   public tunnelsDugCells: number = 0;
+  public soilDeposited: number = 0;
+  /** ground height per column before any mound building (the mound's height is measured against this) */
+  private baseGround: Float32Array | null = null;
+
+  /** 0 = nothing planned, 1 = planned expansion, 2 = urgent repair of storm damage */
+  public digPlan: Uint8Array = new Uint8Array(N_CELLS);
+  private projects: DigProject[] = [];
+  private planCount = 0;
+  private repairCount = 0;
 
   private nextId: number = 1;
-  private nestFieldDirty: boolean = true;
-  private nestFieldTimer: number = 0;
-  private pathBudgetThisTick: number = 0;
-  private naturalFoodTimer: number = 7;
-  private intruderTimer: number = 10;
+  private naturalFoodTimer: number = 4;
+  private intruderTimer: number = 50;
   private fungusTimer: number = 8;
-  private queenEggTimer: number = 4;
-  private labourTimer: number = 5;
+  private queenEggTimer: number = 3;
+  private labourTimer: number = 3;
+  private planTimer: number = 1;
+  private damageTimer: number = 4;
+  private pherAccum = 0;
+  /** running totals, handy for tuning and debugging */
+  public counters = { pickups: 0, deliveries: 0, digs: 0, deposits: 0, larvaFeeds: 0, queenFeeds: 0 };
+  /** A* searches still allowed this step */
+  private pathBudget = 0;
 
-  private static readonly SAVE_KEY = 'formicarium_colony_v1';
+  // --- flow fields ------------------------------------------------------------------------------------------------
+  private fields: Record<FieldKey, Float32Array>;
+  private fieldDirty: Record<FieldKey, boolean>;
+  private fieldAge: Record<FieldKey, number>;
+  private fieldTerrainVersion = -1;
+
+  // --- per-step caches --------------------------------------------------------------------------------------------
+  private hashHead = new Int32Array(HASH_W * HASH_H);
+  private hashNext = new Int32Array(1024);
+  private storedFoodCache = 0;
+  private claimedBrood = new Set<number>();
+  private claimedDig = new Set<number>();
+  private queenFeederId: number | null = null;
+
+  private static readonly SAVE_KEY = 'formicarium_colony_v2';
 
   constructor() {
     this.grid = new ColonyGrid();
+    const mk = () => new Float32Array(N_CELLS).fill(INF);
+    this.fields = {
+      surface: mk(),
+      mound: mk(),
+      midden: mk(),
+      royal: mk(),
+      nursery: mk(),
+      granary: mk(),
+      fungus: mk(),
+      store: mk(),
+      dig: mk(),
+      threat: mk(),
+    };
+    this.fieldDirty = {} as Record<FieldKey, boolean>;
+    this.fieldAge = {} as Record<FieldKey, number>;
+    for (const k of Object.keys(this.fields) as FieldKey[]) {
+      this.fieldDirty[k] = true;
+      this.fieldAge[k] = 99;
+    }
+    try {
+      localStorage.removeItem('formicarium_colony_v1'); // old format: its colonies were stuck and can't be upgraded
+    } catch {
+      /* storage unavailable */
+    }
     if (!this.loadState()) {
       this.initWorld();
       this.saveState();
     }
+    for (const k of Object.keys(this.fields) as FieldKey[]) this.rebuildField(k);
+    this.fieldTerrainVersion = this.grid.terrainVersion;
   }
 
   private allocId(): number {
     return this.nextId++;
   }
+
+  private log(text: string, kind: ColonyEvent['kind'] = 'info'): void {
+    this.events.push({ time: this.simTime, text, kind });
+    if (this.events.length > 8) this.events.shift();
+  }
+
+  // ================================================================================================================
+  // World generation
+  // ================================================================================================================
 
   private initWorld(): void {
     const leftGx = Math.floor(CASE_LEFT / CELL_SIZE);
@@ -301,130 +440,100 @@ export class AntColonySimulation {
       { id: this.allocId(), type: PayloadType.FUNGUS, x: fungus.x + 16, y: fungus.y + 11, amount: 28, maxAmount: 50, radius: 7, storedInChamberId: fungus.id }
     );
 
+    this.grid.rebuildNav();
+    this.baseGround = Float32Array.from(this.grid.surfaceY);
+
     this.spawnSurfaceFood(PayloadType.SEED, 250, false);
     this.spawnSurfaceFood(PayloadType.HONEYDEW, 540, false);
     this.spawnSurfaceFood(PayloadType.SEED, 910, false);
     this.spawnSurfaceFood(PayloadType.PROTEIN, 1085, false);
     this.spawnSurfaceFood(PayloadType.HONEYDEW, 1185, false);
 
-    for (let x = 540; x <= 700; x += 8) {
-      const gx = Math.floor(x / CELL_SIZE);
-      this.grid.depositPheromone(this.grid.foodPheromone, x, this.grid.surfaceY[gx] - 3, 0.55, 1);
-    }
-
-    // 7. Initial Brood
+    // Initial brood spread over the life cycle so the colony keeps renewing from the start
     for (let i = 0; i < 6; i++) {
-      this.brood.push({
-        id: this.allocId(),
-        stage: BroodStage.EGG,
-        x: royal.x + 14 + (Math.random() - 0.5) * 26,
-        y: royal.y + 14 + (Math.random() - 0.5) * 8,
-        progress: Math.random() * 60,
-        nutrition: 90,
-        carriedByAntId: null,
-        chamberId: royal.id,
-        wigglePhase: Math.random() * Math.PI * 2,
-      });
+      this.brood.push(this.makeBrood(BroodStage.EGG, royal.x + 14 + (Math.random() - 0.5) * 26, royal.y + 10, royal.id, Math.random() * 60, 90));
     }
     for (let i = 0; i < 8; i++) {
-      this.brood.push({
-        id: this.allocId(),
-        stage: BroodStage.LARVA,
-        x: nursery.x + (Math.random() - 0.5) * 55,
-        y: nursery.y + 14 + (Math.random() - 0.5) * 8,
-        progress: Math.random() * 75,
-        nutrition: 45 + Math.random() * 45,
-        carriedByAntId: null,
-        chamberId: nursery.id,
-        wigglePhase: Math.random() * Math.PI * 2,
-      });
+      this.brood.push(this.makeBrood(BroodStage.LARVA, nursery.x + (Math.random() - 0.5) * 30, nursery.y + 10, nursery.id, Math.random() * 75, 45 + Math.random() * 45));
     }
     for (let i = 0; i < 6; i++) {
-      this.brood.push({
-        id: this.allocId(),
-        stage: BroodStage.PUPA,
-        x: nursery.x + (Math.random() - 0.5) * 48,
-        y: nursery.y + 10 + (Math.random() - 0.5) * 10,
-        progress: 25 + Math.random() * 65,
-        nutrition: 100,
-        carriedByAntId: null,
-        chamberId: nursery.id,
-        wigglePhase: Math.random() * Math.PI * 2,
-      });
+      this.brood.push(this.makeBrood(BroodStage.PUPA, nursery.x + nursery.rx * 0.45 + (Math.random() - 0.5) * 16, nursery.y + 10, nursery.id, 25 + Math.random() * 65, 100));
     }
 
-    // Collect all valid subterranean tunnel coordinates for guaranteed safe spawning
     const tunnelPositions: Vec2[] = [];
     for (let gy = 38; gy < GRID_H - 12; gy++) {
       for (let gx = 12; gx < GRID_W - 12; gx++) {
-        if (this.grid.terrain[this.grid.idx(gx, gy)] === CellType.TUNNEL) {
-          tunnelPositions.push(this.grid.gridToWorld(gx, gy));
-        }
+        if (this.grid.terrain[this.grid.idx(gx, gy)] === CellType.TUNNEL) tunnelPositions.push(this.grid.gridToWorld(gx, gy));
       }
     }
-    const pickTunnelPos = (): Vec2 => {
-      if (tunnelPositions.length > 0) {
-        return tunnelPositions[Math.floor(Math.random() * tunnelPositions.length)];
-      }
-      return { x: royal.x, y: royal.y };
-    };
+    const pickTunnelPos = (): Vec2 =>
+      tunnelPositions.length > 0 ? tunnelPositions[Math.floor(Math.random() * tunnelPositions.length)] : { x: royal.x, y: royal.y };
 
-    // 8. Spawn Queen & Specialized Castes strictly inside navigable space
     this.spawnAnt(AntCaste.QUEEN, royal.x - 10, royal.y + 8);
-    for (let i = 0; i < 30; i++) {
-      const onSurface = i < 18;
-      if (onSurface) {
+    for (let i = 0; i < 24; i++) {
+      if (i < 12) {
         const sx = 240 + Math.random() * 940;
-        const sy = this.grid.surfaceY[Math.floor(sx / CELL_SIZE)] - 1.5;
-        this.spawnAnt(AntCaste.WORKER, sx, sy);
+        this.spawnAnt(AntCaste.WORKER, sx, this.grid.surfaceY[Math.floor(sx / CELL_SIZE)] - 1.5);
       } else {
         const p = pickTunnelPos();
         this.spawnAnt(AntCaste.WORKER, p.x, p.y);
       }
     }
-    for (let i = 0; i < 14; i++) {
-      const target = i < 6 ? royal : nursery;
+    for (let i = 0; i < 12; i++) {
+      const target = i < 4 ? royal : nursery;
       this.spawnAnt(AntCaste.NURSE, target.x + (Math.random() - 0.5) * 32, target.y + (Math.random() - 0.5) * 12);
     }
-    for (let i = 0; i < 13; i++) {
+    for (let i = 0; i < 12; i++) {
       const p = pickTunnelPos();
       this.spawnAnt(AntCaste.EXCAVATOR, p.x, p.y);
     }
-    for (let i = 0; i < 9; i++) {
-      const nearEnt = i < 6;
-      if (nearEnt) {
+    for (let i = 0; i < 8; i++) {
+      if (i < 5) {
         const sx = 640 + Math.random() * 120;
-        const sy = this.grid.surfaceY[Math.floor(sx / CELL_SIZE)] - 1.5;
-        this.spawnAnt(AntCaste.SOLDIER, sx, sy);
+        this.spawnAnt(AntCaste.SOLDIER, sx, this.grid.surfaceY[Math.floor(sx / CELL_SIZE)] - 1.5);
       } else {
         this.spawnAnt(AntCaste.SOLDIER, royal.x + (Math.random() - 0.5) * 36, royal.y + 4);
       }
     }
-
-    // The founding ants span a range of ages. If they were all born at t=0 they would also all die together,
-    // wiping out every nurse at once and starving the brood (a generation cliff).
+    // Founders span a range of ages so they don't all die in the same minute (a generation cliff).
     for (const a of this.ants) {
-      if (a.caste !== AntCaste.QUEEN) a.age = Math.random() * 0.75 * a.maxAge;
+      if (a.caste !== AntCaste.QUEEN) a.age = Math.random() * 0.6 * a.maxAge;
     }
 
-    // 9. Atmospheric floating dust motes
-    for (let i = 0; i < 65; i++) {
-      this.particles.push({
-        x: CASE_LEFT + 20 + Math.random() * (CASE_RIGHT - CASE_LEFT - 40),
-        y: CASE_TOP + 10 + Math.random() * (SURFACE_BASE_Y - CASE_TOP + 20),
-        vx: (Math.random() - 0.5) * 5,
-        vy: -1.5 + Math.random() * 3,
-        size: 0.7 + Math.random() * 2.0,
-        alpha: 0.14 + Math.random() * 0.42,
-        life: Math.random() * 100,
-        maxLife: 99999,
-        kind: 'dust',
-        color: '#f5e6c8',
-      });
-    }
+    for (let i = 0; i < 65; i++) this.particles.push(this.makeDustMote());
 
-    this.grid.recomputeNestField(royal.x, royal.y);
-    this.nestFieldDirty = false;
+    // Give the diggers something to do from the first minute: a deeper nursery off the royal chamber
+    this.planNewProject(ChamberType.NURSERY);
+    this.log('A young colony settles into the formicarium', 'good');
+  }
+
+  private makeBrood(stage: BroodStage, x: number, y: number, chamberId: number, progress: number, nutrition: number): BroodItem {
+    return {
+      id: this.allocId(),
+      stage,
+      x,
+      y,
+      progress,
+      nutrition,
+      carriedByAntId: null,
+      chamberId,
+      wigglePhase: Math.random() * Math.PI * 2,
+    };
+  }
+
+  private makeDustMote(): Particle {
+    return {
+      x: CASE_LEFT + 20 + Math.random() * (CASE_RIGHT - CASE_LEFT - 40),
+      y: CASE_TOP + 10 + Math.random() * (SURFACE_BASE_Y - CASE_TOP + 20),
+      vx: (Math.random() - 0.5) * 5,
+      vy: -1.5 + Math.random() * 3,
+      size: 0.7 + Math.random() * 2.0,
+      alpha: 0.14 + Math.random() * 0.42,
+      life: Math.random() * 100,
+      maxLife: 99999,
+      kind: 'dust',
+      color: '#f5e6c8',
+    };
   }
 
   private paintEllipse(cx: number, cy: number, rx: number, ry: number, type: CellType, onlyInSoil: boolean): void {
@@ -584,17 +693,7 @@ export class AntColonySimulation {
         sy = w.y;
       }
     }
-    const baseSpeed =
-      caste === AntCaste.QUEEN
-        ? 11
-        : caste === AntCaste.SOLDIER
-        ? 33
-        : caste === AntCaste.WORKER
-        ? 37 + Math.random() * 6
-        : caste === AntCaste.EXCAVATOR
-        ? 31 + Math.random() * 5
-        : 29 + Math.random() * 4;
-
+    const maxHp = caste === AntCaste.QUEEN ? 220 : caste === AntCaste.SOLDIER ? 60 : 24;
     const ant: Ant = {
       id: this.allocId(),
       caste,
@@ -604,29 +703,19 @@ export class AntColonySimulation {
       vy: 0,
       angle: Math.random() * Math.PI * 2,
       targetAngle: Math.random() * Math.PI * 2,
-      speed: baseSpeed,
+      speed: this.casteSpeed(caste),
       energy: 75 + Math.random() * 25,
       hunger: 10 + Math.random() * 25,
       hydration: 80 + Math.random() * 20,
       age: 0,
-      // Workers live tens of minutes (not ~5): long enough for a colony to be a stable, watchable thing.
-      maxAge: caste === AntCaste.QUEEN ? 999999 : 1500 + Math.random() * 1500,
+      maxAge: caste === AntCaste.QUEEN ? 1e9 : 1500 + Math.random() * 1500,
       isCallow,
-      callowTimer: isCallow ? 22 : 0,
-      task:
-        caste === AntCaste.QUEEN
-          ? AntTask.IDLE
-          : caste === AntCaste.WORKER
-          ? AntTask.FORAGING_SCOUT
-          : caste === AntCaste.NURSE
-          ? AntTask.MOVING_BROOD
-          : caste === AntCaste.EXCAVATOR
-          ? AntTask.EXCAVATING
-          : AntTask.PATROLLING,
+      callowTimer: isCallow ? 25 : 0,
+      task: caste === AntCaste.QUEEN ? AntTask.IDLE : AntTask.FORAGING_SCOUT,
       payload: PayloadType.NONE,
       payloadValue: 0,
       payloadId: null,
-      stateTimer: 0.4 + Math.random() * 1.5,
+      stateTimer: 0,
       pheromoneDropTimer: Math.random() * 0.25,
       gaitPhase: Math.random() * Math.PI * 2,
       antennaPhase: Math.random() * Math.PI * 2,
@@ -637,14 +726,32 @@ export class AntColonySimulation {
       trophallaxisPartnerId: null,
       lastPathCalcTime: -10,
       stuckTimer: 0,
-      prevX: x,
-      prevY: y,
+      prevX: sx,
+      prevY: sy,
       greetCooldown: 4 + Math.random() * 8,
       recruitFoodPos: null,
       signalCooldown: 0,
+      hp: maxHp,
+      maxHp,
+      targetId: null,
+      digIdx: -1,
+      excursion: 0,
+      restCooldown: 20 + Math.random() * 60,
     };
     this.ants.push(ant);
     return ant;
+  }
+
+  private casteSpeed(caste: AntCaste): number {
+    return caste === AntCaste.QUEEN
+      ? 11
+      : caste === AntCaste.SOLDIER
+      ? 33
+      : caste === AntCaste.WORKER
+      ? 37 + Math.random() * 6
+      : caste === AntCaste.EXCAVATOR
+      ? 31 + Math.random() * 5
+      : 29 + Math.random() * 4;
   }
 
   public spawnSurfaceFood(
@@ -670,28 +777,66 @@ export class AntColonySimulation {
     });
   }
 
+  // ================================================================================================================
+  // Main step
+  // ================================================================================================================
+
+  public isNight(): boolean {
+    return Math.sin((this.timeOfDay - 0.2) * Math.PI * 2) < -0.5;
+  }
+
   public step(rawDt: number): void {
-    const dt = Math.min(0.05, rawDt);
+    const dt = Math.min(0.1, rawDt);
     if (dt <= 0) return;
-
     this.simTime += dt;
-    this.pathBudgetThisTick = 0;
 
-    // 1. Dynamic Circadian Cycle & Shifting Weather/Wind
-    const dayLength = 135;
     const prevTod = this.timeOfDay;
-    this.timeOfDay = (this.timeOfDay + dt / dayLength) % 1;
-    if (this.timeOfDay < prevTod) {
-      this.dayCount++;
+    const wasNight = this.isNight();
+    this.timeOfDay = (this.timeOfDay + dt / DAY_LENGTH) % 1;
+    if (this.timeOfDay < prevTod) this.dayCount++;
+    if (wasNight !== this.isNight()) {
+      this.log(this.isNight() ? 'Night falls: foragers head underground' : `Day ${this.dayCount} dawns: foragers stream out`);
     }
 
     this.windStrength = 0.3 + 0.45 * Math.sin(this.simTime * 0.14) + 0.25 * Math.cos(this.simTime * 0.37);
+    this.stepWeather(dt);
 
+    this.pherAccum += dt;
+    if (this.pherAccum >= 0.12) {
+      this.grid.stepPheromonesAndMoisture(this.pherAccum, this.weather);
+      this.pherAccum = 0;
+    }
+
+    this.updateFields(dt);
+    this.stepDroplets(dt);
+    this.stepEcosystem(dt);
+    this.stepStormDamage(dt);
+    this.stepBrood(dt);
+    this.stepQueenLaying(dt);
+    this.planExpansion(dt);
+    this.rebalanceLabour(dt);
+
+    this.pathBudget = 10;
+    this.buildHash();
+    this.refreshClaims();
+    this.stepIntruders(dt);
+    this.stepAnts(dt);
+    this.resolveEntityCrowding(dt);
+    this.stepFallenAnts(dt);
+    this.stepParticles(dt);
+  }
+
+  private stepWeather(dt: number): void {
     this.weatherTimer -= dt;
     if (this.weatherTimer <= 0) {
+      const prev = this.weather;
       const r = Math.random();
-      this.weather = r < 0.52 ? 'Clear' : r < 0.78 ? 'Misty' : 'Light Rain';
-      this.weatherTimer = this.weather === 'Clear' ? 38 + Math.random() * 35 : 18 + Math.random() * 18;
+      this.weather = r < 0.5 ? 'Clear' : r < 0.72 ? 'Misty' : 'Light Rain';
+      this.weatherTimer = this.weather === 'Clear' ? 70 + Math.random() * 60 : 30 + Math.random() * 25;
+      if (this.weather !== prev) {
+        if (this.weather === 'Light Rain') this.log('Rain begins: the mound and shallow tunnels are at risk', 'danger');
+        else if (prev === 'Light Rain') this.log('The rain has passed');
+      }
     }
 
     if (this.weather === 'Light Rain' && Math.random() < dt * 13) {
@@ -722,37 +867,6 @@ export class AntColonySimulation {
         color: '#dbeafe',
       });
     }
-
-    // 2. Pheromones & Moisture percolation
-    this.grid.stepPheromonesAndMoisture(dt, this.weather);
-
-    this.nestFieldTimer += dt;
-    if (this.nestFieldDirty && this.nestFieldTimer > 1.1) {
-      const royal = this.getChamber(ChamberType.ROYAL);
-      if (royal) {
-        this.grid.recomputeNestField(royal.x, royal.y);
-      }
-      this.nestFieldDirty = false;
-      this.nestFieldTimer = 0;
-    }
-
-    // 3. Droplets & Falling/Natural Foods
-    this.stepDroplets(dt);
-    this.stepEcosystem(dt);
-
-    // 4. Brood development
-    this.stepBrood(dt);
-
-    // 5. Predatory Insects attacking the nest
-    this.stepIntruders(dt);
-
-    // 6. Autonomous Ant Colony, Crowding Avoidance & Necrophoresis
-    this.stepAnts(dt);
-    this.resolveEntityCrowding(dt);
-    this.stepFallenAnts(dt);
-
-    // 7. Particles
-    this.stepParticles(dt);
   }
 
   private stepDroplets(dt: number): void {
@@ -803,9 +917,9 @@ export class AntColonySimulation {
     this.naturalFoodTimer -= dt;
     if (this.naturalFoodTimer <= 0) {
       // Supply sized so a full-grown colony can sustain itself; the queen still throttles laying when stores run low.
-      this.naturalFoodTimer = 6 + Math.random() * 7;
+      this.naturalFoodTimer = 5 + Math.random() * 6;
       const surfaceFoods = this.foods.filter((f) => f.storedInChamberId === null);
-      if (surfaceFoods.length < 10) {
+      if (surfaceFoods.length < 14) {
         const r = Math.random();
         if (r < 0.55) {
           // Wind-blown seed drifting from canopy
@@ -876,6 +990,372 @@ export class AntColonySimulation {
     }
   }
 
+  // ================================================================================================================
+  // Flow fields (shared navigation)
+  // ================================================================================================================
+
+  private updateFields(dt: number): void {
+    for (const k of Object.keys(this.fieldAge) as FieldKey[]) this.fieldAge[k] += dt;
+    if (this.grid.terrainVersion !== this.fieldTerrainVersion) {
+      this.fieldTerrainVersion = this.grid.terrainVersion;
+      for (const k of STATIC_FIELDS) this.fieldDirty[k] = true;
+      this.fieldDirty.dig = true;
+    }
+    if (this.intruders.length > 0 || this.fieldDirty.threat) {
+      if (this.fieldAge.threat > 0.35) this.rebuildField('threat');
+    }
+    if (this.fieldAge.store > 2) this.fieldDirty.store = true;
+    // Rebuild at most one stale field per step to keep the cost flat.
+    if (this.fieldDirty.dig && this.fieldAge.dig > 0.5) {
+      this.rebuildField('dig');
+      return;
+    }
+    let oldest: FieldKey | null = null;
+    for (const k of STATIC_FIELDS) {
+      if (this.fieldDirty[k] && this.fieldAge[k] > 1.5 && (!oldest || this.fieldAge[k] > this.fieldAge[oldest])) oldest = k;
+    }
+    if (oldest) this.rebuildField(oldest);
+  }
+
+  private chamberSources(types: ChamberType[]): number[] {
+    const out: number[] = [];
+    for (const c of this.chambers) {
+      if (!types.includes(c.type)) continue;
+      const minGx = Math.floor((c.x - c.rx) / CELL_SIZE);
+      const maxGx = Math.ceil((c.x + c.rx) / CELL_SIZE);
+      const minGy = Math.floor((c.y - c.ry) / CELL_SIZE);
+      const maxGy = Math.ceil((c.y + c.ry) / CELL_SIZE);
+      for (let gy = minGy; gy <= maxGy; gy++) {
+        for (let gx = minGx; gx <= maxGx; gx++) {
+          if (!this.grid.inBounds(gx, gy)) continue;
+          const w = this.grid.gridToWorld(gx, gy);
+          const dx = (w.x - c.x) / c.rx;
+          const dy = (w.y - c.y) / c.ry;
+          if (dx * dx + dy * dy < 0.45 && this.grid.nav[this.grid.idx(gx, gy)]) out.push(this.grid.idx(gx, gy));
+        }
+      }
+    }
+    return out;
+  }
+
+  /** Walkable cells resting on the exterior ground, filtered by world x. */
+  private surfaceSources(filter: (wx: number) => boolean): number[] {
+    const out: number[] = [];
+    for (let gx = 10; gx < GRID_W - 10; gx++) {
+      const wx = (gx + 0.5) * CELL_SIZE;
+      if (!filter(wx)) continue;
+      const gy = Math.floor(this.grid.surfaceY[gx] / CELL_SIZE) - 1;
+      if (gy < 1 || gy >= GRID_H - 1) continue;
+      const i = this.grid.idx(gx, gy);
+      // real ground underfoot (not the open mouth of a tunnel)
+      if (this.grid.terrain[i + GRID_W] === CellType.TUNNEL && Math.abs(wx - this.entrancePos.x) > 60 && Math.abs(wx - SIDE_ENTRANCE_X) > 50) continue;
+      if (this.grid.terrain[i] === CellType.AIR && this.grid.nav[i]) out.push(i);
+    }
+    return out;
+  }
+
+  public moundRadius(): number {
+    return 70 + Math.min(150, Math.sqrt(this.soilDeposited) * 6);
+  }
+
+  private rebuildField(k: FieldKey): void {
+    const f = this.fields[k];
+    let sources: number[] = [];
+    let costs: number[] | undefined;
+    const ex = this.entrancePos.x;
+    switch (k) {
+      case 'surface':
+        sources = this.surfaceSources((wx) => Math.abs(wx - ex) > 50 && Math.abs(wx - SIDE_ENTRANCE_X) > 38 && wx > CASE_LEFT + 60 && wx < CASE_RIGHT - 60);
+        break;
+      case 'mound': {
+        const r = this.moundRadius();
+        sources = this.surfaceSources((wx) => {
+          const dm = Math.abs(wx - ex);
+          const ds = Math.abs(wx - SIDE_ENTRANCE_X);
+          return ds > 60 && dm >= CRATER_MAIN + 4 && dm <= CRATER_MAIN + 30 + r * 0.15;
+        });
+        break;
+      }
+      case 'midden':
+        sources = this.surfaceSources((wx) => Math.abs(wx - this.middenPos.x) < 24);
+        break;
+      case 'royal':
+        sources = this.chamberSources([ChamberType.ROYAL]);
+        break;
+      case 'nursery':
+        sources = this.chamberSources([ChamberType.NURSERY]);
+        break;
+      case 'granary':
+        sources = this.chamberSources([ChamberType.GRANARY]);
+        break;
+      case 'fungus':
+        sources = this.chamberSources([ChamberType.FUNGUS]);
+        break;
+      case 'store':
+        // wherever food actually lies in the nest (a drained granary is no use to a hungry ant)
+        for (const fd of this.foods) {
+          if (fd.storedInChamberId === null || fd.amount < 1) continue;
+          const fg = this.grid.worldToGrid(fd.x, fd.y);
+          const near = this.grid.findNearestNavigable(fg.gx, fg.gy, 3);
+          if (near) sources.push(this.grid.idx(near.gx, near.gy));
+        }
+        break;
+      case 'dig': {
+        costs = [];
+        const plan = this.digPlan;
+        const nav = this.grid.nav;
+        for (let i = GRID_W; i < N_CELLS - GRID_W; i++) {
+          if (!nav[i]) continue;
+          let best = 0;
+          const n4 = [i - 1, i + 1, i - GRID_W, i + GRID_W];
+          for (const j of n4) {
+            const p = plan[j];
+            if (p > best && this.canExcavate(j)) best = p;
+          }
+          if (best > 0) {
+            sources.push(i);
+            costs.push(best === 2 ? 0 : 18);
+          }
+        }
+        break;
+      }
+      case 'threat':
+        for (const m of this.intruders) {
+          if (m.hp <= 0) continue;
+          const g = this.grid.worldToGrid(m.x, m.y);
+          const near = this.grid.findNearestNavigable(g.gx, g.gy, 3);
+          if (near) sources.push(this.grid.idx(near.gx, near.gy));
+        }
+        break;
+    }
+    if (sources.length === 0) f.fill(INF);
+    else this.grid.buildFlowField(f, sources, costs);
+    this.fieldDirty[k] = false;
+    this.fieldAge[k] = 0;
+  }
+
+  private antCell(ant: { x: number; y: number }): number {
+    const g = this.grid.worldToGrid(ant.x, ant.y);
+    let i = this.grid.idx(g.gx, g.gy);
+    if (!this.grid.nav[i]) {
+      const n = this.grid.findNearestNavigable(g.gx, g.gy, 2);
+      if (n) i = this.grid.idx(n.gx, n.gy);
+    }
+    return i;
+  }
+
+  private fieldDist(k: FieldKey, x: number, y: number): number {
+    return this.fields[k][this.antCell({ x, y })];
+  }
+
+  /** Builds a short downhill route on a flow field. Returns the remaining cost at the ant's cell. */
+  private go(ant: Ant, k: FieldKey): number {
+    if (ant.navKey !== k) {
+      ant.navKey = k;
+      ant.path = [];
+      ant.pathIndex = 0;
+    }
+    ant.targetPos = null;
+    const f = this.fields[k];
+    let i = this.antCell(ant);
+    let d = f[i];
+    const path: Vec2[] = [];
+    if (d >= INF) {
+      // freshly dug cells aren't on the field until its next refresh: step to a neighbour that is
+      const j = this.nearestOnField(f, i, 3);
+      if (j < 0) return INF;
+      if (ant.path.length > 0 && ant.pathIndex < ant.path.length) return f[j] + 1;
+      i = j;
+      d = f[j] + 1;
+      const jx = j % GRID_W;
+      path.push(this.grid.gridToWorld(jx, (j - jx) / GRID_W));
+    } else if (ant.path.length > 0 && ant.pathIndex < ant.path.length) return d;
+    let cur = i;
+    for (let s = 0; s < 4; s++) {
+      const nxt = this.grid.descend(f, cur);
+      if (nxt < 0) break;
+      cur = nxt;
+      const gx = cur % GRID_W;
+      path.push(this.grid.gridToWorld(gx, (cur - gx) / GRID_W));
+      if (f[cur] <= 0) break;
+    }
+    ant.path = path;
+    ant.pathIndex = 0;
+    return d;
+  }
+
+  private nearestOnField(f: Float32Array, i: number, r: number): number {
+    const cx = i % GRID_W;
+    const cy = (i - cx) / GRID_W;
+    let best = -1;
+    let bestD = INF;
+    for (let y = cy - r; y <= cy + r; y++) {
+      for (let x = cx - r; x <= cx + r; x++) {
+        if (x < 0 || x >= GRID_W || y < 0 || y >= GRID_H) continue;
+        const j = y * GRID_W + x;
+        if (!this.grid.nav[j] || f[j] >= INF) continue;
+        const dd = f[j] + Math.abs(x - cx) + Math.abs(y - cy);
+        if (dd < bestD) {
+          bestD = dd;
+          best = j;
+        }
+      }
+    }
+    return best;
+  }
+
+  /**
+   * Steer to a point. Out on the open ground the ant walks the terrain contour (over mounds, around the entrance
+   * pits) instead of beelining through them; elsewhere (inside one chamber) it heads straight there.
+   */
+  private goTo(ant: Ant, x: number, y: number): void {
+    const gx = clamp(Math.floor(ant.x / CELL_SIZE), 0, GRID_W - 1);
+    const tgx = clamp(Math.floor(x / CELL_SIZE), 0, GRID_W - 1);
+    const antOnGround = ant.y <= this.grid.surfaceY[gx] + 3 && this.grid.terrain[this.grid.idx(gx, clamp(Math.floor(ant.y / CELL_SIZE), 0, GRID_H - 1))] === CellType.AIR;
+    const targetOnGround = y <= this.grid.surfaceY[tgx] + 6;
+    if (antOnGround && targetOnGround && Math.abs(x - ant.x) > 10) {
+      const key = 'contour';
+      const tgt = ant.targetPos;
+      if (ant.navKey !== key || !tgt || Math.abs(tgt.x - x) > 14) {
+        ant.navKey = key;
+        ant.path = [];
+        ant.pathIndex = 0;
+      }
+      ant.targetPos = { x, y };
+      if (ant.path.length === 0 || ant.pathIndex >= ant.path.length) {
+        // a proper grid route copes with bumps, pits and the entrance craters; the contour walk is the fallback
+        if (this.pathBudget > 0) {
+          this.pathBudget--;
+          const route = this.grid.findPath({ x: ant.x, y: ant.y }, { x, y }, { maxIterations: 2500 });
+          if (route.length > 0) {
+            ant.path = route.length > 14 ? route.slice(0, 14) : route;
+            ant.pathIndex = 0;
+            return;
+          }
+        }
+        const dir = x >= ant.x ? 1 : -1;
+        const path: Vec2[] = [];
+        let px = ant.x;
+        for (let s = 0; s < 5; s++) {
+          px += dir * CELL_SIZE;
+          if ((dir > 0 && px > x) || (dir < 0 && px < x)) px = x;
+          const c = clamp(Math.floor(px / CELL_SIZE), 0, GRID_W - 1);
+          path.push({ x: px, y: this.grid.surfaceY[c] - 2 });
+          if (px === x) break;
+        }
+        ant.path = path;
+        ant.pathIndex = 0;
+      }
+      return;
+    }
+    if (ant.navKey !== 'direct') {
+      ant.navKey = 'direct';
+      ant.path = [];
+      ant.pathIndex = 0;
+    }
+    ant.targetPos = { x, y };
+  }
+
+  /**
+   * Route to one specific spot (a particular larva, a particular chamber) with A*. Flow fields only know the
+   * *nearest* chamber of each kind, which is wrong once the nest has several nurseries.
+   */
+  private goPath(ant: Ant, x: number, y: number, key: string): void {
+    if (ant.navKey !== key) {
+      ant.navKey = key;
+      ant.path = [];
+      ant.pathIndex = 0;
+    }
+    ant.targetPos = null;
+    if (ant.path.length > 0 && ant.pathIndex < ant.path.length) return;
+    if (this.pathBudget <= 0) return;
+    this.pathBudget--;
+    const route = this.grid.findPath({ x: ant.x, y: ant.y }, { x, y }, { maxIterations: 6000 });
+    if (route.length === 0) {
+      ant.targetPos = { x, y };
+      return;
+    }
+    ant.path = route.length > 24 ? route.slice(0, 24) : route;
+    ant.pathIndex = 0;
+  }
+
+  private stopMoving(ant: Ant): void {
+    ant.path = [];
+    ant.pathIndex = 0;
+    ant.targetPos = null;
+    ant.navKey = undefined;
+  }
+
+  private surfaceTarget(x: number): Vec2 {
+    const cx = clamp(x, CASE_LEFT + 40, CASE_RIGHT - 40);
+    return { x: cx, y: this.grid.surfaceY[clamp(Math.floor(cx / CELL_SIZE), 0, GRID_W - 1)] - 2 };
+  }
+
+  // ================================================================================================================
+  // Spatial hash & claims
+  // ================================================================================================================
+
+  private buildHash(): void {
+    this.hashHead.fill(-1);
+    if (this.hashNext.length < this.ants.length) this.hashNext = new Int32Array(this.ants.length * 2);
+    for (let i = 0; i < this.ants.length; i++) {
+      const a = this.ants[i];
+      const hx = clamp(Math.floor(a.x / HASH_CELL), 0, HASH_W - 1);
+      const hy = clamp(Math.floor(a.y / HASH_CELL), 0, HASH_H - 1);
+      const h = hy * HASH_W + hx;
+      this.hashNext[i] = this.hashHead[h];
+      this.hashHead[h] = i;
+    }
+  }
+
+  /** Calls `cb` for every ant within `r` of (x, y). Return true from cb to stop early. */
+  private forAntsNear(x: number, y: number, r: number, cb: (a: Ant) => boolean | void): void {
+    const x0 = clamp(Math.floor((x - r) / HASH_CELL), 0, HASH_W - 1);
+    const x1 = clamp(Math.floor((x + r) / HASH_CELL), 0, HASH_W - 1);
+    const y0 = clamp(Math.floor((y - r) / HASH_CELL), 0, HASH_H - 1);
+    const y1 = clamp(Math.floor((y + r) / HASH_CELL), 0, HASH_H - 1);
+    const r2 = r * r;
+    for (let hy = y0; hy <= y1; hy++) {
+      for (let hx = x0; hx <= x1; hx++) {
+        let i = this.hashHead[hy * HASH_W + hx];
+        while (i !== -1) {
+          const a = this.ants[i];
+          if (a) {
+            const dx = a.x - x;
+            const dy = a.y - y;
+            if (dx * dx + dy * dy <= r2 && cb(a)) return;
+          }
+          i = this.hashNext[i];
+        }
+      }
+    }
+  }
+
+  private refreshClaims(): void {
+    this.claimedBrood.clear();
+    this.claimedDig.clear();
+    this.queenFeederId = null;
+    const queen = this.getQueen();
+    for (const a of this.ants) {
+      if (a.targetId != null) {
+        if (queen && a.targetId === queen.id) this.queenFeederId = a.id;
+        else this.claimedBrood.add(a.targetId);
+      }
+      if ((a.digIdx ?? -1) >= 0) this.claimedDig.add(a.digIdx!);
+    }
+    let stored = 0;
+    for (const f of this.foods) if (f.storedInChamberId !== null) stored += f.amount;
+    this.storedFoodCache = stored;
+  }
+
+  public getQueen(): Ant | undefined {
+    return this.ants.find((a) => a.caste === AntCaste.QUEEN);
+  }
+
+  // ================================================================================================================
+  // Brood & queen
+  // ================================================================================================================
+
   private stepBrood(dt: number): void {
     for (let i = this.brood.length - 1; i >= 0; i--) {
       const b = this.brood[i];
@@ -883,33 +1363,46 @@ export class AntColonySimulation {
 
       if (b.carriedByAntId === null) {
         const g = this.grid.worldToGrid(b.x, b.y + 3);
-        if (this.grid.inBounds(g.gx, g.gy) && !this.grid.isSolid(g.gx, g.gy)) {
-          b.y += 18 * dt;
+        if (this.grid.inBounds(g.gx, g.gy) && !this.grid.isSolid(g.gx, g.gy)) b.y += 18 * dt;
+        const own = this.grid.worldToGrid(b.x, b.y);
+        if (this.grid.isSolid(own.gx, own.gy)) {
+          // buried by a collapse: pop it back into the nearest open space
+          const safe = this.grid.findNearestNavigable(own.gx, own.gy, 6);
+          if (safe) {
+            const w = this.grid.gridToWorld(safe.gx, safe.gy);
+            b.x = w.x;
+            b.y = w.y;
+          }
         }
       }
 
       if (b.stage === BroodStage.EGG) {
-        b.progress += dt * 3.5;
+        b.progress += dt * 3.2;
         if (b.progress >= 100) {
           b.stage = BroodStage.LARVA;
           b.progress = 0;
-          b.nutrition = 45;
+          b.nutrition = 50;
         }
       } else if (b.stage === BroodStage.LARVA) {
-        b.nutrition = Math.max(0, b.nutrition - dt * 1.05);
-        if (b.nutrition > 18) {
-          b.progress += dt * (1.8 + (b.nutrition / 100) * 1.9);
+        b.nutrition = Math.max(0, b.nutrition - dt * 0.7);
+        if (b.nutrition > 15) b.progress += dt * (1.4 + (b.nutrition / 100) * 1.8);
+        b.starve = b.nutrition <= 0 ? (b.starve ?? 0) + dt : 0;
+        if ((b.starve ?? 0) > 40) {
+          this.brood.splice(i, 1);
+          this.log('A neglected larva starved', 'danger');
+          continue;
         }
         if (b.progress >= 100) {
           b.stage = BroodStage.PUPA;
           b.progress = 0;
         }
-      } else if (b.stage === BroodStage.PUPA) {
-        b.progress += dt * 2.6;
+      } else {
+        b.progress += dt * 2.4;
         if (b.progress >= 100) {
           if (this.ants.length < MAX_COLONY) {
             const caste = this.chooseNeededCaste();
-            this.spawnAnt(caste, b.x, b.y - 2, true);
+            const a = this.spawnAnt(caste, b.x, b.y - 2, true);
+            a.age = 0;
           }
           this.brood.splice(i, 1);
         }
@@ -918,280 +1411,678 @@ export class AntColonySimulation {
   }
 
   private chooseNeededCaste(): AntCaste {
-    let nurses = 0;
-    let excavators = 0;
     let soldiers = 0;
+    for (const a of this.ants) if (a.caste === AntCaste.SOLDIER) soldiers++;
+    const total = Math.max(1, this.ants.length);
+    if (soldiers / total < (this.intruders.length > 0 ? 0.18 : 0.13)) return AntCaste.SOLDIER;
+    // Young workers start as nurses (age polyethism); the labour balancer moves them on as they mature.
+    return AntCaste.NURSE;
+  }
+
+  private stepQueenLaying(dt: number): void {
+    const queen = this.getQueen();
+    if (!queen) return;
+    const royal = this.nearestChamber(ChamberType.ROYAL, queen.x, queen.y);
+    if (!royal) return;
+    this.queenEggTimer -= dt;
+    if (this.queenEggTimer > 0) return;
+    const stored = this.storedFoodCache;
+    this.queenEggTimer = (stored > 120 ? 4.5 : stored > 40 ? 8 : 16) + this.brood.length * 0.06;
+    if (queen.hunger > 80 || stored < 12) return;
+    if (this.brood.length >= MAX_BROOD || this.ants.length + this.brood.length >= MAX_COLONY + 10) return;
+    if (BUSY_TASKS.has(queen.task) && queen.task !== AntTask.IDLE) return;
+    queen.task = AntTask.LAYING_EGG;
+    queen.stateTimer = 1.6;
+    queen.hunger = Math.min(100, queen.hunger + 2.5);
+    this.brood.push(
+      this.makeBrood(BroodStage.EGG, queen.x - Math.cos(queen.angle) * 14, queen.y - Math.sin(queen.angle) * 6, royal.id, 0, 100)
+    );
+  }
+
+  // ================================================================================================================
+  // Colony planning: expansion, labour
+  // ================================================================================================================
+
+  private canExcavate(i: number): boolean {
+    const t = this.grid.terrain[i];
+    return t === CellType.TOPSOIL || t === CellType.SUBSOIL || t === CellType.DEEP_CLAY || t === CellType.ROOT;
+  }
+
+  private markPlan(gx: number, gy: number, level: 1 | 2): boolean {
+    if (!this.grid.inBounds(gx, gy)) return false;
+    const i = this.grid.idx(gx, gy);
+    if (!this.canExcavate(i)) return false;
+    if (gx * CELL_SIZE < CASE_LEFT + 30 || gx * CELL_SIZE > CASE_RIGHT - 30 || gy * CELL_SIZE > CASE_BOTTOM - 24) return false;
+    if (level === 1 && gy * CELL_SIZE < this.grid.surfaceY[gx] + 24) return false;
+    if (this.digPlan[i] < level) this.digPlan[i] = level;
+    return true;
+  }
+
+  private planExpansion(dt: number): void {
+    this.planTimer -= dt;
+    if (this.planTimer > 0) return;
+    this.planTimer = 3;
+
+    // recount outstanding work, dropping cells that were dug (or can no longer be dug)
+    let plan = 0;
+    let repair = 0;
+    for (let i = 0; i < N_CELLS; i++) {
+      const p = this.digPlan[i];
+      if (!p) continue;
+      if (!this.canExcavate(i)) {
+        this.digPlan[i] = 0;
+        continue;
+      }
+      if (p === 2) repair++;
+      else plan++;
+    }
+    if (plan + repair !== this.planCount + this.repairCount) this.fieldDirty.dig = true;
+    this.planCount = plan;
+    this.repairCount = repair;
+
+    // projects become real chambers once mostly hollowed out
+    for (let k = this.projects.length - 1; k >= 0; k--) {
+      const p = this.projects[k];
+      let remaining = 0;
+      let total = 0;
+      for (let gy = Math.floor((p.y - p.ry) / CELL_SIZE); gy <= Math.ceil((p.y + p.ry) / CELL_SIZE); gy++) {
+        for (let gx = Math.floor((p.x - p.rx) / CELL_SIZE); gx <= Math.ceil((p.x + p.rx) / CELL_SIZE); gx++) {
+          if (!this.grid.inBounds(gx, gy)) continue;
+          const w = this.grid.gridToWorld(gx, gy);
+          const dx = (w.x - p.x) / p.rx;
+          const dy = (w.y - p.y) / p.ry;
+          if (dx * dx + dy * dy > 0.8) continue;
+          total++;
+          if (this.grid.terrain[this.grid.idx(gx, gy)] !== CellType.TUNNEL) remaining++;
+        }
+      }
+      if (total === 0 || remaining / total < 0.2) {
+        this.projects.splice(k, 1);
+        if (p.kind === 'chamber') {
+          this.chambers.push({ id: p.id, type: p.type, x: p.x, y: p.y, rx: p.rx, ry: p.ry });
+          for (const fk of STATIC_FIELDS) this.fieldDirty[fk] = true;
+          this.log(`Excavators finished a new ${p.type.toLowerCase()}`, 'good');
+        } else {
+          this.log('A new gallery tunnel was completed', 'good');
+        }
+      }
+    }
+
+    // Keep one project on the go while the colony needs room (and always a little slow digging)
+    if (this.projects.length === 0 && plan < 8) {
+      const pop = this.ants.length + this.brood.length;
+      const nurseries = this.chambers.filter((c) => c.type === ChamberType.NURSERY).length;
+      const granaries = this.chambers.filter((c) => c.type === ChamberType.GRANARY).length;
+      const piles = this.foods.filter((f) => f.storedInChamberId !== null).length;
+      if (this.chambers.length < 13) {
+        let type = ChamberType.NURSERY;
+        if (this.brood.length > nurseries * 22) type = ChamberType.NURSERY;
+        else if (piles > granaries * 9 || this.storedFoodCache > granaries * 380) type = ChamberType.GRANARY;
+        else if (pop > this.chambers.length * 30) type = this.chambers.length % 2 === 0 ? ChamberType.NURSERY : ChamberType.GRANARY;
+        else type = Math.random() < 0.5 ? ChamberType.NURSERY : ChamberType.GRANARY;
+        if (Math.random() < 0.3 || !this.planNewProject(type)) this.planGallery();
+      } else if (this.tunnelsDugCells < 3500 && Math.random() < 0.25) {
+        this.planGallery();
+      }
+    }
+  }
+
+  /** Picks a site for a new chamber near the existing nest and plans the tunnel + chamber cells. */
+  private planNewProject(type: ChamberType): boolean {
+    let best: { x: number; y: number; rx: number; ry: number; tx: number; ty: number; score: number } | null = null;
+    const depthBias = Math.min(1, this.chambers.length / 10);
+    for (let attempt = 0; attempt < 70; attempt++) {
+      const rx = 40 + Math.random() * 18;
+      const ry = 20 + Math.random() * 8;
+      const x = CASE_LEFT + 110 + Math.random() * (CASE_RIGHT - CASE_LEFT - 220);
+      const y = SURFACE_BASE_Y + 110 + Math.random() * (CASE_BOTTOM - SURFACE_BASE_Y - 170);
+      let tooClose = false;
+      for (const c of this.chambers.concat(this.projects as unknown as Chamber[])) {
+        if (Math.abs(c.x - x) < c.rx + rx + 36 && Math.abs(c.y - y) < c.ry + ry + 40) {
+          tooClose = true;
+          break;
+        }
+      }
+      if (tooClose) continue;
+      // the site must be solid diggable earth with a margin around it
+      let ok = true;
+      let cells = 0;
+      let bad = 0;
+      for (let gy = Math.floor((y - ry - 12) / CELL_SIZE); gy <= Math.ceil((y + ry + 12) / CELL_SIZE) && ok; gy++) {
+        for (let gx = Math.floor((x - rx - 12) / CELL_SIZE); gx <= Math.ceil((x + rx + 12) / CELL_SIZE); gx++) {
+          if (!this.grid.inBounds(gx, gy)) {
+            ok = false;
+            break;
+          }
+          const t = this.grid.terrain[this.grid.idx(gx, gy)];
+          if (t === CellType.TUNNEL || t === CellType.AIR || t === CellType.GLASS_WALL) {
+            ok = false;
+            break;
+          }
+          cells++;
+          if (t === CellType.PEBBLE) bad++;
+        }
+      }
+      if (!ok || bad > cells * 0.06) continue;
+      // nearest existing tunnel to connect from
+      const g = this.grid.worldToGrid(x, y);
+      let found: { gx: number; gy: number } | null = null;
+      for (let r = 4; r <= 36 && !found; r++) {
+        for (let k = 0; k < 24 && !found; k++) {
+          const a = (k / 24) * Math.PI * 2;
+          const gx = g.gx + Math.round(Math.cos(a) * r);
+          const gy = g.gy + Math.round(Math.sin(a) * r * 0.8);
+          if (!this.grid.inBounds(gx, gy)) continue;
+          if (this.grid.terrain[this.grid.idx(gx, gy)] === CellType.TUNNEL && gy * CELL_SIZE > this.grid.surfaceY[gx] + 30) {
+            found = { gx, gy };
+          }
+        }
+      }
+      if (!found) continue;
+      const t = this.grid.gridToWorld(found.gx, found.gy);
+      if (this.lineHitsPebble(t.x, t.y, x, y)) continue;
+      const dist = Math.hypot(t.x - x, t.y - y);
+      const score = dist - depthBias * (y - SURFACE_BASE_Y) * 0.35 + Math.random() * 60;
+      if (!best || score < best.score) best = { x, y, rx, ry, tx: t.x, ty: t.y, score };
+    }
+    if (!best) return false;
+
+    const tunnel = this.wigglyLine(best.tx, best.ty, best.x, best.y);
+    let marked = 0;
+    for (const p of tunnel) marked += this.planDisc(p.x, p.y, 7.5);
+    const minGx = Math.floor((best.x - best.rx - 4) / CELL_SIZE);
+    const maxGx = Math.ceil((best.x + best.rx + 4) / CELL_SIZE);
+    const minGy = Math.floor((best.y - best.ry - 4) / CELL_SIZE);
+    const maxGy = Math.ceil((best.y + best.ry + 4) / CELL_SIZE);
+    for (let gy = minGy; gy <= maxGy; gy++) {
+      for (let gx = minGx; gx <= maxGx; gx++) {
+        const w = this.grid.gridToWorld(gx, gy);
+        const ang = Math.atan2(w.y - best.y, w.x - best.x);
+        const wob = 1 + 0.08 * Math.sin(ang * 5 + best.x) + 0.05 * Math.cos(ang * 3 - best.y);
+        const dx = (w.x - best.x) / (best.rx * wob);
+        const dy = (w.y - best.y) / (best.ry * wob);
+        if (dx * dx + dy * dy <= 1 && this.markPlan(gx, gy, 1)) marked++;
+      }
+    }
+    this.projects.push({ id: this.allocId(), kind: 'chamber', type, x: best.x, y: best.y, rx: best.rx, ry: best.ry, totalCells: marked });
+    this.fieldDirty.dig = true;
+    this.log(`Workers began digging toward a new ${type.toLowerCase()}`);
+    return true;
+  }
+
+  /** A long winding side gallery (real nests are full of them). */
+  private planGallery(): boolean {
+    for (let attempt = 0; attempt < 40; attempt++) {
+      // start from a random deep tunnel cell
+      const gx = 14 + Math.floor(Math.random() * (GRID_W - 28));
+      const gy = 50 + Math.floor(Math.random() * (GRID_H - 64));
+      if (this.grid.terrain[this.grid.idx(gx, gy)] !== CellType.TUNNEL) continue;
+      const s = this.grid.gridToWorld(gx, gy);
+      const ang = (Math.random() < 0.5 ? 0 : Math.PI) + (Math.random() - 0.3) * 1.1;
+      const len = 90 + Math.random() * 120;
+      const ex = clamp(s.x + Math.cos(ang) * len, CASE_LEFT + 60, CASE_RIGHT - 60);
+      const ey = clamp(s.y + Math.abs(Math.sin(ang)) * len * 0.6 + 10, SURFACE_BASE_Y + 80, CASE_BOTTOM - 50);
+      if (this.lineHitsPebble(s.x, s.y, ex, ey)) continue;
+      // don't run straight into existing tunnels further along
+      let crosses = false;
+      for (let t = 0.35; t <= 1; t += 0.08) {
+        const c = this.grid.worldToGrid(s.x + (ex - s.x) * t, s.y + (ey - s.y) * t);
+        if (this.grid.terrain[this.grid.idx(c.gx, c.gy)] === CellType.TUNNEL) crosses = true;
+      }
+      if (crosses) continue;
+      let marked = 0;
+      for (const p of this.wigglyLine(s.x, s.y, ex, ey)) marked += this.planDisc(p.x, p.y, 7);
+      marked += this.planDisc(ex, ey, 11);
+      if (marked < 10) continue;
+      this.projects.push({ id: this.allocId(), kind: 'gallery', type: ChamberType.NURSERY, x: ex, y: ey, rx: 9, ry: 9, totalCells: marked });
+      this.fieldDirty.dig = true;
+      this.log('Excavators started a new side gallery');
+      return true;
+    }
+    return false;
+  }
+
+  private planDisc(cx: number, cy: number, r: number): number {
+    let n = 0;
+    for (let gy = Math.floor((cy - r) / CELL_SIZE); gy <= Math.ceil((cy + r) / CELL_SIZE); gy++) {
+      for (let gx = Math.floor((cx - r) / CELL_SIZE); gx <= Math.ceil((cx + r) / CELL_SIZE); gx++) {
+        const w = this.grid.gridToWorld(gx, gy);
+        if ((w.x - cx) ** 2 + ((w.y - cy) / 0.9) ** 2 <= r * r && this.markPlan(gx, gy, 1)) n++;
+      }
+    }
+    return n;
+  }
+
+  private wigglyLine(x0: number, y0: number, x1: number, y1: number): Vec2[] {
+    const pts: Vec2[] = [];
+    const len = Math.hypot(x1 - x0, y1 - y0);
+    const nx = -(y1 - y0) / Math.max(1, len);
+    const ny = (x1 - x0) / Math.max(1, len);
+    const amp = Math.min(22, len * 0.12) * (Math.random() < 0.5 ? -1 : 1);
+    const phase = Math.random() * Math.PI;
+    const steps = Math.max(2, Math.ceil(len / 4));
+    for (let s = 0; s <= steps; s++) {
+      const t = s / steps;
+      const off = Math.sin(t * Math.PI) * amp + Math.sin(t * Math.PI * 3 + phase) * 4;
+      pts.push({ x: x0 + (x1 - x0) * t + nx * off, y: y0 + (y1 - y0) * t + ny * off });
+    }
+    return pts;
+  }
+
+  private lineHitsPebble(x0: number, y0: number, x1: number, y1: number): boolean {
+    const steps = Math.ceil(Math.hypot(x1 - x0, y1 - y0) / 4);
+    for (let s = 0; s <= steps; s++) {
+      const t = s / Math.max(1, steps);
+      const g = this.grid.worldToGrid(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t);
+      const c = this.grid.terrain[this.grid.idx(g.gx, g.gy)];
+      if (c === CellType.PEBBLE || c === CellType.GLASS_WALL) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Response-threshold style labour allocation: workers switch between nursing, digging and foraging as demand
+   * shifts. Young ants nurse first, older ones move outdoors (age polyethism).
+   */
+  private rebalanceLabour(dt: number): void {
+    this.labourTimer -= dt;
+    if (this.labourTimer > 0) return;
+    this.labourTimer = 2.5;
+
+    let nurses = 0;
+    let diggers = 0;
+    let foragers = 0;
     for (const a of this.ants) {
       if (a.caste === AntCaste.NURSE) nurses++;
-      else if (a.caste === AntCaste.EXCAVATOR) excavators++;
-      else if (a.caste === AntCaste.SOLDIER) soldiers++;
+      else if (a.caste === AntCaste.EXCAVATOR) diggers++;
+      else if (a.caste === AntCaste.WORKER) foragers++;
     }
-    const total = Math.max(1, this.ants.length);
-    if (nurses / total < 0.22) return AntCaste.NURSE;
-    if (soldiers / total < 0.14) return AntCaste.SOLDIER;
-    if (excavators / total < 0.18) return AntCaste.EXCAVATOR;
-    return AntCaste.WORKER;
+    const workers = nurses + diggers + foragers;
+    if (workers < 4) return;
+    const larvae = this.brood.filter((b) => b.stage !== BroodStage.PUPA).length;
+    const wantNurses = clamp(Math.round(4 + this.brood.length * 0.35 + larvae * 0.15), Math.max(4, Math.round(workers * 0.14)), Math.round(workers * 0.4));
+    const work = this.planCount + this.repairCount * 3;
+    const wantDiggers = work > 0 ? clamp(Math.round(3 + Math.sqrt(work) * 1.2 + this.repairCount * 0.4), 3, Math.round(workers * 0.3)) : 2;
+    const wantForagers = workers - wantNurses - wantDiggers;
+
+    const deficits: [AntCaste, number][] = [
+      [AntCaste.NURSE, wantNurses - nurses],
+      [AntCaste.EXCAVATOR, wantDiggers - diggers],
+      [AntCaste.WORKER, wantForagers - foragers],
+    ];
+    deficits.sort((a, b) => b[1] - a[1]);
+    const [needCaste, need] = deficits[0];
+    if (need <= 0) return;
+    // take from the caste with the biggest surplus
+    const surplus = deficits.filter(([c, d]) => d < 0 && c !== needCaste).sort((a, b) => a[1] - b[1]);
+    if (surplus.length === 0) return;
+    const fromCaste = surplus[0][0];
+    // nurses are recruited from the youngest, foragers from the oldest
+    let pick: Ant | null = null;
+    for (const a of this.ants) {
+      if (a.caste !== fromCaste || a.payload !== PayloadType.NONE || a.payloadId !== null || a.isCallow) continue;
+      if (a.targetId != null || a.task === AntTask.DEFENDING) continue;
+      if (!pick) pick = a;
+      else if (needCaste === AntCaste.NURSE ? a.age < pick.age : a.age > pick.age) pick = a;
+    }
+    if (!pick) return;
+    pick.caste = needCaste;
+    pick.speed = this.casteSpeed(needCaste);
+    pick.task = needCaste === AntCaste.NURSE ? AntTask.MOVING_BROOD : needCaste === AntCaste.EXCAVATOR ? AntTask.EXCAVATING : AntTask.FORAGING_SCOUT;
+    pick.digIdx = -1;
+    pick.payloadValue = 0;
+    this.stopMoving(pick);
+  }
+
+  // ================================================================================================================
+  // Weather damage
+  // ================================================================================================================
+
+  private stepStormDamage(dt: number): void {
+    if (this.weather !== 'Light Rain') return;
+    this.damageTimer -= dt;
+    if (this.damageTimer > 0) return;
+    this.damageTimer = 2.2 + Math.random() * 3;
+    if (Math.random() < 0.6) this.erodeMound();
+    else this.collapseShallowTunnel();
+  }
+
+  /** Rain washes soil down the steep faces of the mound; some runs back into the entrance crater and plugs it. */
+  private erodeMound(): void {
+    const ents: [number, number][] = [
+      [this.entrancePos.x, CRATER_MAIN],
+      [SIDE_ENTRANCE_X, CRATER_SIDE],
+    ];
+    for (let tries = 0; tries < 14; tries++) {
+      const [ex, crater] = ents[0];
+      const off = (crater + Math.random() * (this.moundRadius() + 20)) * (Math.random() < 0.5 ? -1 : 1);
+      const gx = clamp(Math.floor((ex + off) / CELL_SIZE), 12, GRID_W - 13);
+      const top = Math.floor(this.grid.surfaceY[gx] / CELL_SIZE);
+      const dir = Math.random() < 0.5 ? -1 : 1;
+      const ngx = gx + dir;
+      const ntop = Math.floor(this.grid.surfaceY[ngx] / CELL_SIZE);
+      if (ntop - top < 2) continue;
+      const ti = this.grid.idx(gx, top);
+      if (!this.canExcavate(ti) || this.grid.terrain[this.grid.idx(gx, top + 1)] === CellType.TUNNEL) continue;
+      const wx = (ngx + 0.5) * CELL_SIZE;
+      const intoCrater = Math.abs(wx - ex) < crater;
+      this.grid.setTerrain(gx, top, CellType.AIR);
+      this.grid.updateSurfaceColumn(gx);
+      if (intoCrater) {
+        // mud slides into the entrance throat
+        const plug = this.findEntrancePlugCell(ex);
+        if (plug >= 0) {
+          const pgx = plug % GRID_W;
+          const pgy = (plug - pgx) / GRID_W;
+          this.grid.setTerrain(pgx, pgy, CellType.SUBSOIL);
+          this.digPlan[plug] = 2;
+          this.grid.updateSurfaceColumn(pgx);
+          this.evictFrom(pgx, pgy);
+          this.log('Rain washed mud into a nest entrance!', 'danger');
+        }
+      } else {
+        const nGy = ntop - 1;
+        if (nGy > 4) {
+          this.grid.setTerrain(ngx, nGy, CellType.SUBSOIL);
+          this.grid.updateSurfaceColumn(ngx);
+          this.evictFrom(ngx, nGy);
+        }
+      }
+      this.spawnCrumbs((gx + 0.5) * CELL_SIZE, top * CELL_SIZE, '#5b4530', 3);
+      this.fieldDirty.dig = true;
+      return;
+    }
+  }
+
+  private findEntrancePlugCell(ex: number): number {
+    const egx = Math.floor(ex / CELL_SIZE);
+    for (let k = 0; k < 6; k++) {
+      const gx = egx + (k % 3) - 1;
+      const surf = Math.floor(this.grid.surfaceY[gx] / CELL_SIZE);
+      for (let gy = surf; gy < surf + 12 && gy < GRID_H - 2; gy++) {
+        const i = this.grid.idx(gx, gy);
+        if (this.grid.terrain[i] === CellType.TUNNEL || this.grid.terrain[i] === CellType.AIR) {
+          if (!this.cellOccupied(gx, gy)) return i;
+          break;
+        }
+      }
+    }
+    return -1;
+  }
+
+  /** Soaked ceilings of shallow tunnels slump in; the debris must be dug out again. */
+  private collapseShallowTunnel(): void {
+    for (let tries = 0; tries < 40; tries++) {
+      const gx = 14 + Math.floor(Math.random() * (GRID_W - 28));
+      const surf = Math.floor(this.grid.surfaceY[gx] / CELL_SIZE);
+      const gy = surf + 3 + Math.floor(Math.random() * 10);
+      if (!this.grid.inBounds(gx, gy)) continue;
+      if (this.grid.terrain[this.grid.idx(gx, gy)] !== CellType.TUNNEL) continue;
+      // only beneath wet soil, and never inside the royal chamber
+      const above = this.grid.idx(gx, Math.max(0, gy - 2));
+      if (this.grid.moisture[above] < 0.4 && Math.random() < 0.6) continue;
+      if (this.chambers.some((c) => c.type === ChamberType.ROYAL && Math.hypot((gx * CELL_SIZE - c.x) / c.rx, (gy * CELL_SIZE - c.y) / c.ry) < 1.3)) continue;
+      let n = 0;
+      const blob = 2 + Math.floor(Math.random() * 4);
+      for (let k = 0; k < 9 && n < blob; k++) {
+        const cx = gx + (k % 3) - 1;
+        const cy = gy + Math.floor(k / 3) - 1;
+        const i = this.grid.idx(cx, cy);
+        if (this.grid.terrain[i] !== CellType.TUNNEL || this.cellOccupied(cx, cy)) continue;
+        this.grid.setTerrain(cx, cy, CellType.SUBSOIL);
+        this.digPlan[i] = 2;
+        n++;
+      }
+      if (n > 0) {
+        this.spawnCrumbs(gx * CELL_SIZE, gy * CELL_SIZE, '#4a3828', 6);
+        this.fieldDirty.dig = true;
+        this.log('A soaked tunnel ceiling caved in', 'danger');
+        return;
+      }
+    }
+  }
+
+  private cellOccupied(gx: number, gy: number): boolean {
+    const x0 = gx * CELL_SIZE - 3;
+    const x1 = (gx + 1) * CELL_SIZE + 3;
+    const y0 = gy * CELL_SIZE - 3;
+    const y1 = (gy + 1) * CELL_SIZE + 3;
+    const inside = (x: number, y: number) => x >= x0 && x <= x1 && y >= y0 && y <= y1;
+    let hit = false;
+    this.forAntsNear((gx + 0.5) * CELL_SIZE, (gy + 0.5) * CELL_SIZE, 10, (a) => {
+      if (inside(a.x, a.y)) hit = true;
+      return hit;
+    });
+    if (hit) return true;
+    for (const b of this.brood) if (inside(b.x, b.y)) return true;
+    for (const f of this.foods) if (inside(f.x, f.y)) return true;
+    return false;
+  }
+
+  /** Lift anything sitting where a fresh clod of earth just landed. */
+  private evictFrom(gx: number, gy: number): void {
+    const surf = this.grid.surfaceY[gx];
+    const wx = (gx + 0.5) * CELL_SIZE;
+    for (const a of this.ants) {
+      if (Math.abs(a.x - wx) < 6 && a.y >= gy * CELL_SIZE - 3 && a.y <= (gy + 1) * CELL_SIZE + 3) {
+        if (a.y < surf + 8) a.y = surf - 1.5;
+      }
+    }
+    for (const f of this.foods) {
+      if (f.storedInChamberId === null && !f.falling && Math.abs(f.x - wx) < 8 && f.y >= surf - 4) f.y = surf - 3;
+    }
+  }
+
+  private spawnCrumbs(x: number, y: number, color: string, n: number): void {
+    for (let k = 0; k < n; k++) {
+      this.particles.push({
+        x: x + (Math.random() - 0.5) * 6,
+        y,
+        vx: (Math.random() - 0.5) * 22,
+        vy: -6 - Math.random() * 16,
+        size: 1.1 + Math.random() * 1.2,
+        alpha: 0.9,
+        life: 0,
+        maxLife: 0.5,
+        kind: 'crumb',
+        color,
+      });
+    }
+  }
+
+  // ================================================================================================================
+  // Intruders
+  // ================================================================================================================
+
+  private spawnIntruders(): void {
+    const homeEdge: 'left' | 'right' = Math.random() < 0.5 ? 'left' : 'right';
+    const creviceX = homeEdge === 'left' ? CASE_LEFT + 78 : CASE_RIGHT - 78;
+    const make = (species: Intruder['species'], behavior: Intruder['behavior'], dx: number) => {
+      const maxHp =
+        species === 'beetle' ? 120 : species === 'centipede' ? 95 : species === 'earwig' ? 80 : species === 'mite' ? 30 : 45;
+      const p = this.surfaceTarget(creviceX + dx);
+      this.intruders.push({
+        id: this.allocId(),
+        x: p.x,
+        y: p.y - 1,
+        vx: 0,
+        vy: 0,
+        angle: homeEdge === 'left' ? 0 : Math.PI,
+        hp: maxHp,
+        maxHp,
+        legPhase: Math.random() * Math.PI * 2,
+        species,
+        aggression: 1,
+        attackCooldown: 0,
+        behavior,
+        carryingFoodAmount: 0,
+        targetFoodId: null,
+        homeEdge,
+        path: [],
+        pathIndex: 0,
+        lastPathTime: -10,
+      });
+    };
+    const r = Math.random();
+    if (r < 0.4) {
+      const squad = 2 + (Math.random() < 0.5 ? 1 : 0);
+      for (let s = 0; s < squad; s++) make('rival_ant', s === 0 ? 'hunting_ants' : 'raiding_food', (homeEdge === 'left' ? 1 : -1) * s * 11);
+      this.log('A raiding party of rival ants approaches!', 'danger');
+    } else {
+      const r2 = Math.random();
+      const species: Intruder['species'] = r2 < 0.28 ? 'beetle' : r2 < 0.52 ? 'earwig' : r2 < 0.8 ? 'mite' : 'centipede';
+      const behavior: Intruder['behavior'] =
+        species === 'beetle' || species === 'earwig' ? 'raiding_food' : species === 'mite' ? 'infiltrating_brood' : 'hunting_ants';
+      make(species, behavior, 0);
+      const name = species === 'mite' ? 'A brood mite' : species === 'centipede' ? 'A hunting centipede' : species === 'earwig' ? 'An earwig' : 'A beetle';
+      this.log(`${name} crawls out of the rocks!`, 'danger');
+    }
   }
 
   private stepIntruders(dt: number): void {
     this.intruderTimer -= dt;
     if (this.intruderTimer <= 0) {
-      this.intruderTimer = 20 + Math.random() * 18;
-      if (this.intruders.length < 3) {
-        const homeEdge: 'left' | 'right' = Math.random() < 0.5 ? 'left' : 'right';
-        // Crawl out directly from under the left or right surface rock outcrop crevice in guaranteed open AIR
-        const creviceX = homeEdge === 'left' ? CASE_LEFT + 78 : CASE_RIGHT - 78;
-        const spawnR = Math.random();
-
-        const makeSpawnPos = (px: number): Vec2 => {
-          const gx = clamp(Math.floor(px / CELL_SIZE), 12, GRID_W - 13);
-          const sy = this.grid.surfaceY[gx] - 3;
-          const g = this.grid.worldToGrid(px, sy);
-          if (this.grid.isSolid(g.gx, g.gy) || !this.grid.isNavigable(g.gx, g.gy)) {
-            const safe = this.grid.findNearestNavigable(g.gx, g.gy, 6);
-            if (safe) return this.grid.gridToWorld(safe.gx, safe.gy);
-          }
-          return { x: px, y: sy };
-        };
-
-        if (spawnR < 0.58) {
-          // Spawn a coordinated rival ant raiding party (2-3 marauders) emerging from the rock shelter
-          const squadSize = 2 + (Math.random() < 0.45 ? 1 : 0);
-          for (let s = 0; s < squadSize; s++) {
-            const pos = makeSpawnPos(creviceX + (homeEdge === 'left' ? s * 11 : -s * 11));
-            this.intruders.push({
-              id: this.allocId(),
-              x: pos.x,
-              y: pos.y,
-              vx: 0,
-              vy: 0,
-              angle: homeEdge === 'left' ? 0 : Math.PI,
-              hp: 46,
-              maxHp: 46,
-              legPhase: Math.random() * Math.PI * 2,
-              species: 'rival_ant',
-              aggression: 1,
-              attackCooldown: 0,
-              behavior: s === 0 ? 'hunting_ants' : 'raiding_food',
-              carryingFoodAmount: 0,
-              targetFoodId: null,
-              homeEdge,
-              path: [],
-              pathIndex: 0,
-              lastPathTime: -10,
-            });
-          }
-        } else {
-          const pos = makeSpawnPos(creviceX);
-          const r = Math.random();
-          const species: Intruder['species'] =
-            r < 0.3 ? 'beetle' : r < 0.56 ? 'earwig' : r < 0.8 ? 'mite' : 'centipede';
-          const maxHp =
-            species === 'beetle' ? 72 : species === 'centipede' ? 62 : species === 'earwig' ? 54 : 38;
-          const behavior: Intruder['behavior'] =
-            species === 'beetle' || species === 'earwig'
-              ? 'raiding_food'
-              : species === 'mite'
-              ? 'infiltrating_brood'
-              : 'hunting_ants';
-          this.intruders.push({
-            id: this.allocId(),
-            x: pos.x,
-            y: pos.y,
-            vx: 0,
-            vy: 0,
-            angle: homeEdge === 'left' ? 0 : Math.PI,
-            hp: maxHp,
-            maxHp,
-            legPhase: 0,
-            species,
-            aggression: 1,
-            attackCooldown: 0,
-            behavior,
-            carryingFoodAmount: 0,
-            targetFoodId: null,
-            homeEdge,
-            path: [],
-            pathIndex: 0,
-            lastPathTime: -10,
-          });
-        }
-      }
+      this.intruderTimer = 40 + Math.random() * 45;
+      if (this.intruders.length < 3 && this.ants.length > 12) this.spawnIntruders();
     }
-
-    const granary = this.getChamber(ChamberType.GRANARY);
-    const nursery = this.getChamber(ChamberType.NURSERY);
 
     for (let i = this.intruders.length - 1; i >= 0; i--) {
       const m = this.intruders[i];
       m.legPhase += dt * (m.species === 'centipede' ? 24 : m.species === 'rival_ant' ? 22 : m.species === 'mite' ? 20 : 16);
       m.attackCooldown = Math.max(0, m.attackCooldown - dt);
-
-      const carrying = (m.carryingFoodAmount ?? 0) > 0;
-      const retreating = m.hp < m.maxHp * 0.28 || carrying;
-      if (retreating) m.behavior = 'retreating';
-
+      m.age = (m.age ?? 0) + dt;
+      const shelterXHome = (m.homeEdge ?? 'left') === 'left' ? CASE_LEFT + 72 : CASE_RIGHT - 72;
+      if (Math.abs(m.x - shelterXHome) > 70) m.roamed = true;
+      // invaders lose their nerve after a while (or when the alarm brings a crowd of defenders)
+      if (m.age > 80 || (m.age > 20 && this.countAntsNear(m.x, m.y, 26) >= (m.species === 'beetle' ? 7 : 5))) m.behavior = 'retreating';
       const prevX = m.x;
       const prevY = m.y;
 
-      const baseSpeed =
-        m.hp < m.maxHp * 0.28
-          ? 38
-          : m.species === 'rival_ant'
-          ? 31
-          : m.species === 'mite'
-          ? 25
-          : m.species === 'centipede'
-          ? 24
-          : m.species === 'earwig'
-          ? 22
-          : 19;
+      const carrying = (m.carryingFoodAmount ?? 0) > 0;
+      if (m.hp < m.maxHp * 0.3 || carrying || m.behavior === 'retreating') m.behavior = 'retreating';
+      const retreating = m.behavior === 'retreating';
+      const speed =
+        (carrying ? 0.6 : 1) *
+        (retreating && m.hp < m.maxHp * 0.3 ? 36 : m.species === 'rival_ant' ? 31 : m.species === 'mite' ? 24 : m.species === 'centipede' ? 26 : m.species === 'earwig' ? 22 : 19) *
+        0.85;
 
-      const rockShelterX =
-        (m.homeEdge ?? (m.x < 700 ? 'left' : 'right')) === 'left' ? CASE_LEFT + 72 : CASE_RIGHT - 72;
-      const shelterGx = clamp(Math.floor(rockShelterX / CELL_SIZE), 12, GRID_W - 13);
-      const shelterPos = { x: rockShelterX, y: this.grid.surfaceY[shelterGx] - 3 };
+      const g = this.grid.worldToGrid(m.x, m.y);
+      const underground = m.y > this.grid.surfaceY[g.gx] + 8 || this.grid.terrain[this.grid.idx(g.gx, g.gy)] === CellType.TUNNEL;
+      const shelterX = (m.homeEdge ?? 'left') === 'left' ? CASE_LEFT + 72 : CASE_RIGHT - 72;
 
+      // pick where to go
+      let fieldKey: FieldKey | null = null;
       let goalX = this.entrancePos.x;
-      let wantShaft = false;
-
+      let directTarget: Vec2 | null = null;
       if (retreating) {
-        goalX = rockShelterX;
-      } else if (m.species === 'rival_ant' || m.species === 'beetle' || m.species === 'earwig') {
-        let targetFood =
-          m.targetFoodId != null
-            ? this.foods.find((f) => f.id === m.targetFoodId && f.storedInChamberId === null && !f.falling && f.amount > 1)
-            : undefined;
-        if (!targetFood && m.behavior !== 'hunting_ants') {
-          let bestD = Infinity;
-          for (const f of this.foods) {
-            if (f.storedInChamberId === null && !f.falling && f.amount > 1) {
-              const d = Math.abs(f.x - m.x);
-              if (d < bestD) {
-                bestD = d;
-                targetFood = f;
-              }
-            }
-          }
-          m.targetFoodId = targetFood ? targetFood.id : null;
-        }
-        if (targetFood) {
-          goalX = targetFood.x;
-          if (Math.hypot(targetFood.x - m.x, targetFood.y - m.y) < 12) {
-            const stolen = Math.min(targetFood.amount, 12);
-            targetFood.amount -= stolen;
-            m.carryingFoodAmount = stolen;
-            m.targetFoodId = null;
-            m.path = [];
-          }
-        } else if (m.species === 'rival_ant') {
-          // Rival raiders target surface ants cleanly without stalling over deep subterranean tunnels
-          let prey: Ant | undefined;
-          let bestD = 220;
-          for (const a of this.ants) {
-            if (a.caste === AntCaste.QUEEN) continue;
-            const ag = this.grid.worldToGrid(a.x, a.y);
-            if (a.y > this.grid.surfaceY[ag.gx] + 10) continue;
-            const d = Math.hypot(a.x - m.x, a.y - m.y);
-            if (d < bestD) {
+        if (underground) fieldKey = 'surface';
+        else goalX = shelterX;
+      } else {
+        let prey: Ant | null = null;
+        if (m.behavior === 'hunting_ants') {
+          let bestD = 200;
+          this.forAntsNear(m.x, m.y, 200, (a) => {
+            if (a.caste === AntCaste.QUEEN) return;
+            const d = Math.abs(a.x - m.x) + Math.abs(a.y - m.y);
+            if (d < bestD && (underground || this.isOutside(a.x, a.y))) {
               bestD = d;
               prey = a;
             }
+          });
+        }
+        let food: FoodSource | undefined;
+        if (m.behavior === 'raiding_food' && !underground) {
+          let bestD = 420;
+          for (const f of this.foods) {
+            if (f.storedInChamberId !== null || f.falling || f.amount < 2) continue;
+            const d = Math.abs(f.x - m.x);
+            if (d < bestD) {
+              bestD = d;
+              food = f;
+            }
           }
-          goalX = prey ? prey.x : this.entrancePos.x;
-          wantShaft = !prey;
+        }
+        if (prey) {
+          const p = prey as Ant;
+          if (underground) directTarget = { x: p.x, y: p.y };
+          else goalX = p.x;
+        } else if (food) {
+          goalX = food.x;
+          if (Math.abs(food.x - m.x) < 10 && Math.abs(food.y - m.y) < 12) {
+            const stolen = Math.min(food.amount, 8);
+            food.amount -= stolen;
+            m.carryingFoodAmount = stolen;
+          }
         } else {
-          goalX = this.entrancePos.x;
-          wantShaft = true;
-        }
-      } else if (m.species === 'mite') {
-        goalX = this.entrancePos.x;
-        wantShaft = true;
-      } else {
-        let prey: Ant | undefined;
-        let bestD = 180;
-        for (const a of this.ants) {
-          if (a.caste === AntCaste.QUEEN) continue;
-          const ag = this.grid.worldToGrid(a.x, a.y);
-          if (a.y > this.grid.surfaceY[ag.gx] + 12) continue;
-          const d = Math.hypot(a.x - m.x, a.y - m.y);
-          if (d < bestD) {
-            bestD = d;
-            prey = a;
+          // raid inside the nest
+          const key: FieldKey = m.species === 'mite' || m.species === 'centipede' ? 'nursery' : 'granary';
+          if (underground || Math.abs(m.x - this.entrancePos.x) < 22 || Math.abs(m.x - SIDE_ENTRANCE_X) < 18) fieldKey = key;
+          else goalX = Math.abs(m.x - SIDE_ENTRANCE_X) < Math.abs(m.x - this.entrancePos.x) * 0.6 ? SIDE_ENTRANCE_X : this.entrancePos.x;
+          if (underground) {
+            // steal from the granary / prey on brood once there
+            if (key === 'granary') {
+              const pile = this.foods.find((f) => f.storedInChamberId !== null && f.amount > 2 && Math.abs(f.x - m.x) < 12 && Math.abs(f.y - m.y) < 12);
+              if (pile && m.attackCooldown <= 0) {
+                const stolen = Math.min(pile.amount, 10);
+                pile.amount -= stolen;
+                m.carryingFoodAmount = stolen;
+                this.log(`Intruder stole food from the granary`, 'danger');
+              }
+            } else {
+              const b = this.brood.find((br) => br.carriedByAntId === null && Math.abs(br.x - m.x) < 11 && Math.abs(br.y - m.y) < 11);
+              if (b && m.attackCooldown <= 0) {
+                m.attackCooldown = 1.2;
+                b.nutrition -= 30;
+                b.progress = Math.max(0, b.progress - 15);
+                if (b.nutrition < -20 || b.stage === BroodStage.EGG) {
+                  this.brood.splice(this.brood.indexOf(b), 1);
+                  this.log(`${m.species === 'mite' ? 'A mite' : 'The centipede'} devoured some brood!`, 'danger');
+                }
+              }
+            }
           }
         }
-        goalX = prey ? prey.x : this.entrancePos.x;
-        wantShaft = !prey;
       }
 
-      const mg = this.grid.worldToGrid(m.x, m.y);
-      const inTunnel = this.grid.terrain[this.grid.idx(mg.gx, mg.gy)] === CellType.TUNNEL || m.y > this.grid.surfaceY[mg.gx] + 6;
-      const shouldUseTunnelAStar = (inTunnel || (!retreating && wantShaft && Math.abs(m.x - this.entrancePos.x) < 28));
-
-      if (shouldUseTunnelAStar) {
-        const deepGoal = retreating
-          ? shelterPos
-          : m.species === 'mite' && nursery
-          ? { x: nursery.x, y: nursery.y }
-          : granary
-          ? { x: granary.x, y: granary.y }
-          : { x: this.entrancePos.x - 10, y: 340 };
-
-        if ((!m.path || m.path.length === 0 || (m.pathIndex ?? 0) >= m.path.length) && this.simTime - (m.lastPathTime ?? -10) > 0.9 && this.pathBudgetThisTick < 3) {
-          this.pathBudgetThisTick++;
-          m.lastPathTime = this.simTime;
-          m.path = this.grid.findPath({ x: m.x, y: m.y }, deepGoal);
+      // movement
+      if (fieldKey) {
+        const f = this.fields[fieldKey];
+        const ci = this.antCell(m);
+        if (!m.path || (m.pathIndex ?? 0) >= m.path.length) {
+          const nxt = this.grid.descend(f, ci);
+          const nxt2 = nxt >= 0 ? this.grid.descend(f, nxt) : -1;
+          m.path = [];
+          for (const c of [nxt, nxt2]) {
+            if (c < 0) break;
+            const gx = c % GRID_W;
+            m.path.push(this.grid.gridToWorld(gx, (c - gx) / GRID_W));
+          }
           m.pathIndex = 0;
+          if (m.path.length === 0 && f[ci] <= 0.5 && fieldKey === 'surface') {
+            // reached open ground: walk home along the surface next step
+            m.y = this.grid.surfaceY[g.gx] - 3;
+          }
         }
-
-        const path = m.path ?? [];
-        const pIdx = m.pathIndex ?? 0;
-        const wp = pIdx < path.length ? path[pIdx] : deepGoal;
-        const dx = wp.x - m.x;
-        const dy = wp.y - m.y;
-        const dist = Math.hypot(dx, dy);
-        if (dist < 7 && pIdx < path.length) {
-          m.pathIndex = pIdx + 1;
-        }
-        const a = Math.atan2(dy, dx);
-        const step = Math.min(dist, baseSpeed * 0.78 * dt);
-        const nx = clamp(m.x + Math.cos(a) * step, CASE_LEFT + 16, CASE_RIGHT - 16);
-        const ny = clamp(m.y + Math.sin(a) * step, CASE_TOP + 14, CASE_BOTTOM - 14);
-        const ng = this.grid.worldToGrid(nx, ny);
-        if (!this.grid.isSolid(ng.gx, ng.gy) && this.grid.isNavigable(ng.gx, ng.gy)) {
-          m.x = nx;
-          m.y = ny;
-        } else {
-          const gX = this.grid.worldToGrid(nx, m.y);
-          const gY = this.grid.worldToGrid(m.x, ny);
-          if (!this.grid.isSolid(gX.gx, gX.gy)) m.x = nx;
-          else if (!this.grid.isSolid(gY.gx, gY.gy)) m.y = ny;
-          else m.path = [];
-        }
-        m.angle = a;
+        const wp = m.path && (m.pathIndex ?? 0) < m.path.length ? m.path[m.pathIndex ?? 0] : directTarget;
+        if (wp) this.moveIntruderToward(m, wp.x, wp.y, speed, dt);
+      } else if (directTarget) {
+        m.path = [];
+        this.moveIntruderToward(m, directTarget.x, directTarget.y, speed, dt);
       } else {
         m.path = [];
         const dir = goalX >= m.x ? 1 : -1;
-        const nx = clamp(m.x + dir * baseSpeed * dt, CASE_LEFT + 16, CASE_RIGHT - 16);
-        const gx = clamp(Math.floor(nx / CELL_SIZE), 0, GRID_W - 1);
-        const surfY = this.grid.surfaceY[gx] - 2.5;
-        const ny = m.y + (surfY - m.y) * Math.min(1, dt * 10);
-        const ng = this.grid.worldToGrid(nx, ny);
-        if (!this.grid.isSolid(ng.gx, ng.gy)) {
+        if (Math.abs(goalX - m.x) > 2) {
+          const nx = clamp(m.x + dir * speed * dt, CASE_LEFT + 16, CASE_RIGHT - 16);
+          const surfY = this.grid.surfaceY[clamp(Math.floor(nx / CELL_SIZE), 0, GRID_W - 1)] - 2.5;
           m.x = nx;
-          m.y = ny;
-        } else {
-          // Step cleanly over steep surface bumps without jamming into the tunnel lip
-          m.x = nx;
-          m.y = surfY - 2.5;
+          m.y = m.y + (surfY - m.y) * Math.min(1, dt * 10);
+          m.angle = dir > 0 ? 0 : Math.PI;
         }
-        m.angle = dir > 0 ? 0 : Math.PI;
       }
 
-      // Hard guarantee no intruder ever remains wedged inside solid soil or a tunnel edge
-      const checkMg = this.grid.worldToGrid(m.x, m.y);
-      if (this.grid.isSolid(checkMg.gx, checkMg.gy) || !this.grid.isNavigable(checkMg.gx, checkMg.gy)) {
-        const safe = this.grid.findNearestNavigable(checkMg.gx, checkMg.gy, 6);
+      const cg = this.grid.worldToGrid(m.x, m.y);
+      if (this.grid.isSolid(cg.gx, cg.gy) || !this.grid.isNavigable(cg.gx, cg.gy)) {
+        const safe = this.grid.findNearestNavigable(cg.gx, cg.gy, 8);
         if (safe) {
           const w = this.grid.gridToWorld(safe.gx, safe.gy);
           m.x = w.x;
@@ -1199,117 +2090,152 @@ export class AntColonySimulation {
           m.path = [];
         }
       }
+      m.vx = (m.x - prevX) / dt;
+      m.vy = (m.y - prevY) / dt;
+      this.grid.depositPheromone(this.grid.alarmPheromone, m.x, m.y, 0.5 * dt * 10, 2);
 
-      m.vx = (m.x - prevX) / Math.max(0.001, dt);
-      m.vy = (m.y - prevY) / Math.max(0.001, dt);
-
-      this.grid.depositPheromone(this.grid.alarmPheromone, m.x, m.y, 0.55 * dt * 10, 2);
-
-      // Combat strike against colony ants (natural mandible standoff range)
-      if (m.hp >= m.maxHp * 0.28 && m.attackCooldown <= 0) {
-        const nearbyAnt = this.ants.find((a) => a.caste !== AntCaste.QUEEN && Math.hypot(a.x - m.x, a.y - m.y) < 15.5);
-        if (nearbyAnt) {
-          m.attackCooldown = m.species === 'rival_ant' ? 0.85 : m.species === 'centipede' ? 1.0 : 1.45;
-          nearbyAnt.hunger = Math.min(95, nearbyAnt.hunger + (m.species === 'rival_ant' ? 7 : 6));
-          if (m.carryingFoodAmount && m.carryingFoodAmount > 0 && nearbyAnt.caste === AntCaste.SOLDIER) {
-            this.foods.push({
-              id: this.allocId(),
-              type: PayloadType.SEED,
-              x: m.x,
-              y: m.y,
-              amount: m.carryingFoodAmount,
-              maxAmount: 30,
-              radius: 5,
-              storedInChamberId: null,
-            });
+      // bite the nearest ant in reach
+      if (m.attackCooldown <= 0 && m.hp >= m.maxHp * 0.3) {
+        let victim: Ant | null = null;
+        let bestD = 14;
+        this.forAntsNear(m.x, m.y, 14, (a) => {
+          const d = Math.hypot(a.x - m.x, a.y - m.y);
+          if (d < bestD) {
+            bestD = d;
+            victim = a;
+          }
+        });
+        if (victim) {
+          const v = victim as Ant;
+          m.attackCooldown = m.species === 'rival_ant' ? 0.8 : m.species === 'centipede' ? 0.9 : m.species === 'mite' ? 1.1 : 1.15;
+          const dmg = m.species === 'centipede' ? 9 : m.species === 'beetle' ? 7 : m.species === 'earwig' ? 7 : m.species === 'mite' ? 3 : 6;
+          v.hp = (v.hp ?? 24) - dmg * (v.caste === AntCaste.QUEEN ? 0.5 : 1);
+          v.lastHitTime = this.simTime;
+          this.spark((m.x + v.x) * 0.5, (m.y + v.y) * 0.5, '#f59e0b');
+          // a soldier's counter-bite can make a raider drop its loot
+          if (carrying && v.caste === AntCaste.SOLDIER && Math.random() < 0.35) {
+            this.dropFoodAt(m.x, m.y, PayloadType.SEED, m.carryingFoodAmount ?? 0);
             m.carryingFoodAmount = 0;
           }
-          this.particles.push({
-            x: (m.x + nearbyAnt.x) * 0.5,
-            y: (m.y + nearbyAnt.y) * 0.5,
-            vx: (Math.random() - 0.5) * 28,
-            vy: -16 - Math.random() * 14,
-            size: 1.4,
-            alpha: 0.7,
-            life: 0,
-            maxLife: 0.35,
-            kind: 'spark',
-            color: '#f59e0b',
-          });
         }
       }
 
-      const backInRocks = retreating && Math.abs(m.x - rockShelterX) < 12 && m.y <= SURFACE_BASE_Y + 22;
-      if (m.hp <= 0 || backInRocks) {
+      const escaped = retreating && !underground && Math.abs(m.x - shelterX) < 12 && (m.roamed || m.age > 25);
+      if (m.hp <= 0 || escaped) {
         if (m.hp <= 0) {
-          // Keep dropped protein/seed clear of narrow entrance shafts so bottlenecks never clog
-          let dropX = m.x;
-          let dropY = m.y;
-          const mGx = clamp(Math.floor(m.x / CELL_SIZE), 0, GRID_W - 1);
-          const nearMain = Math.abs(m.x - this.entrancePos.x) < 38;
-          const nearSide = Math.abs(m.x - 405) < 28;
-          if ((nearMain || nearSide) && m.y > this.grid.surfaceY[mGx] - 6) {
-            const entX = nearMain ? this.entrancePos.x : 405;
-            const side = m.x >= entX ? 1 : -1;
-            dropX = clamp(entX + side * (nearMain ? 48 : 34), CASE_LEFT + 32, CASE_RIGHT - 32);
-            const dGx = clamp(Math.floor(dropX / CELL_SIZE), 0, GRID_W - 1);
-            dropY = this.grid.surfaceY[dGx] - 3;
-          }
-          if (m.carryingFoodAmount && m.carryingFoodAmount > 0) {
-            this.foods.push({
-              id: this.allocId(),
-              type: PayloadType.SEED,
-              x: dropX - 6,
-              y: dropY,
-              amount: m.carryingFoodAmount,
-              maxAmount: 30,
-              radius: 5,
-              storedInChamberId: null,
-            });
-          }
-          this.foods.push({
-            id: this.allocId(),
-            type: PayloadType.PROTEIN,
-            x: dropX,
-            y: dropY,
-            amount: m.species === 'rival_ant' ? 24 : 38,
-            maxAmount: 48,
-            radius: 5,
-            storedInChamberId: null,
-          });
+          if ((m.carryingFoodAmount ?? 0) > 0) this.dropFoodAt(m.x - 5, m.y, PayloadType.SEED, m.carryingFoodAmount ?? 0);
+          this.dropFoodAt(m.x, m.y, PayloadType.PROTEIN, m.species === 'rival_ant' || m.species === 'mite' ? 22 : 40);
+          const name = m.species === 'rival_ant' ? 'a rival ant' : m.species === 'earwig' ? 'an earwig' : `a ${m.species}`;
+          this.log(`Defenders killed ${name}; its body becomes food`, 'good');
+        } else if ((m.carryingFoodAmount ?? 0) > 0) {
+          this.log('A raider escaped with stolen food', 'danger');
+        } else {
+          this.log(`The ${m.species === 'rival_ant' ? 'rival ant' : m.species} was driven off`, 'good');
         }
         this.intruders.splice(i, 1);
+        this.fieldDirty.threat = true;
       }
     }
   }
 
-  /**
-   * Soft pairwise separation & deterministic tangential passing dodge so ants, rival ants,
-   * and soil predators never interpenetrate, freeze head-on, or wedge inside one another.
-   */
+  private countAntsNear(x: number, y: number, r: number): number {
+    let n = 0;
+    this.forAntsNear(x, y, r, () => {
+      n++;
+    });
+    return n;
+  }
+
+  private moveIntruderToward(m: Intruder, tx: number, ty: number, speed: number, dt: number): void {
+    const dx = tx - m.x;
+    const dy = ty - m.y;
+    const dist = Math.hypot(dx, dy);
+    if (dist < 1) {
+      m.pathIndex = (m.pathIndex ?? 0) + 1;
+      return;
+    }
+    if (dist < 4 && m.path && (m.pathIndex ?? 0) < m.path.length) m.pathIndex = (m.pathIndex ?? 0) + 1;
+    const a = Math.atan2(dy, dx);
+    const step = Math.min(dist, speed * dt);
+    const nx = m.x + Math.cos(a) * step;
+    const ny = m.y + Math.sin(a) * step;
+    const ng = this.grid.worldToGrid(nx, ny);
+    if (this.grid.isNavigable(ng.gx, ng.gy)) {
+      m.x = nx;
+      m.y = ny;
+    } else {
+      const gX = this.grid.worldToGrid(nx, m.y);
+      const gY = this.grid.worldToGrid(m.x, ny);
+      if (this.grid.isNavigable(gX.gx, gX.gy)) m.x = nx;
+      else if (this.grid.isNavigable(gY.gx, gY.gy)) m.y = ny;
+      else m.path = [];
+    }
+    m.angle = lerpAngle(m.angle, a, Math.min(1, dt * 10));
+  }
+
+  private dropFoodAt(x: number, y: number, type: FoodSource['type'], amount: number): void {
+    if (amount <= 0.5) return;
+    let dx = x;
+    let dy = y;
+    const gx = clamp(Math.floor(x / CELL_SIZE), 0, GRID_W - 1);
+    const onSurface = y <= this.grid.surfaceY[gx] + 6;
+    // keep the entrance throats clear
+    for (const [ex, r] of [[this.entrancePos.x, 40], [SIDE_ENTRANCE_X, 30]] as const) {
+      if (onSurface && Math.abs(x - ex) < r) {
+        dx = ex + (x >= ex ? 1 : -1) * (r + 6);
+        dy = this.surfaceTarget(dx).y - 1;
+      }
+    }
+    this.foods.push({
+      id: this.allocId(),
+      type,
+      x: dx,
+      y: dy,
+      amount,
+      maxAmount: Math.max(30, amount),
+      radius: 5,
+      storedInChamberId: null,
+    });
+  }
+
+  private spark(x: number, y: number, color: string): void {
+    if (this.particles.length > 220) return;
+    this.particles.push({
+      x,
+      y,
+      vx: (Math.random() - 0.5) * 24,
+      vy: -12 - Math.random() * 12,
+      size: 1.2,
+      alpha: 0.75,
+      life: 0,
+      maxLife: 0.28,
+      kind: 'spark',
+      color,
+    });
+  }
+
+  // ================================================================================================================
+  // Crowding
+  // ================================================================================================================
+
   private resolveEntityCrowding(dt: number): void {
     const canOccupy = (px: number, py: number): boolean => {
-      if (px <= CASE_LEFT + 12 || px >= CASE_RIGHT - 12 || py <= CASE_TOP + 12 || py >= CASE_BOTTOM - 12) {
-        return false;
-      }
+      if (px <= CASE_LEFT + 12 || px >= CASE_RIGHT - 12 || py <= CASE_TOP + 12 || py >= CASE_BOTTOM - 12) return false;
       const g = this.grid.worldToGrid(px, py);
-      return !this.grid.isSolid(g.gx, g.gy) && this.grid.isNavigable(g.gx, g.gy);
+      return this.grid.isNavigable(g.gx, g.gy);
     };
-
     const nudgePair = (
       a: { id: number; x: number; y: number },
       b: { id: number; x: number; y: number },
       minDist: number,
-      strength: number,
-      allowDodge: boolean
+      strength: number
     ) => {
       let dx = b.x - a.x;
       let dy = b.y - a.y;
       let dist = Math.hypot(dx, dy);
       if (dist >= minDist) return;
-
       if (dist < 0.05) {
-        const ang = ((a.id * 2.39996 + b.id * 1.17) % (Math.PI * 2));
+        const ang = (a.id * 2.39996 + b.id * 1.17) % (Math.PI * 2);
         dx = Math.cos(ang);
         dy = Math.sin(ang);
         dist = 1;
@@ -1317,21 +2243,16 @@ export class AntColonySimulation {
         dx /= dist;
         dy /= dist;
       }
-
       const overlap = minDist - dist;
-      // Keep the shove well below walking speed (~37 u/s) so a few neighbours can never pin an ant in place;
-      // ants should ease around each other (tangential dodge) rather than get bulldozed backwards.
       const push = Math.min(0.9 * dt * 60, overlap * strength * Math.min(1, dt * 18));
       const sign = a.id < b.id ? 1 : -1;
-      const dodge = allowDodge ? push * 0.9 * sign : 0;
-
+      const dodge = push * 0.9 * sign;
       const ax = a.x - dx * push - dy * dodge;
       const ay = a.y - dy * push + dx * dodge;
       if (canOccupy(ax, ay)) {
         a.x = ax;
         a.y = ay;
       }
-
       const bx = b.x + dx * push + dy * dodge;
       const by = b.y + dy * push - dx * dodge;
       if (canOccupy(bx, by)) {
@@ -1340,44 +2261,25 @@ export class AntColonySimulation {
       }
     };
 
-    // 1. Ant vs Ant separation
-    const nAnts = this.ants.length;
-    for (let i = 0; i < nAnts; i++) {
+    for (let i = 0; i < this.ants.length; i++) {
       const a = this.ants[i];
-      for (let j = i + 1; j < nAnts; j++) {
-        const b = this.ants[j];
-        if (Math.abs(a.x - b.x) > 12 || Math.abs(a.y - b.y) > 12) continue;
-        if (a.trophallaxisPartnerId === b.id || b.trophallaxisPartnerId === a.id) continue;
-        const minDist = a.caste === AntCaste.QUEEN || b.caste === AntCaste.QUEEN ? 10.5 : 7.5;
-        nudgePair(a, b, minDist, 0.55, true);
-      }
+      if (BUSY_TASKS.has(a.task) && a.task !== AntTask.IDLE) continue;
+      this.forAntsNear(a.x, a.y, 11, (b) => {
+        if (b.id <= a.id) return;
+        if (a.trophallaxisPartnerId === b.id) return;
+        const minDist = a.caste === AntCaste.QUEEN || b.caste === AntCaste.QUEEN ? 10.5 : 7.0;
+        nudgePair(a, b, minDist, 0.5);
+      });
     }
-
-    // 2. Intruder vs Intruder separation
-    const nIntr = this.intruders.length;
-    for (let i = 0; i < nIntr; i++) {
-      const a = this.intruders[i];
-      for (let j = i + 1; j < nIntr; j++) {
-        const b = this.intruders[j];
-        if (Math.abs(a.x - b.x) > 16 || Math.abs(a.y - b.y) > 16) continue;
-        const large =
-          a.species === 'beetle' ||
-          a.species === 'centipede' ||
-          b.species === 'beetle' ||
-          b.species === 'centipede';
-        nudgePair(a, b, large ? 13.5 : 10.5, 0.65, true);
-      }
-    }
-
-    // 3. Ant vs Intruder combat standoff (face-to-face bite distance without merging inside torsos)
-    for (let i = 0; i < nIntr; i++) {
+    for (let i = 0; i < this.intruders.length; i++) {
       const m = this.intruders[i];
-      const standoff = m.species === 'rival_ant' || m.species === 'mite' ? 9.0 : 12.0;
-      for (let j = 0; j < nAnts; j++) {
-        const a = this.ants[j];
-        if (Math.abs(a.x - m.x) > 15 || Math.abs(a.y - m.y) > 15) continue;
-        nudgePair(a, m, standoff, 0.65, true);
+      for (let j = i + 1; j < this.intruders.length; j++) {
+        const o = this.intruders[j];
+        if (Math.abs(m.x - o.x) > 16 || Math.abs(m.y - o.y) > 16) continue;
+        nudgePair(m, o, 12, 0.65);
       }
+      const standoff = m.species === 'rival_ant' || m.species === 'mite' ? 9.0 : 12.0;
+      this.forAntsNear(m.x, m.y, standoff, (a) => nudgePair(a, m, standoff, 0.65));
     }
   }
 
@@ -1385,376 +2287,1074 @@ export class AntColonySimulation {
     for (let i = this.fallenAnts.length - 1; i >= 0; i--) {
       const f = this.fallenAnts[i];
       if (f.carriedByAntId !== null) continue;
-      // Corpses at the midden are broken down quickly; any left lying elsewhere desiccate and get dismantled
-      // by passers-by far more slowly, so they can never pile up without bound.
-      f.decayTimer -= dt * (f.atMidden ? 1 : 0.12);
-      if (f.decayTimer <= 0) {
-        this.fallenAnts.splice(i, 1);
-      }
+      f.decayTimer -= dt * (f.atMidden ? 1 : 0.1);
+      if (f.decayTimer <= 0) this.fallenAnts.splice(i, 1);
     }
   }
 
-  /**
-   * Colonies reallocate labour when a task is short-handed. If nurses run low (they age out like everyone else)
-   * a worker switches to brood care, otherwise larvae starve and the colony cannot renew itself.
-   */
-  private rebalanceLabour(dt: number): void {
-    this.labourTimer -= dt;
-    if (this.labourTimer > 0) return;
-    this.labourTimer = 4 + Math.random() * 3;
+  // ================================================================================================================
+  // Ants
+  // ================================================================================================================
 
-    let nurses = 0;
-    let total = 0;
-    for (const a of this.ants) {
-      if (a.caste === AntCaste.QUEEN) continue;
-      total++;
-      if (a.caste === AntCaste.NURSE) nurses++;
-    }
-    const needed = Math.max(3, Math.round(total * 0.14));
-    if (nurses >= needed || total < 6) return;
-
-    // Prefer an unladen worker that is already inside the nest, else any unladen worker.
-    let pick: Ant | null = null;
-    let pickInside = false;
-    for (const a of this.ants) {
-      if (a.caste !== AntCaste.WORKER || a.payload !== PayloadType.NONE || a.payloadId !== null || a.recruitFoodPos) continue;
-      const inside = a.y > this.grid.surfaceY[clamp(Math.floor(a.x / CELL_SIZE), 0, GRID_W - 1)] + 14;
-      if (!pick || (inside && !pickInside)) {
-        pick = a;
-        pickInside = inside;
+  private killAnt(index: number, cause: 'age' | 'combat' | 'starvation'): void {
+    const ant = this.ants[index];
+    this.releasePayload(ant);
+    let fx = ant.x;
+    let fy = ant.y;
+    const gx = clamp(Math.floor(ant.x / CELL_SIZE), 0, GRID_W - 1);
+    const surfY = this.grid.surfaceY[gx];
+    for (const [ex, r] of [[this.entrancePos.x, 30], [SIDE_ENTRANCE_X, 24]] as const) {
+      if (Math.abs(ant.x - ex) < r && ant.y > surfY - 4 && ant.y < surfY + 60) {
+        fx = clamp(ex + (ant.id % 2 === 0 ? 1 : -1) * (r + 18), CASE_LEFT + 32, CASE_RIGHT - 32);
+        fy = this.surfaceTarget(fx).y;
       }
-      if (inside) break;
     }
-    if (pick) {
-      pick.caste = AntCaste.NURSE;
-      pick.task = AntTask.MOVING_BROOD;
-      pick.path = [];
-      pick.targetPos = null;
-      pick.speed = 29 + Math.random() * 4;
+    this.fallenAnts.push({ id: this.allocId(), x: fx, y: fy, angle: ant.angle, carriedByAntId: null, atMidden: false, decayTimer: 25 });
+    this.ants.splice(index, 1);
+    if (ant.caste === AntCaste.QUEEN) this.log('The queen has died! The colony cannot raise new workers', 'danger');
+    else if (cause === 'combat') this.log(`A ${ant.caste.toLowerCase()} fell defending the colony`, 'danger');
+    else if (cause === 'starvation') this.log(this.storedFoodCache < 10 ? 'A worker starved: the stores are empty' : 'A worker starved', 'danger');
+  }
+
+  /** Drop whatever is carried (brood goes back on the floor, food lands where the ant stands). */
+  private releasePayload(ant: Ant): void {
+    if (ant.payloadId !== null) {
+      if (ant.payload === PayloadType.REFUSE) {
+        const fa = this.fallenAnts.find((f) => f.id === ant.payloadId);
+        if (fa) fa.carriedByAntId = null;
+      } else {
+        const b = this.brood.find((br) => br.id === ant.payloadId);
+        if (b) b.carriedByAntId = null;
+      }
+    } else if (isFoodPayload(ant.payload) && ant.payloadValue > 0) {
+      this.dropFoodAt(ant.x, ant.y, ant.payload as FoodSource['type'], ant.payloadValue);
     }
+    ant.payload = PayloadType.NONE;
+    ant.payloadId = null;
+    ant.payloadValue = 0;
+    ant.targetId = null;
+    ant.digIdx = -1;
   }
 
   private stepAnts(dt: number): void {
-    this.rebalanceLabour(dt);
-    const granary = this.getChamber(ChamberType.GRANARY);
-    const nursery = this.getChamber(ChamberType.NURSERY);
-    const royal = this.getChamber(ChamberType.ROYAL);
-
-    // Queen egg laying
-    if (royal) {
-      const storedFood = this.foods
-        .filter((f) => f.storedInChamberId !== null)
-        .reduce((acc, f) => acc + f.amount, 0);
-      this.queenEggTimer -= dt;
-      if (this.queenEggTimer <= 0) {
-        this.queenEggTimer = storedFood > 60 ? 5.2 : 10.5;
-        if (this.brood.length < 44 && this.ants.length + this.brood.length < MAX_COLONY && storedFood > 15) {
-          const queen = this.ants.find((a) => a.caste === AntCaste.QUEEN);
-          if (queen) {
-            queen.task = AntTask.LAYING_EGG;
-            queen.stateTimer = 1.4;
-            this.brood.push({
-              id: this.allocId(),
-              stage: BroodStage.EGG,
-              x: queen.x - Math.cos(queen.angle) * 14,
-              y: queen.y - Math.sin(queen.angle) * 14,
-              progress: 0,
-              nutrition: 100,
-              carriedByAntId: null,
-              chamberId: royal.id,
-              wigglePhase: Math.random() * Math.PI * 2,
-            });
-          }
-        }
-      }
-    }
-
+    const night = this.isNight();
     for (let i = this.ants.length - 1; i >= 0; i--) {
       const ant = this.ants[i];
       ant.age += dt;
       ant.greetCooldown = Math.max(0, ant.greetCooldown - dt);
       ant.signalCooldown = Math.max(0, (ant.signalCooldown ?? 0) - dt);
+      ant.attackCd = Math.max(0, (ant.attackCd ?? 0) - dt);
       ant.antennaPhase += dt * (ant.task === AntTask.TROPHALLAXIS || ant.task === AntTask.GREETING || ant.task === AntTask.SIGNALING_FOOD ? 18 : 8);
-
       if (ant.isCallow) {
         ant.callowTimer -= dt;
         if (ant.callowTimer <= 0) ant.isCallow = false;
       }
 
-      // Natural end of life -> becomes FallenAnt for Necrophoresis undertakers
+      ant.hunger = clamp(ant.hunger + dt * (ant.caste === AntCaste.QUEEN ? 0.22 : ant.task === AntTask.IDLE ? 0.06 : 0.11), 0, 100);
+      ant.hydration = clamp(ant.hydration - dt * 0.2, 0, 100);
+      if (ant.hunger >= 100) ant.hp = (ant.hp ?? 24) - dt * 0.6;
+      else if (ant.hunger < 60 && this.simTime - (ant.lastHitTime ?? -99) > 6) ant.hp = Math.min(ant.maxHp ?? 24, (ant.hp ?? 24) + dt * 0.8);
+
+      if ((ant.hp ?? 1) <= 0) {
+        this.killAnt(i, ant.hunger >= 100 ? 'starvation' : 'combat');
+        continue;
+      }
       if (ant.caste !== AntCaste.QUEEN && ant.age > ant.maxAge) {
-        if (ant.payloadId !== null) {
-          if (ant.payload === PayloadType.REFUSE) {
-            const carriedFa = this.fallenAnts.find((f) => f.id === ant.payloadId);
-            if (carriedFa) carriedFa.carriedByAntId = null;
-          } else {
-            const b = this.brood.find((br) => br.id === ant.payloadId);
-            if (b) b.carriedByAntId = null;
-          }
-        }
-        let fx = ant.x;
-        let fy = ant.y;
-        const fgx = clamp(Math.floor(ant.x / CELL_SIZE), 0, GRID_W - 1);
-        const surfY = this.grid.surfaceY[fgx];
-        if ((Math.abs(ant.x - this.entrancePos.x) < 28 || Math.abs(ant.x - 405) < 22) && ant.y > surfY - 4 && ant.y < surfY + 60) {
-          const entX = Math.abs(ant.x - this.entrancePos.x) < 28 ? this.entrancePos.x : 405;
-          const side = ant.id % 2 === 0 ? 1 : -1;
-          fx = clamp(entX + side * 46, CASE_LEFT + 32, CASE_RIGHT - 32);
-          const nGx = clamp(Math.floor(fx / CELL_SIZE), 0, GRID_W - 1);
-          fy = this.grid.surfaceY[nGx] - 2;
-        }
-        this.fallenAnts.push({
-          id: this.allocId(),
-          x: fx,
-          y: fy,
-          angle: ant.angle,
-          carriedByAntId: null,
-          atMidden: false,
-          decayTimer: 22,
-        });
-        this.ants.splice(i, 1);
+        this.killAnt(i, 'age');
         continue;
       }
 
-      ant.hunger = clamp(ant.hunger + dt * (ant.caste === AntCaste.QUEEN ? 0.2 : 0.12), 0, 100);
-      ant.hydration = clamp(ant.hydration - dt * 0.25, 0, 100);
-
-      if (ant.hunger > 72 && ant.caste !== AntCaste.QUEEN && ant.payload === PayloadType.NONE) {
-        const stored = this.foods.find(
-          (f) => f.storedInChamberId !== null && f.amount > 2 && Math.hypot(f.x - ant.x, f.y - ant.y) < 38
-        );
-        if (stored) {
-          stored.amount = Math.max(0, stored.amount - 5);
-          ant.hunger = Math.max(0, ant.hunger - 48);
-          ant.energy = Math.min(100, ant.energy + 35);
-        }
-      }
-
-      // Resting: in a real colony a large share of workers are idle at any moment. Rest only happens inside a
-      // chamber (never in traffic lanes), never while carrying, and is cut short when intruders show up.
-      if (ant.task === AntTask.IDLE && ant.caste !== AntCaste.QUEEN) {
-        ant.stateTimer -= dt;
-        ant.vx = 0;
-        ant.vy = 0;
-        ant.path = [];
-        ant.targetPos = null;
-        const alarmed = this.intruderNear(ant, 110) && Math.random() < dt * 1.5;
-        if (ant.stateTimer <= 0 || alarmed) this.endRest(ant);
-        continue;
-      }
-      // Walking home to a chamber to rest
-      if (ant.task === AntTask.SEEKING_REST && ant.caste !== AntCaste.QUEEN) {
-        const ch = this.chambers.find((c) => c.id === ant.restChamberId);
-        ant.stateTimer -= dt;
-        const giveUp = !ch || ant.stateTimer <= 0 || this.intruderNear(ant, 90) || ant.payload !== PayloadType.NONE;
-        if (giveUp) {
-          this.endRest(ant);
-          continue;
-        }
-        if (this.isInsideChamber(ant, ch, 0.55)) {
-          ant.task = AntTask.IDLE;
-          ant.stateTimer = this.napDuration(ant);
-          ant.path = [];
-          ant.targetPos = null;
-          continue;
-        }
-        if (ant.path.length === 0 && this.simTime - ant.lastPathCalcTime > 1.0 && this.pathBudgetThisTick < 4) {
-          this.pathBudgetThisTick++;
-          ant.lastPathCalcTime = this.simTime;
-          ant.path = this.grid.findPath(
-            { x: ant.x, y: ant.y },
-            { x: ch.x + (Math.random() - 0.5) * ch.rx * 0.9, y: ch.y + (Math.random() - 0.5) * ch.ry * 0.5 }
-          );
-          ant.pathIndex = 0;
-        }
+      if (ant.caste === AntCaste.QUEEN) {
+        this.stepQueen(ant, dt);
         this.moveAnt(ant, dt);
         continue;
       }
 
-      if (ant.caste !== AntCaste.QUEEN) {
-        ant.restCooldown = (ant.restCooldown ?? 10 + Math.random() * 60) - dt;
-        if (ant.restCooldown <= 0 && this.isCalmAndUnladen(ant)) {
-          const here = this.chambers.find((c) => this.isInsideChamber(ant, c, 1.0));
-          if (here && Math.random() < dt * 1.5) {
-            // already in a chamber: just settle down
-            ant.task = AntTask.IDLE;
-            ant.stateTimer = this.napDuration(ant);
-            ant.path = [];
-            ant.targetPos = null;
-            continue;
-          }
-          if (!here && Math.random() < dt * 0.12 && this.chambers.length > 0) {
-            // decide to head home for a rest
-            const ch = this.chambers[Math.floor(Math.random() * this.chambers.length)];
-            ant.task = AntTask.SEEKING_REST;
-            ant.restChamberId = ch.id;
-            ant.stateTimer = 40; // give up if we cannot get there
-            ant.path = [];
-            ant.targetPos = null;
-            ant.lastPathCalcTime = -10;
-            continue;
-          }
-        }
-      }
-
-      // Handle transient social, grooming, fungus-tending, and food-signaling states
-      if (ant.task === AntTask.SIGNALING_FOOD) {
+      // --- timed stationary activities -------------------------------------------------------------------------
+      if (ant.task === AntTask.EXCAVATING && (ant.digIdx ?? -1) >= 0) {
         ant.stateTimer -= dt;
         ant.vx = 0;
         ant.vy = 0;
-        const foodTarget = ant.recruitFoodPos;
-        if (foodTarget) {
-          let recruited = 0;
-          for (const mate of this.ants) {
-            if (
-              mate.id !== ant.id &&
-              mate.caste === AntCaste.WORKER &&
-              mate.payload === PayloadType.NONE &&
-              !mate.recruitFoodPos &&
-              mate.task !== AntTask.SIGNALING_FOOD &&
-              mate.task !== AntTask.DEFENDING &&
-              Math.hypot(mate.x - ant.x, mate.y - ant.y) < 58
-            ) {
-              mate.recruitFoodPos = { x: foodTarget.x, y: foodTarget.y };
-              mate.task = AntTask.FOLLOWING_FOOD_TRAIL;
-              mate.path = [];
-              mate.targetPos = null;
-              recruited++;
-              if (recruited >= 3) break;
-            }
-          }
-        }
-        if (ant.stateTimer <= 0) {
-          ant.task = AntTask.FOLLOWING_FOOD_TRAIL;
-          ant.path = [];
-          ant.targetPos = null;
-        }
+        if (ant.stateTimer <= 0) this.finishDig(ant);
         continue;
       }
-
-      if (ant.task === AntTask.TROPHALLAXIS || ant.task === AntTask.GREETING) {
+      if (BUSY_TASKS.has(ant.task)) {
         ant.stateTimer -= dt;
-        const partner = this.ants.find((o) => o.id === ant.trophallaxisPartnerId);
-        if (partner) {
-          ant.targetAngle = Math.atan2(partner.y - ant.y, partner.x - ant.x);
-          ant.angle = lerpAngle(ant.angle, ant.targetAngle, Math.min(1, dt * 10));
+        ant.vx = 0;
+        ant.vy = 0;
+        if (ant.trophallaxisPartnerId != null) {
+          const p = this.ants.find((o) => o.id === ant.trophallaxisPartnerId);
+          if (p) ant.angle = lerpAngle(ant.angle, Math.atan2(p.y - ant.y, p.x - ant.x), Math.min(1, dt * 8));
         }
-        if (ant.stateTimer <= 0 || !partner) {
+        const alarmed = ant.task === AntTask.IDLE && this.intruderNear(ant, ant.caste === AntCaste.SOLDIER ? 220 : 90);
+        const dawn = ant.task === AntTask.IDLE && ant.caste === AntCaste.WORKER && !night && ant.stateTimer > 4 && Math.random() < dt * 0.3;
+        if (ant.stateTimer <= 0 || alarmed || dawn) {
+          if (ant.task === AntTask.IDLE) ant.restCooldown = 40 + Math.random() * 80;
+          ant.task = AntTask.FORAGING_SCOUT;
           ant.trophallaxisPartnerId = null;
-          ant.task =
-            ant.caste === AntCaste.QUEEN
-              ? AntTask.IDLE
-              : ant.caste === AntCaste.NURSE
-              ? AntTask.MOVING_BROOD
-              : AntTask.FORAGING_SCOUT;
         }
+        if (ant.payloadId !== null) this.syncCarried(ant);
         continue;
       }
 
-      if (ant.task === AntTask.GROOMING || ant.task === AntTask.TENDING_FUNGUS) {
-        ant.stateTimer -= dt;
-        if (ant.stateTimer <= 0) {
-          ant.task =
-            ant.caste === AntCaste.NURSE
-              ? AntTask.MOVING_BROOD
-              : ant.caste === AntCaste.EXCAVATOR
-              ? AntTask.EXCAVATING
-              : AntTask.FORAGING_SCOUT;
-        }
+      // --- defence comes first ---------------------------------------------------------------------------------
+      const fight = this.handleThreat(ant, dt);
+      if (fight === 'hold') {
+        ant.vx = 0;
+        ant.vy = 0;
         continue;
       }
 
-      // Occasional antennal greeting between unladen nestmates passing close by (never inside entrance throats!)
-      const nearEntranceBottleneck =
-        Math.abs(ant.x - this.entrancePos.x) < 48 || Math.abs(ant.x - 405) < 36;
-      if (
-        !nearEntranceBottleneck &&
-        ant.caste !== AntCaste.QUEEN &&
-        ant.payload === PayloadType.NONE &&
-        ant.greetCooldown <= 0 &&
-        this.intruders.length === 0 &&
-        Math.random() < 0.015
-      ) {
-        const other = this.ants.find(
-          (o) =>
-            o.id !== ant.id &&
-            o.caste !== AntCaste.QUEEN &&
-            o.greetCooldown <= 0 &&
-            o.task !== AntTask.TROPHALLAXIS &&
-            o.task !== AntTask.GREETING &&
-            o.task !== AntTask.SIGNALING_FOOD &&
-            Math.hypot(o.x - ant.x, o.y - ant.y) < 9
-        );
-        if (other) {
-          ant.task = AntTask.GREETING;
-          ant.stateTimer = 0.55;
-          ant.greetCooldown = 14;
-          ant.trophallaxisPartnerId = other.id;
-          other.task = AntTask.GREETING;
-          other.stateTimer = 0.55;
-          other.greetCooldown = 14;
-          other.trophallaxisPartnerId = ant.id;
+      if (fight !== 'moving') {
+        // --- casual greeting between passing nestmates -----------------------------------------------------------
+        if (ant.payload === PayloadType.NONE && ant.greetCooldown <= 0 && Math.random() < dt * 0.4 && this.intruders.length === 0) {
+          let other: Ant | null = null;
+          this.forAntsNear(ant.x, ant.y, 9, (o) => {
+            if (o.id !== ant.id && o.caste !== AntCaste.QUEEN && o.greetCooldown <= 0 && !BUSY_TASKS.has(o.task) && o.payload === PayloadType.NONE) {
+              other = o;
+              return true;
+            }
+          });
+          if (other) {
+            const o = other as Ant;
+            // Trophallaxis if one is hungry and the other well fed, otherwise a quick antennal greeting
+            const share = Math.abs(ant.hunger - o.hunger) > 35;
+            for (const [p, q] of [[ant, o], [o, ant]] as const) {
+              p.task = share ? AntTask.TROPHALLAXIS : AntTask.GREETING;
+              p.stateTimer = share ? 1.8 : 0.7;
+              p.greetCooldown = 18 + Math.random() * 10;
+              p.trophallaxisPartnerId = q.id;
+              this.stopMoving(p);
+            }
+            if (share) {
+              const avg = (ant.hunger + o.hunger) / 2;
+              ant.hunger = avg;
+              o.hunger = avg;
+            }
+            continue;
+          }
+          ant.greetCooldown = 3;
+        }
+
+        if (ant.caste === AntCaste.WORKER) this.stepForager(ant, dt, night);
+        else if (ant.caste === AntCaste.NURSE) this.stepNurse(ant, dt);
+        else if (ant.caste === AntCaste.EXCAVATOR) this.stepExcavator(ant, dt);
+        else if (ant.caste === AntCaste.SOLDIER) this.stepSoldier(ant, dt, night);
+        if (BUSY_TASKS.has(ant.task) || (ant.task === AntTask.EXCAVATING && (ant.digIdx ?? -1) >= 0)) {
+          this.syncCarried(ant);
           continue;
         }
       }
 
-      if (ant.caste === AntCaste.QUEEN) {
-        this.stepQueen(ant, dt, royal);
-      } else if (ant.caste === AntCaste.WORKER) {
-        this.stepForager(ant, dt, granary);
-      } else if (ant.caste === AntCaste.NURSE) {
-        this.stepNurse(ant, dt, royal, nursery, granary);
-      } else if (ant.caste === AntCaste.EXCAVATOR) {
-        this.stepExcavator(ant, dt, royal);
-      } else if (ant.caste === AntCaste.SOLDIER) {
-        this.stepSoldier(ant, dt, royal);
-      }
-
+      // keep contour walks going between behaviour decisions
+      if (ant.navKey === 'contour' && ant.targetPos && ant.pathIndex >= ant.path.length) this.goTo(ant, ant.targetPos.x, ant.targetPos.y);
       this.moveAnt(ant, dt);
+      this.syncCarried(ant);
+    }
+  }
 
-      if (ant.payloadId !== null) {
-        if (ant.payload === PayloadType.REFUSE) {
-          const fa = this.fallenAnts.find((f) => f.id === ant.payloadId);
-          if (fa) {
-            fa.x = ant.x + Math.cos(ant.angle) * 7;
-            fa.y = ant.y + Math.sin(ant.angle) * 7;
-            fa.angle = ant.angle + 0.4;
-          }
+  private syncCarried(ant: Ant): void {
+    if (ant.payloadId === null) return;
+    if (ant.payload === PayloadType.REFUSE) {
+      const fa = this.fallenAnts.find((f) => f.id === ant.payloadId);
+      if (fa) {
+        fa.x = ant.x + Math.cos(ant.angle) * 7;
+        fa.y = ant.y + Math.sin(ant.angle) * 7;
+        fa.angle = ant.angle + 0.4;
+      } else {
+        ant.payloadId = null;
+        ant.payload = PayloadType.NONE;
+      }
+    } else {
+      const b = this.brood.find((br) => br.id === ant.payloadId);
+      if (b) {
+        b.x = ant.x + Math.cos(ant.angle) * 7;
+        b.y = ant.y + Math.sin(ant.angle) * 7;
+      } else {
+        ant.payloadId = null;
+        ant.payload = PayloadType.NONE;
+      }
+    }
+  }
+
+  private busy(ant: Ant, task: AntTask, seconds: number): void {
+    ant.task = task;
+    ant.stateTimer = seconds;
+    this.stopMoving(ant);
+  }
+
+  private intruderNear(ant: { x: number; y: number }, radius: number): boolean {
+    for (const m of this.intruders) {
+      if (Math.abs(m.x - ant.x) < radius && Math.abs(m.y - ant.y) < radius) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Alarm response. Soldiers converge on any intruder near or inside the nest; other workers fight what is right
+   * next to them (or anything that got inside), but flee large predators out on the open surface.
+   */
+  private handleThreat(ant: Ant, dt: number): 'none' | 'moving' | 'hold' {
+    if (this.intruders.length === 0) return 'none';
+    const soldier = ant.caste === AntCaste.SOLDIER;
+    const radius = soldier ? 320 : ant.caste === AntCaste.NURSE ? 45 : 60;
+    let target: Intruder | null = null;
+    let bestD = radius;
+    for (const m of this.intruders) {
+      if (m.hp <= 0) continue;
+      const d = Math.hypot(m.x - ant.x, m.y - ant.y);
+      if (d < bestD) {
+        bestD = d;
+        target = m;
+      }
+    }
+    if (!target) return 'none';
+    const m = target as Intruder;
+    if (!soldier && ant.payload !== PayloadType.NONE && bestD > 18) return 'none';
+    if (ant.hunger > 85 && bestD > 18) return 'none';
+    const g = this.grid.worldToGrid(m.x, m.y);
+    const inside = m.y > this.grid.surfaceY[g.gx] + 8;
+    const big = m.species === 'beetle' || m.species === 'centipede' || m.species === 'earwig';
+    if (!soldier && big && !inside && bestD > 16) {
+      // flee from big predators out in the open
+      if (bestD > 45) return 'none';
+      const away = ant.x >= m.x ? 1 : -1;
+      if (ant.task !== AntTask.FLEEING || !ant.targetPos || Math.sign(ant.targetPos.x - ant.x) !== away) {
+        const t = this.surfaceTarget(ant.x + away * 90);
+        this.goTo(ant, t.x, t.y);
+      }
+      ant.task = AntTask.FLEEING;
+      return 'moving';
+    }
+    if (ant.payload !== PayloadType.NONE && ant.payloadId === null && !isFoodPayload(ant.payload)) this.releasePayload(ant);
+    ant.task = AntTask.DEFENDING;
+    this.grid.depositPheromone(this.grid.alarmPheromone, ant.x, ant.y, 0.4, 1);
+    const reach = (soldier ? 16 : 14) + (big ? 3 : 0);
+    if (bestD < reach) {
+      ant.angle = lerpAngle(ant.angle, Math.atan2(m.y - ant.y, m.x - ant.x), Math.min(1, dt * 10));
+      if ((ant.attackCd ?? 0) <= 0) {
+        ant.attackCd = soldier ? 0.45 : 0.65;
+        m.hp -= soldier ? 9 : 3.5;
+        this.spark((ant.x + m.x) * 0.5, (ant.y + m.y) * 0.5, '#fef08a');
+      }
+      this.stopMoving(ant);
+      return 'hold';
+    }
+    // close and in the open: charge straight in; otherwise route through the tunnels
+    if (bestD < 22 || (bestD < 60 && this.isOutside(ant.x, ant.y) && !inside)) this.goTo(ant, m.x, m.y);
+    else if (this.go(ant, 'threat') >= INF) return 'none';
+    return 'moving';
+  }
+
+  private stepQueen(ant: Ant, dt: number): void {
+    ant.stateTimer -= dt;
+    if (ant.task === AntTask.LAYING_EGG || ant.task === AntTask.TROPHALLAXIS) {
+      if (ant.stateTimer > 0) {
+        this.stopMoving(ant);
+        ant.vx = 0;
+        ant.vy = 0;
+        return;
+      }
+      ant.task = AntTask.IDLE;
+      ant.trophallaxisPartnerId = null;
+    }
+    const royal = this.nearestChamber(ChamberType.ROYAL, ant.x, ant.y);
+    if (!royal) return;
+    if (!this.isInsideChamber(ant, royal, 1.0)) {
+      this.go(ant, 'royal');
+      return;
+    }
+    if (ant.stateTimer <= 0) {
+      ant.stateTimer = 3 + Math.random() * 4;
+      this.goTo(ant, royal.x + (Math.random() - 0.5) * royal.rx * 0.7, royal.y + royal.ry * 0.3);
+    }
+  }
+
+  // --- foragers ---------------------------------------------------------------------------------------------------
+
+  private stepForager(ant: Ant, dt: number, night: boolean): void {
+    ant.pheromoneDropTimer -= dt;
+    const onSurface = this.isOutside(ant.x, ant.y);
+
+    if (ant.payload === PayloadType.REFUSE) {
+      this.carryRefuse(ant);
+      return;
+    }
+
+    if (isFoodPayload(ant.payload)) {
+      ant.task = AntTask.RETURNING_WITH_FOOD;
+      if (onSurface && ant.pheromoneDropTimer <= 0) {
+        ant.pheromoneDropTimer = 0.12;
+        // successful foragers mark the way back so nestmates can follow it out
+        this.grid.depositPheromone(this.grid.foodPheromone, ant.x, ant.y, ant.recruitFoodPos ? 0.6 : 0.25, 1);
+      }
+      const d = this.go(ant, 'granary');
+      const g = this.nearestChamber(ChamberType.GRANARY, ant.x, ant.y);
+      if (g && (d <= 0.5 || this.isInsideChamber(ant, g, 0.6))) this.storeFood(ant, g);
+      return;
+    }
+
+    if (ant.hunger > 70 && this.storedFoodCache > 3) {
+      this.goEat(ant);
+      return;
+    }
+
+    // undertakers: a minority of workers clear corpses to the midden
+    if (ant.id % 4 === 0 && this.fallenAnts.length > 0) {
+      const corpse = this.fallenAnts.find((f) => !f.atMidden && f.carriedByAntId === null && Math.abs(f.x - ant.x) < 50 && Math.abs(f.y - ant.y) < 30);
+      if (corpse) {
+        ant.task = AntTask.NECROPHORESIS;
+        if (Math.hypot(corpse.x - ant.x, corpse.y - ant.y) < 9) {
+          corpse.carriedByAntId = ant.id;
+          ant.payload = PayloadType.REFUSE;
+          ant.payloadId = corpse.id;
+          this.stopMoving(ant);
+        } else this.goTo(ant, corpse.x, corpse.y);
+        return;
+      }
+    }
+
+    if (!onSurface) {
+      ant.excursion = 0;
+      if (night && !ant.recruitFoodPos) {
+        this.seekRest(ant, 'granary', 8 + Math.random() * 14);
+        return;
+      }
+      // pick up any food lying inside the nest (e.g. a dead intruder) on the way
+      const loose = this.foods.find((f) => f.storedInChamberId === null && !f.falling && f.amount > 1 && Math.abs(f.x - ant.x) < 28 && Math.abs(f.y - ant.y) < 16);
+      if (loose) {
+        if (this.tryPickFood(ant, loose)) return;
+        this.goTo(ant, loose.x, loose.y);
+        return;
+      }
+      if ((ant.restCooldown = (ant.restCooldown ?? 30) - dt) <= 0 && Math.random() < 0.3) {
+        ant.restCooldown = 60 + Math.random() * 80;
+        this.seekRest(ant, 'granary', 5 + Math.random() * 10);
+        return;
+      }
+      ant.task = ant.recruitFoodPos ? AntTask.FOLLOWING_FOOD_TRAIL : AntTask.FORAGING_SCOUT;
+      if (this.go(ant, 'surface') >= INF) this.seekRest(ant, 'granary', 6);
+      return;
+    }
+
+    // ---- out on the surface ----
+    ant.excursion = (ant.excursion ?? 0) + dt;
+    if (night && ant.excursion > 6) ant.excursion = 999;
+    if (ant.excursion > 70 + (ant.id % 7) * 8) {
+      // tired or dark: head home empty-handed
+      ant.recruitFoodPos = null;
+      ant.task = AntTask.SEEKING_REST;
+      const d = this.go(ant, 'granary');
+      if (d <= 0.5) {
+        ant.excursion = 0;
+        this.busy(ant, AntTask.IDLE, 6 + Math.random() * 10);
+      }
+      return;
+    }
+
+    if (ant.hydration < 55) {
+      const drop = this.droplets.find((dd) => dd.settled && Math.abs(dd.x - ant.x) < 60 && Math.abs(dd.y - ant.y) < 20);
+      if (drop) {
+        if (Math.hypot(drop.x - ant.x, drop.y - ant.y) < 7) {
+          ant.hydration = 100;
+          drop.volume = Math.max(0, drop.volume - 2);
+          this.busy(ant, AntTask.DRINKING_DEW, 1.2);
         } else {
-          const b = this.brood.find((br) => br.id === ant.payloadId);
-          if (b) {
-            b.x = ant.x + Math.cos(ant.angle) * 7;
-            b.y = ant.y + Math.sin(ant.angle) * 7;
-          } else {
-            ant.payloadId = null;
-            ant.payload = PayloadType.NONE;
-          }
+          ant.task = AntTask.FORAGING_SCOUT;
+          this.goTo(ant, drop.x, drop.y);
+        }
+        return;
+      }
+    }
+
+    // food in sight
+    let food: FoodSource | null = null;
+    let bestD = 140;
+    for (const f of this.foods) {
+      if (f.storedInChamberId !== null || f.falling || f.amount <= 1) continue;
+      const d = Math.abs(f.x - ant.x) + Math.abs(f.y - ant.y) * 2;
+      if (d < bestD) {
+        bestD = d;
+        food = f;
+      }
+    }
+    if (food) {
+      ant.task = AntTask.FOLLOWING_FOOD_TRAIL;
+      if (!this.tryPickFood(ant, food)) this.goTo(ant, food.x, food.y - 1);
+      return;
+    }
+
+    if (ant.recruitFoodPos) {
+      const rp = ant.recruitFoodPos;
+      const still = this.foods.some((f) => f.storedInChamberId === null && f.amount > 1 && Math.abs(f.x - rp.x) < 30);
+      if (!still || Math.abs(rp.x - ant.x) < 10) ant.recruitFoodPos = null;
+      else {
+        ant.task = AntTask.FOLLOWING_FOOD_TRAIL;
+        const t = this.surfaceTarget(rp.x);
+        this.goTo(ant, t.x, t.y);
+        return;
+      }
+    }
+
+    // sniff for a trail either side
+    const pAt = (x: number) => {
+      const g = this.grid.worldToGrid(x, ant.y);
+      return this.grid.foodPheromone[this.grid.idx(g.gx, g.gy)] + this.grid.foodPheromone[this.grid.idx(g.gx, Math.max(0, g.gy - 1))];
+    };
+    const pL = pAt(ant.x - 18);
+    const pR = pAt(ant.x + 18);
+    ant.stateTimer -= dt;
+    if (pL > 0.06 || pR > 0.06) {
+      ant.task = AntTask.FOLLOWING_FOOD_TRAIL;
+      ant.trailCommit = (ant.trailCommit ?? 0) - dt;
+      if (ant.trailDir === undefined || ant.trailCommit <= 0) {
+        // Outbound ants follow a trail *away from home* (they keep track of where the nest is), which brings them
+        // to the food at its far end rather than shuttling up and down it.
+        const home = Math.abs(ant.x - this.entrancePos.x) < Math.abs(ant.x - SIDE_ENTRANCE_X) ? this.entrancePos.x : SIDE_ENTRANCE_X;
+        const awayDir = ant.x >= home ? 1 : -1;
+        const ahead = awayDir > 0 ? pR : pL;
+        ant.trailDir = ahead > 0.03 ? awayDir : pR > pL ? 1 : -1;
+        ant.trailCommit = 2 + Math.random() * 2;
+      }
+      if (!ant.targetPos || ant.navKey !== 'contour' || Math.sign(ant.targetPos.x - ant.x) !== ant.trailDir || Math.abs(ant.targetPos.x - ant.x) < 12) {
+        const t = this.surfaceTarget(ant.x + ant.trailDir * 70);
+        this.goTo(ant, t.x, t.y);
+      }
+      return;
+    }
+    if (ant.stateTimer <= 0 || !ant.targetPos) {
+      ant.task = AntTask.FORAGING_SCOUT;
+      ant.stateTimer = 2.5 + Math.random() * 3.5;
+      // correlated random walk: mostly keep going the same way
+      const keep = Math.cos(ant.angle) >= 0 ? 1 : -1;
+      const dir = Math.random() < 0.75 ? keep : -keep;
+      const t = this.surfaceTarget(ant.x + dir * (60 + Math.random() * 160));
+      this.goTo(ant, t.x, t.y);
+    }
+  }
+
+  private tryPickFood(ant: Ant, food: FoodSource): boolean {
+    if (Math.hypot(food.x - ant.x, food.y - ant.y) > 10) return false;
+    this.counters.pickups++;
+    const take = Math.min(food.amount, 10);
+    food.amount -= take;
+    ant.payload = food.type;
+    ant.payloadValue = take;
+    ant.recruitFoodPos = food.amount > 6 && food.storedInChamberId === null ? { x: food.x, y: food.y } : null;
+    ant.pauseTimer = 0.4 + Math.random() * 0.4; // antennate the find before hauling it off
+    ant.task = AntTask.RETURNING_WITH_FOOD;
+    this.stopMoving(ant);
+    this.grid.depositPheromone(this.grid.foodPheromone, ant.x, ant.y, 0.9, 2);
+    return true;
+  }
+
+  private storeFood(ant: Ant, granary: Chamber): void {
+    this.counters.deliveries++;
+    const type = ant.payload as FoodSource['type'];
+    const piles = this.foods.filter((f) => f.storedInChamberId === granary.id);
+    const pile = piles.find((f) => f.type === type && f.amount < f.maxAmount - 2);
+    if (pile) pile.amount = Math.min(pile.maxAmount, pile.amount + ant.payloadValue);
+    else if (piles.length < 12) {
+      const fx = granary.x + (Math.random() - 0.5) * granary.rx * 1.2;
+      this.foods.push({
+        id: this.allocId(),
+        type,
+        x: fx,
+        y: this.chamberFloorY(granary, fx) - 3,
+        amount: ant.payloadValue,
+        maxAmount: 60,
+        radius: 5,
+        storedInChamberId: granary.id,
+      });
+    } else {
+      const smallest = piles.reduce((a, b) => (a.amount < b.amount ? a : b));
+      smallest.amount = Math.min(smallest.maxAmount + 20, smallest.amount + ant.payloadValue);
+    }
+    ant.payload = PayloadType.NONE;
+    ant.payloadValue = 0;
+    ant.hunger = Math.max(0, ant.hunger - 8);
+    if (ant.recruitFoodPos && (ant.signalCooldown ?? 0) <= 0) {
+      // waggle and antennate nestmates to recruit them to the find
+      ant.signalCooldown = 10;
+      const rp = ant.recruitFoodPos;
+      let recruited = 0;
+      this.forAntsNear(ant.x, ant.y, 70, (mate) => {
+        if (mate.caste === AntCaste.WORKER && mate.id !== ant.id && mate.payload === PayloadType.NONE && !mate.recruitFoodPos && !BUSY_TASKS.has(mate.task)) {
+          mate.recruitFoodPos = { x: rp.x, y: rp.y };
+          mate.task = AntTask.FOLLOWING_FOOD_TRAIL;
+          recruited++;
+        }
+        return recruited >= 6;
+      });
+      this.busy(ant, AntTask.SIGNALING_FOOD, 1.6);
+    } else {
+      ant.task = AntTask.FORAGING_SCOUT;
+      this.stopMoving(ant);
+    }
+  }
+
+  /** Lowest open point beneath a spot inside a chamber (so piles and brood rest on the floor). */
+  private chamberFloorY(c: Chamber, x: number): number {
+    const gx = clamp(Math.floor(x / CELL_SIZE), 0, GRID_W - 1);
+    let gy = Math.floor(c.y / CELL_SIZE);
+    while (gy < GRID_H - 2 && !this.grid.isSolid(gx, gy + 1) && gy * CELL_SIZE < c.y + c.ry + 12) gy++;
+    return (gy + 1) * CELL_SIZE;
+  }
+
+  private takeFromStore(ant: Ant, amount: number): FoodSource | null {
+    let best: FoodSource | null = null;
+    let bestD = 60;
+    for (const f of this.foods) {
+      if (f.storedInChamberId === null || f.amount < 1) continue;
+      const d = Math.abs(f.x - ant.x) + Math.abs(f.y - ant.y);
+      if (d < bestD) {
+        bestD = d;
+        best = f;
+      }
+    }
+    if (!best) return null;
+    const take = Math.min(best.amount, amount);
+    best.amount -= take;
+    this.storedFoodCache -= take;
+    return best;
+  }
+
+  private goEat(ant: Ant): void {
+    ant.task = AntTask.STORING_FOOD;
+    const d = this.go(ant, 'store');
+    if (d <= 0.5 || d >= INF) {
+      const src = this.takeFromStore(ant, 4);
+      if (src) {
+        ant.hunger = Math.max(0, ant.hunger - 55);
+        ant.energy = Math.min(100, ant.energy + 30);
+        this.busy(ant, AntTask.EATING, 1.5);
+      } else ant.hunger = Math.max(0, ant.hunger - 5); // nibble crumbs, try again later
+    }
+  }
+
+  private carryRefuse(ant: Ant): void {
+    ant.task = AntTask.NECROPHORESIS;
+    const d = this.go(ant, 'midden');
+    if (d <= 0.5 || (this.isOutside(ant.x, ant.y) && Math.abs(ant.x - this.middenPos.x) < 26)) {
+      const fa = this.fallenAnts.find((f) => f.id === ant.payloadId);
+      if (fa) {
+        fa.carriedByAntId = null;
+        fa.atMidden = true;
+        fa.x = this.middenPos.x + (Math.random() - 0.5) * 22;
+        fa.y = this.surfaceTarget(fa.x).y + 1;
+      }
+      ant.payload = PayloadType.NONE;
+      ant.payloadId = null;
+      ant.task = AntTask.FORAGING_SCOUT;
+      this.stopMoving(ant);
+    }
+  }
+
+  private seekRest(ant: Ant, k: FieldKey, nap: number): void {
+    ant.task = AntTask.SEEKING_REST;
+    const d = this.go(ant, k);
+    if (d <= 0.5 || d >= INF) this.busy(ant, AntTask.IDLE, nap);
+  }
+
+  // --- nurses -----------------------------------------------------------------------------------------------------
+
+  private nurseryStageX(c: Chamber, stage: BroodStage, id: number): number {
+    const off = stage === BroodStage.EGG ? -0.45 : stage === BroodStage.PUPA ? 0.45 : 0;
+    return c.x + c.rx * off + (((id * 37) % 100) / 100 - 0.5) * c.rx * 0.35;
+  }
+
+  private stepNurse(ant: Ant, dt: number): void {
+    const queen = this.getQueen();
+
+    // 1. carrying brood to the nursery
+    if (isBroodPayload(ant.payload)) {
+      ant.task = AntTask.MOVING_BROOD;
+      const b = this.brood.find((br) => br.id === ant.payloadId);
+      if (!b) {
+        ant.payload = PayloadType.NONE;
+        ant.payloadId = null;
+        return;
+      }
+      const ch = this.bestNursery(ant);
+      if (!ch) return;
+      if (this.isInsideChamber(ant, ch, 0.85)) {
+        const sx = this.nurseryStageX(ch, b.stage, b.id);
+        if (Math.abs(ant.x - sx) > 7) this.goTo(ant, sx, ch.y + ch.ry * 0.3);
+        else {
+          b.carriedByAntId = null;
+          b.chamberId = ch.id;
+          b.x = ant.x + Math.cos(ant.angle) * 5;
+          b.y = ant.y;
+          ant.payload = PayloadType.NONE;
+          ant.payloadId = null;
+          ant.targetId = null;
+          this.busy(ant, AntTask.GROOMING, 0.8);
+        }
+      } else this.goPath(ant, ch.x, ch.y + ch.ry * 0.3, 'chamber:' + ch.id);
+      return;
+    }
+
+    // 2. carrying food for a larva or the queen
+    if (isFoodPayload(ant.payload)) {
+      const isQueenRun = queen && ant.targetId === queen.id;
+      if (isQueenRun && queen) {
+        ant.task = AntTask.TENDING_QUEEN;
+        if (Math.hypot(queen.x - ant.x, queen.y - ant.y) < 15) {
+          queen.hunger = Math.max(0, queen.hunger - ant.payloadValue * 11);
+          this.counters.queenFeeds++;
+          ant.payload = PayloadType.NONE;
+          ant.payloadValue = 0;
+          ant.targetId = null;
+          this.busy(ant, AntTask.TROPHALLAXIS, 2);
+          ant.trophallaxisPartnerId = queen.id;
+          queen.task = AntTask.TROPHALLAXIS;
+          queen.stateTimer = 2;
+          queen.trophallaxisPartnerId = ant.id;
+          return;
+        }
+        const royal = this.nearestChamber(ChamberType.ROYAL, queen.x, queen.y);
+        if (royal && this.isInsideChamber(ant, royal, 1.0)) this.goTo(ant, queen.x, queen.y);
+        else this.go(ant, 'royal');
+        return;
+      }
+      let larva = this.brood.find((b) => b.id === ant.targetId && b.stage === BroodStage.LARVA && b.carriedByAntId === null);
+      if (!larva || larva.nutrition > 85) {
+        larva = this.hungriestLarva(ant, 85) ?? undefined;
+        ant.targetId = larva ? larva.id : null;
+      }
+      if (!larva) {
+        // nobody needs it any more: eat it
+        ant.hunger = Math.max(0, ant.hunger - ant.payloadValue * 8);
+        ant.payload = PayloadType.NONE;
+        ant.payloadValue = 0;
+        return;
+      }
+      ant.task = AntTask.FEEDING_LARVA;
+      if (Math.hypot(larva.x - ant.x, larva.y - ant.y) < 9) {
+        // regurgitate just what this larva needs, keep the rest for its neighbours
+        this.counters.larvaFeeds++;
+        const give = Math.min(ant.payloadValue, Math.max(1, Math.ceil((100 - larva.nutrition) / 12)));
+        larva.nutrition = Math.min(100, larva.nutrition + give * 12);
+        ant.payloadValue -= give;
+        if (ant.payloadValue <= 0.01) {
+          ant.payload = PayloadType.NONE;
+          ant.payloadValue = 0;
+        }
+        ant.targetId = null;
+        this.busy(ant, AntTask.GROOMING, 1.3);
+        return;
+      }
+      this.approachBrood(ant, larva);
+      return;
+    }
+
+    // 3. continue an errand already claimed
+    if (ant.targetId != null) {
+      if (queen && ant.targetId === queen.id) {
+        this.fetchFood(ant, AntTask.TENDING_QUEEN);
+        return;
+      }
+      const b = this.brood.find((br) => br.id === ant.targetId);
+      if (!b || b.carriedByAntId !== null) ant.targetId = null;
+      else if (b.stage === BroodStage.LARVA && b.nutrition < 75 && this.inNursery(b)) {
+        this.fetchFood(ant, AntTask.FEEDING_LARVA);
+        return;
+      } else if (!this.inNursery(b)) {
+        ant.task = AntTask.MOVING_BROOD;
+        if (Math.hypot(b.x - ant.x, b.y - ant.y) < 9) {
+          b.carriedByAntId = ant.id;
+          ant.payloadId = b.id;
+          ant.payload = b.stage === BroodStage.EGG ? PayloadType.EGG : b.stage === BroodStage.LARVA ? PayloadType.LARVA : PayloadType.PUPA;
+          this.stopMoving(ant);
+        } else this.approachBrood(ant, b);
+        return;
+      } else ant.targetId = null;
+    }
+
+    // 4. choose a new errand
+    const stray = this.brood.find((b) => b.carriedByAntId === null && !this.claimedBrood.has(b.id) && !this.inNursery(b) && (b.stage !== BroodStage.EGG || b.progress > 4));
+    if (stray && this.bestNursery(ant)) {
+      ant.targetId = stray.id;
+      this.claimedBrood.add(stray.id);
+      return;
+    }
+    if (queen && queen.hunger > 55 && this.queenFeederId === null && this.storedFoodCache > 3) {
+      ant.targetId = queen.id;
+      this.queenFeederId = ant.id;
+      return;
+    }
+    if (this.storedFoodCache > 3) {
+      const hungriest = this.hungriestLarva(ant, 70);
+      if (hungriest) {
+        ant.targetId = hungriest.id;
+        this.claimedBrood.add(hungriest.id);
+        return;
+      }
+    }
+    if (ant.hunger > 70 && this.storedFoodCache > 3) {
+      this.goEat(ant);
+      return;
+    }
+
+    // 5. idle care: groom brood (pupae near eclosion get the most attention), attend the queen, or rest
+    ant.stateTimer -= dt;
+    if (ant.stateTimer > 0 && (ant.path.length > 0 || ant.targetPos)) return;
+    ant.stateTimer = 3 + Math.random() * 3;
+    const r = Math.random();
+    if (r < 0.5 && this.brood.length > 0) {
+      const pool = this.brood.filter((b) => b.carriedByAntId === null && this.inNursery(b));
+      if (pool.length > 0) {
+        const b = pool.reduce((best, c) => (c.stage === BroodStage.PUPA && c.progress > best.progress ? c : best), pool[Math.floor(Math.random() * pool.length)]);
+        ant.task = AntTask.FEEDING_LARVA;
+        if (Math.hypot(b.x - ant.x, b.y - ant.y) < 10) this.busy(ant, AntTask.GROOMING, 1.2 + Math.random());
+        else this.approachBrood(ant, b);
+        return;
+      }
+    }
+    if ((r < 0.8 || (queen && queen.hunger > 40)) && queen) {
+      ant.task = AntTask.TENDING_QUEEN;
+      const royal = this.nearestChamber(ChamberType.ROYAL, queen.x, queen.y);
+      if (royal && this.isInsideChamber(ant, royal, 1.0)) {
+        if (Math.hypot(queen.x - ant.x, queen.y - ant.y) < 18) {
+          if (queen.hunger > 20 && ant.hunger < 60 && queen.task !== AntTask.LAYING_EGG) {
+            // the retinue feeds the queen mouth-to-mouth from their own crop
+            this.counters.queenFeeds++;
+            queen.hunger = Math.max(0, queen.hunger - 30);
+            ant.hunger = Math.min(100, ant.hunger + 15);
+            this.busy(ant, AntTask.TROPHALLAXIS, 1.8);
+            ant.trophallaxisPartnerId = queen.id;
+            queen.task = AntTask.TROPHALLAXIS;
+            queen.stateTimer = 1.8;
+            queen.trophallaxisPartnerId = ant.id;
+          } else this.busy(ant, AntTask.GROOMING, 1.5 + Math.random() * 1.5);
+        } else this.goTo(ant, queen.x + Math.cos(ant.id) * 14, queen.y);
+      } else this.go(ant, 'royal');
+      return;
+    }
+    this.seekRest(ant, 'nursery', 4 + Math.random() * 8);
+  }
+
+  /** Most underfed unclaimed larva (ties broken by distance). */
+  private hungriestLarva(ant: Ant, below: number): BroodItem | null {
+    let best: BroodItem | null = null;
+    let bestScore = Infinity;
+    for (const b of this.brood) {
+      if (b.stage !== BroodStage.LARVA || b.carriedByAntId !== null || this.claimedBrood.has(b.id) || b.nutrition > below) continue;
+      const score = b.nutrition * 4 + Math.abs(b.x - ant.x) + Math.abs(b.y - ant.y);
+      if (score < bestScore) {
+        bestScore = score;
+        best = b;
+      }
+    }
+    if (best) this.claimedBrood.add(best.id);
+    return best;
+  }
+
+  private fetchFood(ant: Ant, label: AntTask): void {
+    ant.task = label;
+    const d = this.go(ant, 'store');
+    if (d <= 0.5 || d >= INF) {
+      const src = this.takeFromStore(ant, 9);
+      if (src) {
+        ant.payload = src.type;
+        ant.payloadValue = 9;
+        ant.pauseTimer = 0.5;
+        this.stopMoving(ant);
+      } else ant.targetId = null;
+    }
+  }
+
+  private inNursery(b: BroodItem): boolean {
+    const c = this.chambers.find((ch) => ch.id === b.chamberId);
+    if (!c || c.type !== ChamberType.NURSERY) return false;
+    return Math.abs(b.x - c.x) < c.rx + 6 && Math.abs(b.y - c.y) < c.ry + 10;
+  }
+
+  private bestNursery(ant: Ant): Chamber | undefined {
+    // prefer the nearest nursery that isn't crowded
+    let best: Chamber | undefined;
+    let bestScore = Infinity;
+    for (const c of this.chambers) {
+      if (c.type !== ChamberType.NURSERY) continue;
+      const load = this.brood.reduce((n, b) => n + (b.chamberId === c.id ? 1 : 0), 0);
+      const score = Math.hypot(c.x - ant.x, c.y - ant.y) + load * 12;
+      if (score < bestScore) {
+        bestScore = score;
+        best = c;
+      }
+    }
+    return best;
+  }
+
+  /** Reach a brood item: by flow field to its chamber, then straight to it. */
+  private approachBrood(ant: Ant, b: BroodItem): void {
+    const c = this.chambers.find((ch) => ch.id === b.chamberId);
+    if (c && this.isInsideChamber(ant, c, 1.0)) {
+      this.goTo(ant, b.x, b.y);
+      return;
+    }
+    if (Math.hypot(b.x - ant.x, b.y - ant.y) < 30) {
+      this.goTo(ant, b.x, b.y);
+      return;
+    }
+    this.goPath(ant, b.x, b.y, 'brood:' + b.id);
+  }
+
+  // --- excavators -------------------------------------------------------------------------------------------------
+
+  private stepExcavator(ant: Ant, dt: number): void {
+    if (ant.payload === PayloadType.SOIL) {
+      ant.task = AntTask.CARRYING_SOIL;
+      const d = this.go(ant, 'mound');
+      const cell = this.grid.worldToGrid(ant.x, ant.y);
+      if (d <= 2.5 && this.grid.terrain[this.grid.idx(cell.gx, cell.gy)] === CellType.AIR) {
+        this.counters.deposits++;
+        for (let k = 0; k < Math.max(1, ant.payloadValue); k++) this.depositSoil(ant.x + (k % 2 === 0 ? 0 : (ant.x >= this.entrancePos.x ? 6 : -6)));
+        ant.payload = PayloadType.NONE;
+        ant.payloadValue = 0;
+        ant.pauseTimer = 0.3 + Math.random() * 0.3;
+        ant.task = AntTask.EXCAVATING;
+        this.stopMoving(ant);
+      } else if (d >= INF) {
+        // walled in (a collapse cut the way out): wait for the diggers to reopen it
+        ant.pauseTimer = 1;
+      }
+      return;
+    }
+    if (ant.payload !== PayloadType.NONE) {
+      this.releasePayload(ant);
+      return;
+    }
+    if (ant.hunger > 72 && this.storedFoodCache > 3) {
+      this.goEat(ant);
+      return;
+    }
+    if (this.planCount + this.repairCount === 0 && ant.payloadValue > 0) {
+      ant.payload = PayloadType.SOIL;
+      return;
+    }
+    if (this.planCount + this.repairCount === 0) {
+      // nothing to dig: tend the fungus garden for a while
+      const d = this.go(ant, 'fungus');
+      ant.task = AntTask.SEEKING_REST;
+      if (d <= 0.5 || d >= INF) this.busy(ant, Math.random() < 0.6 ? AntTask.TENDING_FUNGUS : AntTask.IDLE, 5 + Math.random() * 6);
+      return;
+    }
+    const d = this.go(ant, 'dig');
+    ant.task = this.repairCount > 0 ? AntTask.REPAIRING : AntTask.EXCAVATING;
+    if (d >= INF) {
+      ant.task = AntTask.EXCAVATING;
+      return;
+    }
+    if (d > 0.5 && !(ant.path.length === 0 && d < 30)) return;
+    // at the dig face: choose an adjacent planned cell
+    const g = this.grid.worldToGrid(ant.x, ant.y);
+    let pick = -1;
+    let pickLevel = 0;
+    for (let oy = -1; oy <= 1; oy++) {
+      for (let ox = -1; ox <= 1; ox++) {
+        const gx = g.gx + ox;
+        const gy = g.gy + oy;
+        if (!this.grid.inBounds(gx, gy)) continue;
+        const i = this.grid.idx(gx, gy);
+        const lvl = this.digPlan[i];
+        if (!lvl || !this.canExcavate(i) || this.claimedDig.has(i)) continue;
+        if (lvl > pickLevel || (lvl === pickLevel && Math.random() < 0.5)) {
+          pick = i;
+          pickLevel = lvl;
         }
       }
     }
+    if (pick < 0) {
+      // stale field (someone else dug here): look again shortly
+      this.fieldDirty.dig = true;
+      if (d <= 0.5) ant.pauseTimer = 0.4;
+      return;
+    }
+    ant.digIdx = pick;
+    this.claimedDig.add(pick);
+    ant.task = pickLevel === 2 ? AntTask.REPAIRING : AntTask.EXCAVATING;
+    const px = (pick % GRID_W) + 0.5;
+    const py = Math.floor(pick / GRID_W) + 0.5;
+    ant.angle = Math.atan2(py * CELL_SIZE - ant.y, px * CELL_SIZE - ant.x);
+    ant.stateTimer = 1.1 + Math.random() * 1.0;
+    this.stopMoving(ant);
+    // keep the EXCAVATING label while chewing so the renderer animates the mandibles
+    ant.task = AntTask.EXCAVATING;
   }
 
-  private stepQueen(ant: Ant, dt: number, royal: Chamber | undefined): void {
+  private finishDig(ant: Ant): void {
+    const i = ant.digIdx ?? -1;
+    ant.digIdx = -1;
+    ant.task = AntTask.EXCAVATING;
+    if (i < 0 || !this.digPlan[i] || !this.canExcavate(i)) {
+      if (ant.payloadValue > 0) ant.payload = PayloadType.SOIL;
+      return;
+    }
+    const gx = i % GRID_W;
+    const gy = (i - gx) / GRID_W;
+    const wasRepair = this.digPlan[i] === 2;
+    this.grid.setTerrain(gx, gy, CellType.TUNNEL);
+    this.digPlan[i] = 0;
+    if (wasRepair) this.repairCount = Math.max(0, this.repairCount - 1);
+    else this.planCount = Math.max(0, this.planCount - 1);
+    this.tunnelsDugCells++;
+    this.counters.digs++;
+    this.grid.updateSurfaceColumn(gx);
+    this.fieldDirty.dig = true;
+    ant.payloadValue += 1;
+    // a forager-sized pellet is small: chew out a second cell before making the trip up to the mound
+    if (ant.payloadValue >= 2 || this.planCount + this.repairCount <= 1) ant.payload = PayloadType.SOIL;
+    const w = this.grid.gridToWorld(gx, gy);
+    this.spawnCrumbs(w.x, w.y, '#7c5836', 3);
+    if (wasRepair && this.repairCount === 0) this.log('Storm damage repaired', 'good');
+  }
+
+  /** Drop a pellet of soil on the mound; it rolls down until the slope is stable (angle of repose). */
+  /** The undisturbed ground height the world was generated with (before any mound was built). */
+  private naturalGroundY(wx: number): number {
+    const gx = clamp(Math.floor(wx / CELL_SIZE), 0, GRID_W - 1);
+    if (this.baseGround) return this.baseGround[gx];
+    return SURFACE_BASE_Y + Math.sin(wx * 0.0065) * 13 + Math.cos(wx * 0.017) * 6 + Math.sin(wx * 0.041) * 2.5;
+  }
+
+  private depositSoil(worldX: number): void {
+    // all spoil goes on the main mound; the side entrance is kept as a plain hole
+    const ex = this.entrancePos.x;
+    const crater = CRATER_MAIN;
+    const outward = worldX >= ex ? 1 : -1;
+    const minGx = Math.floor((CASE_LEFT + 40) / CELL_SIZE);
+    const maxGx = Math.floor((CASE_RIGHT - 40) / CELL_SIZE);
+    // the mound may roof over the flared mouth of the shaft; only the central hole itself stays open
+    const inCrater = (gx: number) => Math.abs((gx + 0.5) * CELL_SIZE - ex) < crater;
+    let gx = clamp(Math.floor(worldX / CELL_SIZE), minGx, maxGx);
+    for (let k = 0; k < 20 && inCrater(gx); k++) gx += outward;
+    const maxHeightCells = Math.min(17, 6 + Math.floor(Math.sqrt(this.soilDeposited) * 0.5));
+    // the mound spreads wider as it grows
+    const falloff = 0.07 * (400 / (400 + this.soilDeposited));
+    let settled = false;
+    let rolledOut = false;
+    for (let step = 0; step < 60; step++) {
+      const top = Math.floor(this.grid.surfaceY[gx] / CELL_SIZE);
+      const baseTop = Math.floor(this.naturalGroundY((gx + 0.5) * CELL_SIZE) / CELL_SIZE);
+      const outTop = Math.floor(this.grid.surfaceY[clamp(gx + outward, minGx, maxGx)] / CELL_SIZE);
+      const inTop = Math.floor(this.grid.surfaceY[clamp(gx - outward, minGx, maxGx)] / CELL_SIZE);
+      // the allowed height falls away from the hole, so the top of the mound is a rounded dome, not a mesa
+      const distCols = Math.max(0, Math.abs((gx + 0.5) * CELL_SIZE - ex) - crater) / CELL_SIZE;
+      const cap = Math.max(1, maxHeightCells - Math.floor(distCols * distCols * falloff));
+      const tooTall = baseTop - top >= cap;
+      // a pellet first fills any hollow toward the hole (the flared funnel), then rolls down the outer flank while
+      // the next column is lower: the mound settles into a cone around a narrow entrance
+      if (!rolledOut && !tooTall && inTop - top >= 1 && !inCrater(gx - outward)) gx -= outward;
+      // a one-cell step is stable (angle of repose); a pellet only tumbles down a steeper drop
+      else if ((outTop - top >= 2 || tooTall) && gx + outward >= minGx && gx + outward <= maxGx) {
+        gx += outward;
+        rolledOut = true;
+      }
+      else {
+        settled = true;
+        break;
+      }
+    }
+    if (!settled && Math.abs((gx + 0.5) * CELL_SIZE - ex) > 260) return; // spread too thin to notice
+    const surfGy = Math.floor(this.grid.surfaceY[gx] / CELL_SIZE);
+    const placeGy = surfGy - 1;
+    if (placeGy <= Math.floor((CASE_TOP + 64) / CELL_SIZE)) return;
+    if (this.grid.terrain[this.grid.idx(gx, placeGy)] !== CellType.AIR) return;
+    this.grid.setTerrain(gx, placeGy, CellType.SUBSOIL);
+    this.grid.updateSurfaceColumn(gx);
+    this.evictFrom(gx, placeGy);
+    this.soilDeposited++;
+    this.raiseEntranceShaft(ex, crater);
+    if (this.soilDeposited % 150 === 0) this.log(`The mound keeps growing (${this.soilDeposited} loads of soil)`, 'good');
+    this.spawnCrumbs((gx + 0.5) * CELL_SIZE, this.grid.surfaceY[gx] - 3, '#8c623d', 3);
+  }
+
+  /**
+   * As the mound rises around the hole, extend the entrance shaft up through it (an ant hill's entrance is a tunnel
+   * running up through the mound, not an open pit). Shaft cells are open tunnel, so ants climb them freely and
+   * surface walkers can step across the top of the hole.
+   */
+  private raiseEntranceShaft(ex: number, crater: number): void {
+    const g0 = Math.floor((ex - crater) / CELL_SIZE);
+    const g1 = Math.floor((ex + crater) / CELL_SIZE);
+    const leftTop = Math.floor(this.grid.surfaceY[g0 - 1] / CELL_SIZE);
+    const rightTop = Math.floor(this.grid.surfaceY[g1 + 1] / CELL_SIZE);
+    const rimGy = Math.max(leftTop, rightTop);
+    for (let gx = g0; gx <= g1; gx++) {
+      for (let gy = rimGy; gy < GRID_H - 2; gy++) {
+        const i = this.grid.idx(gx, gy);
+        const t = this.grid.terrain[i];
+        if (t === CellType.AIR) this.grid.setTerrain(gx, gy, CellType.TUNNEL);
+        else break;
+      }
+      this.grid.updateSurfaceColumn(gx);
+    }
+  }
+
+  // --- soldiers ---------------------------------------------------------------------------------------------------
+
+  private stepSoldier(ant: Ant, dt: number, night: boolean): void {
+    if (ant.hunger > 72 && this.storedFoodCache > 3) {
+      this.goEat(ant);
+      return;
+    }
+    const onSurface = this.isOutside(ant.x, ant.y);
+    const guard = ant.id % 3 !== 0 && !(night && ant.id % 2 === 0);
+    ant.task = AntTask.PATROLLING;
     ant.stateTimer -= dt;
-    if (ant.task === AntTask.LAYING_EGG && ant.stateTimer <= 0) {
-      ant.task = AntTask.IDLE;
+    if (guard) {
+      if (!onSurface) {
+        if (this.go(ant, 'surface') >= INF) this.seekRest(ant, 'royal', 8);
+        return;
+      }
+      if (ant.stateTimer <= 0 || !ant.targetPos) {
+        ant.stateTimer = 3 + Math.random() * 4;
+        const side = (ant.id % 2 === 0 ? 1 : -1) * (CRATER_MAIN + 20 + Math.random() * 70);
+        const t = this.surfaceTarget(this.entrancePos.x + side);
+        this.goTo(ant, t.x, t.y);
+        if (Math.random() < 0.2) ant.pauseTimer = 1 + Math.random() * 2;
+      }
+      return;
     }
+    const royal = this.nearestChamber(ChamberType.ROYAL, ant.x, ant.y);
     if (!royal) return;
-
-    if (ant.stateTimer <= 0) {
-      ant.stateTimer = 2.5 + Math.random() * 3.5;
-      ant.targetPos = {
-        x: royal.x + (Math.random() - 0.5) * 44,
-        y: royal.y + (Math.random() - 0.5) * 14,
-      };
+    if (!this.isInsideChamber(ant, royal, 1.0)) {
+      this.go(ant, 'royal');
+      return;
     }
-
-    if (Math.hypot(ant.x - royal.x, ant.y - royal.y) > 48) {
-      ant.targetPos = { x: royal.x, y: royal.y + 4 };
+    if (ant.stateTimer <= 0 || !ant.targetPos) {
+      ant.stateTimer = 3 + Math.random() * 3;
+      if (Math.random() < 0.35) this.busy(ant, AntTask.IDLE, 4 + Math.random() * 6);
+      else this.goTo(ant, royal.x + (Math.random() - 0.5) * royal.rx * 1.4, royal.y + (Math.random() - 0.2) * royal.ry * 0.6);
     }
   }
 
-  private isOnExteriorSurface(x: number, y: number): boolean {
+  // ================================================================================================================
+  // Helpers kept from the original locomotion model
+  // ================================================================================================================
+
+  private nearestChamber(type: ChamberType, x: number, y: number): Chamber | undefined {
+    let best: Chamber | undefined;
+    let bestD = Infinity;
+    for (const c of this.chambers) {
+      if (c.type !== type) continue;
+      const d = Math.abs(c.x - x) + Math.abs(c.y - y);
+      if (d < bestD) {
+        bestD = d;
+        best = c;
+      }
+    }
+    return best;
+  }
+
+  /** Out in the open air above ground (as opposed to inside a tunnel), including over the entrance holes. */
+  public isOutside(x: number, y: number): boolean {
+    const g = this.grid.worldToGrid(x, y);
+    return this.grid.terrain[this.grid.idx(g.gx, g.gy)] === CellType.AIR;
+  }
+
+  public isOnExteriorSurface(x: number, y: number): boolean {
     const g = this.grid.worldToGrid(x, y);
     const t = this.grid.terrain[this.grid.idx(g.gx, g.gy)];
     const b1 = Math.min(GRID_H - 1, g.gy + 1);
@@ -1771,845 +3371,12 @@ export class AntColonySimulation {
     );
   }
 
-  private getSurfaceExitTarget(nearX: number): Vec2 {
-    const useMain = Math.abs(nearX - this.entrancePos.x) <= Math.abs(nearX - 405) + 80;
-    const entX = useMain ? this.entrancePos.x : 405;
-    const side = nearX >= entX ? 1 : -1;
-    const exitX = clamp(entX + side * (useMain ? 44 : 32), CASE_LEFT + 36, CASE_RIGHT - 36);
-    const gx = clamp(Math.floor(exitX / CELL_SIZE), 0, GRID_W - 1);
-    return { x: exitX, y: this.grid.surfaceY[gx] - 3 };
-  }
-
-  private findDigFrontierTarget(ant: Ant): Vec2 | null {
-    // Prefer expanding around existing chambers or deep subsoil frontiers
-    for (let attempt = 0; attempt < 24; attempt++) {
-      const rx = 14 + Math.floor(Math.random() * (GRID_W - 28));
-      const ry = 42 + Math.floor(Math.random() * (GRID_H - 54));
-      if (this.grid.terrain[this.grid.idx(rx, ry)] !== CellType.TUNNEL) continue;
-      for (let oy = -1; oy <= 1; oy++) {
-        for (let ox = -1; ox <= 1; ox++) {
-          if (this.grid.isDiggable(rx + ox, ry + oy) && (ry + oy) * CELL_SIZE > this.grid.surfaceY[rx + ox] + 24) {
-            return this.grid.gridToWorld(rx, ry);
-          }
-        }
-      }
-    }
-    const royal = this.getChamber(ChamberType.ROYAL);
-    return royal ? { x: royal.x + (Math.random() - 0.5) * 32, y: royal.y + 4 } : null;
-  }
-
-  private stepForager(ant: Ant, dt: number, granary: Chamber | undefined): void {
-    ant.pheromoneDropTimer -= dt;
-    const onSurface = this.isOnExteriorSurface(ant.x, ant.y);
-
-    // Engage rival raiding ants or evade large soil predators
-    if (this.intruders.length > 0 && ant.payload === PayloadType.NONE) {
-      const threat = this.intruders.find(
-        (m) => m.hp >= m.maxHp * 0.28 && Math.hypot(m.x - ant.x, m.y - ant.y) < 42
-      );
-      if (threat) {
-        this.grid.depositPheromone(this.grid.alarmPheromone, ant.x, ant.y, 0.55, 2);
-        const nearEntrance = Math.abs(threat.x - this.entrancePos.x) < 130;
-        const fightRival = threat.species === 'rival_ant' || threat.species === 'mite' || nearEntrance;
-        if (fightRival) {
-          ant.task = AntTask.DEFENDING;
-          const dist = Math.hypot(threat.x - ant.x, threat.y - ant.y);
-          if (dist < 16) {
-            ant.stateTimer -= dt;
-            if (ant.stateTimer <= 0) {
-              ant.stateTimer = 0.55;
-              threat.hp -= 5;
-              this.particles.push({
-                x: (ant.x + threat.x) * 0.5,
-                y: (ant.y + threat.y) * 0.5,
-                vx: (Math.random() - 0.5) * 18,
-                vy: -10 - Math.random() * 10,
-                size: 1.1,
-                alpha: 0.7,
-                life: 0,
-                maxLife: 0.22,
-                kind: 'spark',
-                color: '#fef08a',
-              });
-            }
-            ant.targetAngle = Math.atan2(threat.y - ant.y, threat.x - ant.x);
-          } else {
-            ant.targetPos = { x: threat.x, y: threat.y };
-          }
-          return;
-        }
-        ant.task = AntTask.FLEEING;
-        const awayDir = ant.x >= threat.x ? 1 : -1;
-        const fleeX = clamp(ant.x + awayDir * 48, CASE_LEFT + 26, CASE_RIGHT - 26);
-        const fgx = Math.floor(fleeX / CELL_SIZE);
-        ant.targetPos = { x: fleeX, y: this.grid.surfaceY[clamp(fgx, 0, GRID_W - 1)] - 2 };
-        return;
-      }
-    }
-
-    // 0. Necrophoresis: Carry fallen ant out to surface Midden
-    if (ant.payload === PayloadType.REFUSE) {
-      ant.task = AntTask.NECROPHORESIS;
-      if (onSurface && Math.hypot(ant.x - this.middenPos.x, ant.y - this.middenPos.y) < 28) {
-        const fa = this.fallenAnts.find((f) => f.id === ant.payloadId);
-        if (fa) {
-          fa.carriedByAntId = null;
-          fa.atMidden = true;
-          fa.x = this.middenPos.x + (Math.random() - 0.5) * 18;
-          fa.y = this.middenPos.y;
-        }
-        ant.payload = PayloadType.NONE;
-        ant.payloadId = null;
-        ant.path = [];
-        ant.task = AntTask.FORAGING_SCOUT;
-        return;
-      }
-      if (ant.path.length === 0 && this.simTime - ant.lastPathCalcTime > 1.2 && this.pathBudgetThisTick < 3) {
-        this.pathBudgetThisTick++;
-        ant.lastPathCalcTime = this.simTime;
-        const goal = onSurface ? this.middenPos : this.getSurfaceExitTarget(ant.x);
-        ant.path = this.grid.findPath({ x: ant.x, y: ant.y }, goal);
-        ant.pathIndex = 0;
-      }
-      return;
-    }
-
-    // 1. Carrying food home to Granary (laying invisible chemical foodPheromone)
-    if (ant.payload === PayloadType.SEED || ant.payload === PayloadType.HONEYDEW || ant.payload === PayloadType.PROTEIN) {
-      ant.task = AntTask.RETURNING_WITH_FOOD;
-      if (ant.pheromoneDropTimer <= 0) {
-        ant.pheromoneDropTimer = 0.14;
-        this.grid.depositPheromone(this.grid.foodPheromone, ant.x, ant.y, 0.52, 1);
-      }
-
-      if (granary) {
-        const distGranary = Math.hypot(ant.x - granary.x, ant.y - granary.y);
-        if (distGranary < 34) {
-          const existing = this.foods.find(
-            (f) => f.storedInChamberId === granary.id && f.type === ant.payload && f.amount < f.maxAmount - 4
-          );
-          if (existing) {
-            existing.amount = Math.min(existing.maxAmount, existing.amount + ant.payloadValue);
-          } else if (this.foods.filter((f) => f.storedInChamberId === granary.id).length < 10) {
-            this.foods.push({
-              id: this.allocId(),
-              type: ant.payload,
-              x: granary.x + (Math.random() - 0.5) * 52,
-              y: granary.y + 8 + Math.random() * 8,
-              amount: ant.payloadValue,
-              maxAmount: 50,
-              radius: 5,
-              storedInChamberId: granary.id,
-            });
-          }
-          ant.payload = PayloadType.NONE;
-          ant.payloadValue = 0;
-          ant.hunger = Math.max(0, ant.hunger - 18);
-          ant.path = [];
-          ant.targetPos = null;
-          // Scout performs antennal food signaling inside granary/entrance if source had more food!
-          if (ant.recruitFoodPos && (ant.signalCooldown ?? 0) <= 0) {
-            ant.task = AntTask.SIGNALING_FOOD;
-            ant.stateTimer = 1.6;
-            ant.signalCooldown = 12;
-          } else {
-            ant.task = AntTask.FORAGING_SCOUT;
-          }
-          return;
-        }
-
-        if (ant.path.length === 0 && this.simTime - ant.lastPathCalcTime > 1.0 && this.pathBudgetThisTick < 4) {
-          this.pathBudgetThisTick++;
-          ant.lastPathCalcTime = this.simTime;
-          ant.path = this.grid.findPath(
-            { x: ant.x, y: ant.y },
-            { x: granary.x + (Math.random() - 0.5) * 18, y: granary.y + 6 },
-            { preferHomePheromone: true }
-          );
-          ant.pathIndex = 0;
-        }
-      }
-      return;
-    }
-
-    if (ant.pheromoneDropTimer <= 0) {
-      ant.pheromoneDropTimer = 0.2;
-      this.grid.depositPheromone(this.grid.homePheromone, ant.x, ant.y, 0.24, 1);
-    }
-
-    // Check for fallen nestmate needing undertaker
-    // Undertaking is done by a specialist minority of foragers, not by every worker that walks past a corpse.
-    const fallen =
-      ant.id % 5 === 0
-        ? this.fallenAnts.find(
-            (f) => !f.atMidden && f.carriedByAntId === null && Math.hypot(f.x - ant.x, f.y - ant.y) < 18
-          )
-        : undefined;
-    if (fallen) {
-      fallen.carriedByAntId = ant.id;
-      ant.payload = PayloadType.REFUSE;
-      ant.payloadId = fallen.id;
-      ant.path = [];
-      ant.task = AntTask.NECROPHORESIS;
-      return;
-    }
-
-    // Check near surface food (must have landed)
-    const nearFood = this.foods.find(
-      (f) => f.storedInChamberId === null && !f.falling && f.amount > 1 && Math.hypot(f.x - ant.x, f.y - ant.y) < 16
-    );
-    if (nearFood) {
-      const take = Math.min(nearFood.amount, 8);
-      nearFood.amount -= take;
-      ant.pauseTimer = 0.35 + Math.random() * 0.4; // antennate the find before hauling it off
-      ant.payload = nearFood.type;
-      ant.payloadValue = take;
-      ant.recruitFoodPos = nearFood.amount > 4 ? { x: nearFood.x, y: nearFood.y } : null;
-      ant.path = [];
-      ant.targetPos = null;
-      ant.task = AntTask.RETURNING_WITH_FOOD;
-      this.grid.depositPheromone(this.grid.foodPheromone, ant.x, ant.y, 0.9, 2);
-      return;
-    }
-
-    // If inside subterranean tunnels or the entrance shaft throat, NEVER switch to straight-line surface roaming!
-    // Follow A* cleanly out past the entrance rim until actually standing in AIR on the exterior surface.
-    if (!onSurface) {
-      // If recruited toward a discovered food source, route straight there via A*
-      if (ant.recruitFoodPos) {
-        ant.task = AntTask.FOLLOWING_FOOD_TRAIL;
-        if (ant.path.length === 0 && this.simTime - ant.lastPathCalcTime > 1.1 && this.pathBudgetThisTick < 4) {
-          this.pathBudgetThisTick++;
-          ant.lastPathCalcTime = this.simTime;
-          ant.path = this.grid.findPath(
-            { x: ant.x, y: ant.y },
-            ant.recruitFoodPos,
-            { preferFoodPheromone: true }
-          );
-          ant.pathIndex = 0;
-        }
-        return;
-      }
-
-      // Occasionally tend the fungus garden briefly if passing nearby, else exit to forage
-      const fungusCh = this.getChamber(ChamberType.FUNGUS);
-      if (fungusCh && Math.hypot(ant.x - fungusCh.x, ant.y - fungusCh.y) < 28 && Math.random() < 0.08) {
-        ant.task = AntTask.TENDING_FUNGUS;
-        ant.stateTimer = 1.4;
-        return;
-      }
-
-      ant.task = AntTask.FORAGING_SCOUT;
-      if (ant.path.length === 0 && this.simTime - ant.lastPathCalcTime > 0.9 && this.pathBudgetThisTick < 4) {
-        this.pathBudgetThisTick++;
-        ant.lastPathCalcTime = this.simTime;
-        ant.path = this.grid.findPath({ x: ant.x, y: ant.y }, this.getSurfaceExitTarget(ant.x));
-        ant.pathIndex = 0;
-      }
-      return;
-    }
-
-    // --- Below here, ant is guaranteed on exterior surface (AIR) ---
-
-    if (ant.recruitFoodPos) {
-      const stillThere = this.foods.some(
-        (f) => f.storedInChamberId === null && !f.falling && f.amount > 1 && Math.hypot(f.x - ant.recruitFoodPos!.x, f.y - ant.recruitFoodPos!.y) < 30
-      );
-      if (!stillThere) {
-        ant.recruitFoodPos = null;
-      } else {
-        ant.task = AntTask.FOLLOWING_FOOD_TRAIL;
-        ant.targetPos = { x: ant.recruitFoodPos.x, y: ant.recruitFoodPos.y };
-        return;
-      }
-    }
-
-    if (ant.hydration < 62) {
-      const drop = this.droplets.find((d) => d.settled && Math.hypot(d.x - ant.x, d.y - ant.y) < 55);
-      if (drop) {
-        ant.task = AntTask.DRINKING_DEW;
-        ant.targetPos = { x: drop.x, y: drop.y };
-        if (Math.hypot(drop.x - ant.x, drop.y - ant.y) < 8) {
-          ant.hydration = 100;
-          drop.volume = Math.max(0, drop.volume - 2);
-        }
-        return;
-      }
-    }
-
-    const visibleFood = this.foods.find(
-      (f) => f.storedInChamberId === null && !f.falling && f.amount > 1 && Math.hypot(f.x - ant.x, f.y - ant.y) < 110
-    );
-    if (visibleFood) {
-      ant.task = AntTask.FOLLOWING_FOOD_TRAIL;
-      ant.targetPos = { x: visibleFood.x, y: visibleFood.y };
-      return;
-    }
-
-    // Follow invisible chemical foodPheromone gradient across surface
-    const gL = this.grid.worldToGrid(ant.x - 18, ant.y);
-    const gR = this.grid.worldToGrid(ant.x + 18, ant.y);
-    const pL = this.grid.foodPheromone[this.grid.idx(gL.gx, gL.gy)] +
-      this.grid.foodPheromone[this.grid.idx(gL.gx, Math.max(0, gL.gy - 1))];
-    const pR = this.grid.foodPheromone[this.grid.idx(gR.gx, gR.gy)] +
-      this.grid.foodPheromone[this.grid.idx(gR.gx, Math.max(0, gR.gy - 1))];
-
-    ant.stateTimer -= dt;
-    if (pL > 0.05 || pR > 0.05) {
-      ant.task = AntTask.FOLLOWING_FOOD_TRAIL;
-      // Commit to a direction for a while. Re-deciding every tick made ants flip left/right and shuffle in place
-      // wherever both sides smelled alike (old, fading trails around food that was already carried off).
-      ant.trailCommit = (ant.trailCommit ?? 0) - dt;
-      if (ant.trailDir === undefined || ant.trailCommit <= 0) {
-        const hi = Math.max(pL, pR);
-        const clearlyRight = pR > pL + hi * 0.15;
-        const clearlyLeft = pL > pR + hi * 0.15;
-        ant.trailDir = clearlyRight ? 1 : clearlyLeft ? -1 : Math.cos(ant.angle) >= 0 ? 1 : -1;
-        ant.trailCommit = 1.2 + Math.random() * 1.4;
-      }
-      const dir = ant.trailDir;
-      const tx = clamp(ant.x + dir * 34, CASE_LEFT + 28, CASE_RIGHT - 28);
-      const gx = clamp(Math.floor(tx / CELL_SIZE), 0, GRID_W - 1);
-      ant.targetPos = { x: tx, y: this.grid.surfaceY[gx] - 2 };
-    } else if (ant.stateTimer <= 0 || !ant.targetPos) {
-      ant.task = AntTask.FORAGING_SCOUT;
-      ant.stateTimer = 2.4 + Math.random() * 3.2;
-      if (ant.hunger > 65 && granary) {
-        if (this.pathBudgetThisTick < 3) {
-          this.pathBudgetThisTick++;
-          ant.path = this.grid.findPath({ x: ant.x, y: ant.y }, { x: granary.x, y: granary.y });
-          ant.pathIndex = 0;
-        }
-      } else {
-        const roamX = clamp(ant.x + (Math.random() - 0.5) * 320, CASE_LEFT + 44, CASE_RIGHT - 44);
-        const gx = Math.floor(roamX / CELL_SIZE);
-        ant.targetPos = { x: roamX, y: this.grid.surfaceY[gx] - 2 };
-      }
-    }
-  }
-
-  private stepNurse(
-    ant: Ant,
-    dt: number,
-    royal: Chamber | undefined,
-    nursery: Chamber | undefined,
-    granary: Chamber | undefined
-  ): void {
-    // 1. Carrying brood item -> deliver to Nursery (or reposition gently inside Nursery)
-    if (ant.payloadId !== null && nursery) {
-      ant.task = AntTask.MOVING_BROOD;
-      const d = Math.hypot(ant.x - nursery.x, ant.y - nursery.y);
-      if (d < 34) {
-        const b = this.brood.find((br) => br.id === ant.payloadId);
-        if (b) {
-          b.carriedByAntId = null;
-          b.chamberId = nursery.id;
-          b.x = nursery.x + (Math.random() - 0.5) * 44;
-          b.y = nursery.y + 10;
-        }
-        ant.payloadId = null;
-        ant.payload = PayloadType.NONE;
-        ant.path = [];
-        ant.targetPos = null;
-        return;
-      }
-      if (ant.path.length === 0 && this.simTime - ant.lastPathCalcTime > 1.0 && this.pathBudgetThisTick < 4) {
-        this.pathBudgetThisTick++;
-        ant.lastPathCalcTime = this.simTime;
-        ant.path = this.grid.findPath({ x: ant.x, y: ant.y }, { x: nursery.x, y: nursery.y + 6 });
-        ant.pathIndex = 0;
-      }
-      return;
-    }
-
-    // 2. Deterministically pick up any eggs waiting in the Royal Chamber
-    if (royal && nursery) {
-      const strayEgg = this.brood.find(
-        (b) => b.carriedByAntId === null && b.stage === BroodStage.EGG && b.chamberId === royal.id && b.progress > 6
-      );
-      if (strayEgg) {
-        ant.task = AntTask.MOVING_BROOD;
-        if (Math.hypot(strayEgg.x - ant.x, strayEgg.y - ant.y) < 16) {
-          strayEgg.carriedByAntId = ant.id;
-          ant.payloadId = strayEgg.id;
-          ant.payload = PayloadType.EGG;
-          ant.path = [];
-          return;
-        }
-        if (ant.path.length === 0 && this.simTime - ant.lastPathCalcTime > 0.9 && this.pathBudgetThisTick < 4) {
-          this.pathBudgetThisTick++;
-          ant.lastPathCalcTime = this.simTime;
-          ant.path = this.grid.findPath({ x: ant.x, y: ant.y }, { x: strayEgg.x, y: strayEgg.y });
-          ant.pathIndex = 0;
-        }
-        return;
-      }
-    }
-
-    // 3. Feed hungry larvae (fetching nutrition from Granary first if needed)
-    const hungryLarva = this.brood.find(
-      (b) => b.carriedByAntId === null && b.stage === BroodStage.LARVA && b.nutrition < 78
-    );
-    if (hungryLarva) {
-      if (ant.hunger < 65) {
-        ant.task = AntTask.FEEDING_LARVA;
-        const d = Math.hypot(hungryLarva.x - ant.x, hungryLarva.y - ant.y);
-        if (d < 12) {
-          hungryLarva.nutrition = Math.min(100, hungryLarva.nutrition + 34);
-          ant.hunger += 9;
-          ant.task = AntTask.GROOMING;
-          ant.stateTimer = 0.85;
-          return;
-        }
-        if (ant.path.length === 0 && this.simTime - ant.lastPathCalcTime > 1.1 && this.pathBudgetThisTick < 4) {
-          this.pathBudgetThisTick++;
-          ant.lastPathCalcTime = this.simTime;
-          ant.path = this.grid.findPath({ x: ant.x, y: ant.y }, { x: hungryLarva.x, y: hungryLarva.y });
-          ant.pathIndex = 0;
-        }
-        return;
-      } else if (granary) {
-        if (ant.path.length === 0 && this.simTime - ant.lastPathCalcTime > 1.2 && this.pathBudgetThisTick < 3) {
-          this.pathBudgetThisTick++;
-          ant.lastPathCalcTime = this.simTime;
-          ant.path = this.grid.findPath({ x: ant.x, y: ant.y }, { x: granary.x, y: granary.y });
-          ant.pathIndex = 0;
-        }
-        return;
-      }
-    }
-
-    // 4. Dedicated Queen Care Retinue: feed and groom the Queen
-    const queen = this.ants.find((a) => a.caste === AntCaste.QUEEN);
-    if (queen && ((queen.hunger > 18 && ant.hunger < 55) || ant.id % 3 === 0)) {
-      const dq = Math.hypot(queen.x - ant.x, queen.y - ant.y);
-      if (dq < 18) {
-        if (queen.hunger > 15 && ant.hunger < 60) {
-          ant.task = AntTask.TROPHALLAXIS;
-          ant.stateTimer = 1.4;
-          ant.trophallaxisPartnerId = queen.id;
-          queen.task = AntTask.TROPHALLAXIS;
-          queen.stateTimer = 1.4;
-          queen.trophallaxisPartnerId = ant.id;
-          queen.hunger = Math.max(0, queen.hunger - 26);
-          ant.hunger += 12;
-        } else {
-          ant.task = AntTask.GROOMING;
-          ant.stateTimer = 1.2;
-          ant.targetAngle = Math.atan2(queen.y - ant.y, queen.x - ant.x);
-        }
-        return;
-      }
-      if (ant.path.length === 0 && this.simTime - ant.lastPathCalcTime > 1.5 && this.pathBudgetThisTick < 3) {
-        this.pathBudgetThisTick++;
-        ant.lastPathCalcTime = this.simTime;
-        ant.path = this.grid.findPath({ x: ant.x, y: ant.y }, { x: queen.x, y: queen.y });
-        ant.pathIndex = 0;
-      }
-      ant.task = AntTask.TENDING_QUEEN;
-      return;
-    }
-
-    // 5. Groom & tend specific brood items in Nursery (never wander empty tunnels!)
-    const anyBrood = this.brood.find((b) => b.carriedByAntId === null && b.chamberId === nursery?.id);
-    if (anyBrood) {
-      ant.task = AntTask.FEEDING_LARVA;
-      if (Math.hypot(anyBrood.x - ant.x, anyBrood.y - ant.y) < 14) {
-        anyBrood.nutrition = Math.min(100, anyBrood.nutrition + 8);
-        ant.task = AntTask.GROOMING;
-        ant.stateTimer = 0.9;
-        return;
-      }
-      if (ant.path.length === 0 && this.simTime - ant.lastPathCalcTime > 1.4 && this.pathBudgetThisTick < 3) {
-        this.pathBudgetThisTick++;
-        ant.lastPathCalcTime = this.simTime;
-        ant.path = this.grid.findPath({ x: ant.x, y: ant.y }, { x: anyBrood.x, y: anyBrood.y });
-        ant.pathIndex = 0;
-      }
-      return;
-    }
-
-    ant.stateTimer -= dt;
-    if (ant.stateTimer <= 0 || !ant.targetPos) {
-      ant.stateTimer = 2.0 + Math.random() * 2.0;
-      const ch = nursery ?? royal;
-      if (ch) {
-        ant.task = ch === royal ? AntTask.TENDING_QUEEN : AntTask.FEEDING_LARVA;
-        const dest = { x: ch.x + (Math.random() - 0.5) * 40, y: ch.y + (Math.random() - 0.5) * 14 };
-        if (Math.hypot(dest.x - ant.x, dest.y - ant.y) > 60 && this.pathBudgetThisTick < 3) {
-          this.pathBudgetThisTick++;
-          ant.path = this.grid.findPath({ x: ant.x, y: ant.y }, dest);
-          ant.pathIndex = 0;
-        } else {
-          ant.targetPos = dest;
-        }
-      }
-    }
-  }
-
-  private depositSoilGranuleAt(worldX: number): void {
-    let gx = clamp(
-      Math.floor(worldX / CELL_SIZE),
-      Math.floor(CASE_LEFT / CELL_SIZE) + 4,
-      Math.floor(CASE_RIGHT / CELL_SIZE) - 4
-    );
-
-    if (Math.abs(gx * CELL_SIZE - this.entrancePos.x) < 48) {
-      gx += gx * CELL_SIZE >= this.entrancePos.x ? 8 : -8;
-    }
-    if (Math.abs(gx * CELL_SIZE - 405) < 36) {
-      gx += gx * CELL_SIZE >= 405 ? 6 : -6;
-    }
-
-    for (let step = 0; step < 6; step++) {
-      const currGy = Math.floor(this.grid.surfaceY[gx] / CELL_SIZE);
-      const leftGy = Math.floor(this.grid.surfaceY[gx - 1] / CELL_SIZE);
-      const rightGy = Math.floor(this.grid.surfaceY[gx + 1] / CELL_SIZE);
-
-      if (leftGy > currGy && Math.abs((gx - 1) * CELL_SIZE - this.entrancePos.x) >= 48 && Math.abs((gx - 1) * CELL_SIZE - 405) >= 36) {
-        gx -= 1;
-      } else if (rightGy > currGy && Math.abs((gx + 1) * CELL_SIZE - this.entrancePos.x) >= 48 && Math.abs((gx + 1) * CELL_SIZE - 405) >= 36) {
-        gx += 1;
-      } else {
-        break;
-      }
-    }
-
-    const surfGy = Math.floor(this.grid.surfaceY[gx] / CELL_SIZE);
-    const placeGy = surfGy - 1;
-    if (placeGy > Math.floor((CASE_TOP + 64) / CELL_SIZE) && this.grid.inBounds(gx, placeGy)) {
-      const belowT = this.grid.terrain[this.grid.idx(gx, surfGy)];
-      if (this.grid.terrain[this.grid.idx(gx, placeGy)] === CellType.AIR && belowT !== CellType.TUNNEL) {
-        this.grid.setTerrain(gx, placeGy, CellType.SUBSOIL);
-        this.grid.updateSurfaceProfile();
-
-        const newSurfY = this.grid.surfaceY[gx];
-        const wx = (gx + 0.5) * CELL_SIZE;
-        for (const other of this.ants) {
-          if (Math.abs(other.x - wx) < 11 && other.y >= newSurfY - 5 && other.y <= newSurfY + 9) {
-            other.y = newSurfY - 1.5;
-          }
-        }
-        for (const f of this.foods) {
-          if (f.storedInChamberId === null && !f.falling && Math.abs(f.x - wx) < 10 && f.y >= newSurfY - 4) {
-            f.y = newSurfY - 3;
-          }
-        }
-
-        for (let k = 0; k < 3; k++) {
-          this.particles.push({
-            x: wx + (Math.random() - 0.5) * 6,
-            y: newSurfY - 3,
-            vx: (Math.random() - 0.5) * 18,
-            vy: -8 - Math.random() * 12,
-            size: 1.1 + Math.random() * 1.1,
-            alpha: 0.9,
-            life: 0,
-            maxLife: 0.42,
-            kind: 'crumb',
-            color: '#8c623d',
-          });
-        }
-      }
-    }
-  }
-
-  private stepExcavator(ant: Ant, dt: number, royal: Chamber | undefined): void {
-    const onSurface = this.isOnExteriorSurface(ant.x, ant.y);
-
-    if (ant.payload === PayloadType.SOIL) {
-      ant.task = AntTask.CARRYING_SOIL;
-
-      if (!ant.targetPos || ant.targetPos.y > SURFACE_BASE_Y + 12) {
-        const useMain = Math.abs(ant.x - this.entrancePos.x) < Math.abs(ant.x - 405) + 120;
-        const entX = useMain ? this.entrancePos.x : 405;
-        const side = (ant.id + Math.floor(this.simTime * 0.1)) % 2 === 0 ? 1 : -1;
-        const offset = (useMain ? 48 : 36) + ((ant.id * 19 + Math.floor(ant.age * 3)) % 46);
-        const dropX = clamp(entX + side * offset, CASE_LEFT + 30, CASE_RIGHT - 30);
-        const gx = Math.floor(dropX / CELL_SIZE);
-        ant.targetPos = { x: dropX, y: this.grid.surfaceY[clamp(gx, 0, GRID_W - 1)] - 3 };
-      }
-
-      const dropX = ant.targetPos.x;
-      const gxCurr = clamp(Math.floor(ant.x / CELL_SIZE), 0, GRID_W - 1);
-      const surfYCurr = this.grid.surfaceY[gxCurr];
-
-      // Only drop soil once cleanly past the flared entrance funnel rim!
-      if (onSurface && (Math.abs(ant.x - dropX) < 14 || Math.abs(ant.x - this.entrancePos.x) > 48)) {
-        const nearDrop = Math.abs(ant.x - dropX) < 14 && Math.abs(ant.y - surfYCurr) < 14;
-        const nearMoundEdge =
-          (Math.abs(ant.x - this.entrancePos.x) > 48 && Math.abs(ant.x - this.entrancePos.x) < 104) ||
-          (Math.abs(ant.x - 405) > 36 && Math.abs(ant.x - 405) < 76);
-        if (nearDrop || (nearMoundEdge && Math.abs(ant.x - dropX) < 24)) {
-          this.depositSoilGranuleAt(ant.x);
-          ant.pauseTimer = 0.3 + Math.random() * 0.3;
-          ant.payload = PayloadType.NONE;
-          ant.path = [];
-          ant.targetPos = null;
-          ant.task = AntTask.EXCAVATING;
-          return;
-        }
-      }
-
-      if (ant.path.length === 0 && this.simTime - ant.lastPathCalcTime > 1.0 && this.pathBudgetThisTick < 4) {
-        this.pathBudgetThisTick++;
-        ant.lastPathCalcTime = this.simTime;
-        const gx = clamp(Math.floor(dropX / CELL_SIZE), 0, GRID_W - 1);
-        const goal = onSurface ? { x: dropX, y: this.grid.surfaceY[gx] - 3 } : this.getSurfaceExitTarget(ant.x);
-        ant.path = this.grid.findPath({ x: ant.x, y: ant.y }, goal);
-        ant.pathIndex = 0;
-      }
-      return;
-    }
-
-    ant.task = AntTask.EXCAVATING;
-    ant.stateTimer -= dt;
-
-    // If on exterior surface without soil payload, immediately re-enter the nest to dig!
-    if (onSurface) {
-      if (ant.path.length === 0 && this.simTime - ant.lastPathCalcTime > 1.0 && this.pathBudgetThisTick < 3) {
-        this.pathBudgetThisTick++;
-        ant.lastPathCalcTime = this.simTime;
-        const dest = this.findDigFrontierTarget(ant) ?? (royal ? { x: royal.x, y: royal.y + 4 } : null);
-        if (dest) {
-          ant.path = this.grid.findPath({ x: ant.x, y: ant.y }, dest);
-          ant.pathIndex = 0;
-        }
-      }
-      return;
-    }
-
-    const g = this.grid.worldToGrid(ant.x, ant.y);
-    let bestGx = -1;
-    let bestGy = -1;
-    let bestScore = -999;
-
-    const desiredDugBudget = 340 + this.ants.length * 8;
-
-    for (let dy = -3; dy <= 3; dy++) {
-      for (let dx = -3; dx <= 3; dx++) {
-        if (dx === 0 && dy === 0) continue;
-        const nx = g.gx + dx;
-        const ny = g.gy + dy;
-        if (!this.grid.isDiggable(nx, ny)) continue;
-        const wy = ny * CELL_SIZE;
-        const wx = nx * CELL_SIZE;
-        if (wy < this.grid.surfaceY[nx] + 24) continue;
-        if (wx < CASE_LEFT + 34 || wx > CASE_RIGHT - 34 || wy > CASE_BOTTOM - 30) continue;
-
-        let score = 0;
-        let tunnelNeighbors = 0;
-        for (let oy = -1; oy <= 1; oy++) {
-          for (let ox = -1; ox <= 1; ox++) {
-            if (this.grid.inBounds(nx + ox, ny + oy) && this.grid.terrain[this.grid.idx(nx + ox, ny + oy)] === CellType.TUNNEL) {
-              tunnelNeighbors++;
-            }
-          }
-        }
-        if (tunnelNeighbors >= 2 && tunnelNeighbors <= 5) score += 2.6;
-        if (ny > 64 && ny < 128) score += 0.8;
-        if (this.tunnelsDugCells > desiredDugBudget) score -= 2.2;
-
-        score += Math.random() * 1.1;
-        if (score > bestScore) {
-          bestScore = score;
-          bestGx = nx;
-          bestGy = ny;
-        }
-      }
-    }
-
-    if (bestGx !== -1 && bestScore > 1.6 && ant.stateTimer <= 0) {
-      this.grid.setTerrain(bestGx, bestGy, CellType.TUNNEL);
-      this.tunnelsDugCells++;
-      this.nestFieldDirty = true;
-      ant.payload = PayloadType.SOIL;
-      ant.stateTimer = 1.1 + Math.random() * 0.8;
-      ant.path = [];
-      ant.targetPos = null;
-      const w = this.grid.gridToWorld(bestGx, bestGy);
-      for (let k = 0; k < 3; k++) {
-        this.particles.push({
-          x: w.x,
-          y: w.y,
-          vx: (Math.random() - 0.5) * 24,
-          vy: 10 + Math.random() * 25,
-          size: 1.2 + Math.random() * 1.4,
-          alpha: 0.85,
-          life: 0,
-          maxLife: 0.45,
-          kind: 'crumb',
-          color: '#7c5836',
-        });
-      }
-      return;
-    }
-
-    // If excavation budget is temporarily saturated, help tend the Fungus Garden instead of idling!
-    if (this.tunnelsDugCells > desiredDugBudget) {
-      const fungusCh = this.getChamber(ChamberType.FUNGUS);
-      if (fungusCh) {
-        if (Math.hypot(ant.x - fungusCh.x, ant.y - fungusCh.y) < 32) {
-          ant.task = AntTask.TENDING_FUNGUS;
-          ant.stateTimer = 1.8;
-          return;
-        }
-        if (ant.path.length === 0 && this.simTime - ant.lastPathCalcTime > 1.4 && this.pathBudgetThisTick < 3) {
-          this.pathBudgetThisTick++;
-          ant.lastPathCalcTime = this.simTime;
-          ant.path = this.grid.findPath({ x: ant.x, y: ant.y }, { x: fungusCh.x, y: fungusCh.y + 6 });
-          ant.pathIndex = 0;
-        }
-        return;
-      }
-    }
-
-    if ((ant.path.length === 0 && !ant.targetPos) || ant.stateTimer <= -2.0) {
-      ant.stateTimer = 1.8 + Math.random() * 1.8;
-      const dest = this.findDigFrontierTarget(ant);
-      if (dest && this.pathBudgetThisTick < 3) {
-        this.pathBudgetThisTick++;
-        ant.path = this.grid.findPath({ x: ant.x, y: ant.y }, dest);
-        ant.pathIndex = 0;
-      }
-    }
-  }
-
-  private stepSoldier(ant: Ant, dt: number, royal: Chamber | undefined): void {
-    const onSurface = this.isOnExteriorSurface(ant.x, ant.y);
-
-    if (this.intruders.length > 0) {
-      let target = this.intruders[0];
-      let bestDist = Math.hypot(target.x - ant.x, target.y - ant.y);
-      for (let idx = 1; idx < this.intruders.length; idx++) {
-        const cand = this.intruders[idx];
-        const d = Math.hypot(cand.x - ant.x, cand.y - ant.y);
-        if (d < bestDist) {
-          bestDist = d;
-          target = cand;
-        }
-      }
-      ant.task = AntTask.DEFENDING;
-      if (bestDist < 18) {
-        ant.stateTimer -= dt;
-        if (ant.stateTimer <= 0) {
-          ant.stateTimer = 0.4;
-          target.hp -= 10;
-          this.particles.push({
-            x: (ant.x + target.x) * 0.5,
-            y: (ant.y + target.y) * 0.5,
-            vx: (Math.random() - 0.5) * 20,
-            vy: -12 - Math.random() * 12,
-            size: 1.2,
-            alpha: 0.75,
-            life: 0,
-            maxLife: 0.25,
-            kind: 'spark',
-            color: '#fef08a',
-          });
-        }
-        ant.targetAngle = Math.atan2(target.y - ant.y, target.x - ant.x);
-        return;
-      }
-      if (ant.path.length === 0 && this.simTime - ant.lastPathCalcTime > 0.7 && this.pathBudgetThisTick < 5) {
-        this.pathBudgetThisTick++;
-        ant.lastPathCalcTime = this.simTime;
-        const goal = !onSurface && target.y <= SURFACE_BASE_Y + 25 ? this.getSurfaceExitTarget(target.x) : { x: target.x, y: target.y };
-        ant.path = this.grid.findPath({ x: ant.x, y: ant.y }, goal);
-        ant.pathIndex = 0;
-      }
-      return;
-    }
-
-    ant.task = AntTask.PATROLLING;
-    ant.stateTimer -= dt;
-    if (ant.stateTimer <= 0 || (!ant.targetPos && ant.path.length === 0)) {
-      ant.stateTimer = 3.2 + Math.random() * 3.0;
-      const guardEntrance = ant.id % 3 !== 0;
-      if (guardEntrance) {
-        const side = (ant.id % 2 === 0 ? 1 : -1) * (38 + Math.random() * 58);
-        const px = clamp(this.entrancePos.x + side, CASE_LEFT + 40, CASE_RIGHT - 40);
-        const gx = Math.floor(px / CELL_SIZE);
-        const dest = { x: px, y: this.grid.surfaceY[clamp(gx, 0, GRID_W - 1)] - 2 };
-        if (!onSurface || Math.hypot(ant.x - dest.x, ant.y - dest.y) > 48) {
-          if (this.pathBudgetThisTick < 3) {
-            this.pathBudgetThisTick++;
-            ant.path = this.grid.findPath({ x: ant.x, y: ant.y }, onSurface ? dest : this.getSurfaceExitTarget(px));
-            ant.pathIndex = 0;
-          }
-        } else {
-          ant.targetPos = dest;
-        }
-      } else if (royal) {
-        const dest = {
-          x: royal.x + (Math.random() - 0.5) * 80,
-          y: royal.y + (Math.random() - 0.5) * 20,
-        };
-        if (onSurface && this.pathBudgetThisTick < 2) {
-          this.pathBudgetThisTick++;
-          ant.path = this.grid.findPath({ x: ant.x, y: ant.y }, dest);
-          ant.pathIndex = 0;
-        } else {
-          ant.targetPos = dest;
-        }
-      }
-    }
-  }
-
   private isInsideChamber(ant: Ant, c: Chamber, radiusFrac: number): boolean {
     const dx = (ant.x - c.x) / c.rx;
     const dy = (ant.y - c.y) / c.ry;
     return dx * dx + dy * dy < radiusFrac;
   }
 
-  /** Is any intruder close enough that this ant would notice it (alarm is local, not colony-wide)? */
-  private intruderNear(ant: Ant, radius: number): boolean {
-    for (const m of this.intruders) {
-      if (Math.abs(m.x - ant.x) < radius && Math.abs(m.y - ant.y) < radius) return true;
-    }
-    return false;
-  }
-
-  /** Unladen, calm and not mid-way through something that matters: may consider a rest. */
-  private isCalmAndUnladen(ant: Ant): boolean {
-    if (ant.payload !== PayloadType.NONE || ant.payloadId !== null || ant.recruitFoodPos) return false;
-    if (this.intruderNear(ant, 150)) return false;
-    return !(
-      ant.task === AntTask.DEFENDING ||
-      ant.task === AntTask.FLEEING ||
-      ant.task === AntTask.EXCAVATING ||
-      ant.task === AntTask.CARRYING_SOIL ||
-      ant.task === AntTask.NECROPHORESIS ||
-      ant.task === AntTask.SIGNALING_FOOD
-    );
-  }
-
-  /** Naps are skewed short with the occasional long one; busy castes nap less. */
-  private napDuration(ant: Ant): number {
-    const scale = ant.caste === AntCaste.SOLDIER ? 0.7 : ant.caste === AntCaste.EXCAVATOR ? 0.8 : 1;
-    return (5 + Math.random() * Math.random() * 36) * scale;
-  }
-
-  /** Back to the caste's normal work after a rest (or after giving up on reaching one). */
-  private endRest(ant: Ant): void {
-    ant.task =
-      ant.caste === AntCaste.NURSE
-        ? AntTask.MOVING_BROOD
-        : ant.caste === AntCaste.EXCAVATOR
-        ? AntTask.EXCAVATING
-        : ant.caste === AntCaste.SOLDIER
-        ? AntTask.PATROLLING
-        : AntTask.FORAGING_SCOUT;
-    ant.restCooldown = 45 + Math.random() * 90;
-    ant.path = [];
-    ant.targetPos = null;
-  }
-
-  /**
-   * Locomotion pace: ants never walk at one steady speed. Pace eases toward a task-dependent target with a slow
-   * individual ebb and flow, slows for sharp turns, and drops to zero for brief stops (a scout sampling the air,
-   * an ant antennating food it just found).
-   */
   private updatePace(ant: Ant, dt: number, turnErr: number): number {
     let target: number;
     if ((ant.pauseTimer ?? 0) > 0) {
@@ -2833,7 +3600,8 @@ export class AntColonySimulation {
         // keep the climb height
       } else if (ant.path.length === 0 && belowT !== CellType.TUNNEL && ny <= surfY + 3) {
         ny = surfY - 1.5;
-      } else if (ny < surfY - 14) {
+      } else if (ny < surfY - 14 && !this.grid.isNavigable(finalG.gx, finalG.gy)) {
+        // floating in open air (not clinging to a wall or mound face): settle back onto the ground
         ny = surfY - 2.0;
       }
     }
@@ -2916,10 +3684,44 @@ export class AntColonySimulation {
     return this.chambers.find((c) => c.type === type);
   }
 
+  public getStats(): ColonyStats {
+    const castes: Record<string, number> = {};
+    const busy: Record<string, number> = {};
+    for (const a of this.ants) {
+      castes[a.caste] = (castes[a.caste] ?? 0) + 1;
+      busy[a.task] = (busy[a.task] ?? 0) + 1;
+    }
+    let eggs = 0;
+    let larvae = 0;
+    let pupae = 0;
+    for (const b of this.brood) {
+      if (b.stage === BroodStage.EGG) eggs++;
+      else if (b.stage === BroodStage.LARVA) larvae++;
+      else pupae++;
+    }
+    return {
+      population: this.ants.length,
+      queenAlive: !!this.getQueen(),
+      castes,
+      eggs,
+      larvae,
+      pupae,
+      storedFood: Math.round(this.storedFoodCache),
+      chambers: this.chambers.length,
+      tunnelCells: this.tunnelsDugCells,
+      moundSoil: this.soilDeposited,
+      intruders: this.intruders.length,
+      day: this.dayCount,
+      isNight: this.isNight(),
+      weather: this.weather,
+      busy,
+    };
+  }
+
   private sanitizeAntPositions(): void {
     for (const ant of this.ants) {
       const g = this.grid.worldToGrid(ant.x, ant.y);
-      if (this.grid.isSolid(g.gx, g.gy) || !this.grid.isNavigable(g.gx, g.gy)) {
+      if (!this.grid.isNavigable(g.gx, g.gy)) {
         const safe = this.grid.findNearestNavigable(g.gx, g.gy, 32);
         if (safe) {
           const w = this.grid.gridToWorld(safe.gx, safe.gy);
@@ -2932,73 +3734,68 @@ export class AntColonySimulation {
     }
   }
 
+  // ================================================================================================================
+  // Persistence
+  // ================================================================================================================
+
+  private static rle(arr: ArrayLike<number>, quant = 1): number[] {
+    const out: number[] = [];
+    let prev = Math.round(arr[0] * quant);
+    let count = 1;
+    for (let i = 1; i < arr.length; i++) {
+      const v = Math.round(arr[i] * quant);
+      if (v === prev) count++;
+      else {
+        out.push(prev, count);
+        prev = v;
+        count = 1;
+      }
+    }
+    out.push(prev, count);
+    return out;
+  }
+
+  private static unrle(data: number[], target: { length: number; [i: number]: number }, quant = 1): void {
+    let idx = 0;
+    for (let i = 0; i < data.length; i += 2) {
+      const v = data[i] / quant;
+      for (let c = 0; c < data[i + 1] && idx < target.length; c++) target[idx++] = v;
+    }
+  }
+
   public saveState(): void {
     try {
-      // Run-length encode terrain & quantized moisture for compact fast localStorage persistence
-      const terrainRle: number[] = [];
-      let prevT = this.grid.terrain[0];
-      let countT = 1;
-      for (let i = 1; i < this.grid.terrain.length; i++) {
-        const t = this.grid.terrain[i];
-        if (t === prevT) {
-          countT++;
-        } else {
-          terrainRle.push(prevT, countT);
-          prevT = t;
-          countT = 1;
-        }
-      }
-      terrainRle.push(prevT, countT);
-
-      const moistRle: number[] = [];
-      let prevM = Math.round(this.grid.moisture[0] * 20);
-      let countM = 1;
-      for (let i = 1; i < this.grid.moisture.length; i++) {
-        const m = Math.round(this.grid.moisture[i] * 20);
-        if (m === prevM) {
-          countM++;
-        } else {
-          moistRle.push(prevM, countM);
-          prevM = m;
-          countM = 1;
-        }
-      }
-      moistRle.push(prevM, countM);
-
-      const compactAnts = this.ants.map((a) => ({
-        ...a,
-        path: [], // Recomputed dynamically as needed
-        pathIndex: 0,
-      }));
-
       const payload = {
-        v: 1,
+        v: 2,
         simTime: this.simTime,
         timeOfDay: this.timeOfDay,
         dayCount: this.dayCount,
         weather: this.weather,
-        windStrength: this.windStrength,
         weatherTimer: this.weatherTimer,
         tunnelsDugCells: this.tunnelsDugCells,
+        soilDeposited: this.soilDeposited,
         nextId: this.nextId,
         entrancePos: this.entrancePos,
         middenPos: this.middenPos,
         chambers: this.chambers,
-        ants: compactAnts,
+        projects: this.projects,
+        ants: this.ants.map((a) => ({ ...a, path: [], pathIndex: 0, targetPos: null, navKey: undefined })),
         brood: this.brood,
         foods: this.foods,
         fallenAnts: this.fallenAnts,
-        intruders: this.intruders,
-        droplets: this.droplets,
+        intruders: this.intruders.map((m) => ({ ...m, path: [], pathIndex: 0 })),
         sprouts: this.sprouts,
         surfaceProps: this.surfaceProps,
         rootPolylines: this.rootPolylines,
-        terrainRle,
-        moistRle,
+        events: this.events,
+        terrainRle: AntColonySimulation.rle(this.grid.terrain),
+        moistRle: AntColonySimulation.rle(this.grid.moisture, 20),
+        planRle: AntColonySimulation.rle(this.digPlan),
+        baseGround: this.baseGround ? Array.from(this.baseGround) : null,
       };
       localStorage.setItem(AntColonySimulation.SAVE_KEY, JSON.stringify(payload));
     } catch {
-      // Ignore storage quota or private browsing errors cleanly
+      // storage unavailable or full: the colony simply won't persist
     }
   }
 
@@ -3007,152 +3804,56 @@ export class AntColonySimulation {
       const raw = localStorage.getItem(AntColonySimulation.SAVE_KEY);
       if (!raw) return false;
       const data = JSON.parse(raw);
-      if (!data || data.v !== 1 || !Array.isArray(data.terrainRle) || !Array.isArray(data.ants) || data.ants.length === 0) {
-        return false;
-      }
+      if (!data || data.v !== 2 || !Array.isArray(data.terrainRle) || !Array.isArray(data.ants) || data.ants.length === 0) return false;
 
-      // Decode RLE terrain
-      let tIdx = 0;
-      for (let i = 0; i < data.terrainRle.length; i += 2) {
-        const val = data.terrainRle[i];
-        const count = data.terrainRle[i + 1];
-        for (let c = 0; c < count && tIdx < this.grid.terrain.length; c++) {
-          this.grid.terrain[tIdx++] = val;
-        }
-      }
-
-      // Decode RLE moisture
-      if (Array.isArray(data.moistRle)) {
-        let mIdx = 0;
-        for (let i = 0; i < data.moistRle.length; i += 2) {
-          const val = data.moistRle[i] / 20;
-          const count = data.moistRle[i + 1];
-          for (let c = 0; c < count && mIdx < this.grid.moisture.length; c++) {
-            this.grid.moisture[mIdx++] = val;
-          }
-        }
-      }
+      AntColonySimulation.unrle(data.terrainRle, this.grid.terrain);
+      if (Array.isArray(data.moistRle)) AntColonySimulation.unrle(data.moistRle, this.grid.moisture, 20);
+      if (Array.isArray(data.planRle)) AntColonySimulation.unrle(data.planRle, this.digPlan);
 
       this.simTime = Number(data.simTime) || 0;
-      this.timeOfDay = Number(data.timeOfDay) ?? 0.34;
+      this.timeOfDay = Number.isFinite(data.timeOfDay) ? data.timeOfDay : 0.3;
       this.dayCount = Number(data.dayCount) || 1;
       this.weather = data.weather || 'Clear';
-      this.windStrength = Number(data.windStrength) || 0.35;
       this.weatherTimer = Number(data.weatherTimer) || 35;
       this.tunnelsDugCells = Number(data.tunnelsDugCells) || 0;
-      this.nextId = Number(data.nextId) || 1000;
+      this.soilDeposited = Number(data.soilDeposited) || 0;
+      this.nextId = Number(data.nextId) || 100000;
       this.entrancePos = data.entrancePos || { x: 700, y: SURFACE_BASE_Y };
       this.middenPos = data.middenPos || { x: 1290, y: SURFACE_BASE_Y };
       this.chambers = data.chambers || [];
+      this.projects = data.projects || [];
       this.ants = data.ants || [];
       this.brood = data.brood || [];
       this.foods = data.foods || [];
       this.fallenAnts = data.fallenAnts || [];
       this.intruders = data.intruders || [];
-      this.droplets = data.droplets || [];
       this.sprouts = data.sprouts || [];
       this.surfaceProps = data.surfaceProps || [];
       this.rootPolylines = data.rootPolylines || [];
-
+      this.events = data.events || [];
+      if (Array.isArray(data.baseGround) && data.baseGround.length === GRID_W) this.baseGround = Float32Array.from(data.baseGround);
+      this.droplets = [];
       this.particles = [];
-      for (let i = 0; i < 65; i++) {
-        this.particles.push({
-          x: CASE_LEFT + 20 + Math.random() * (CASE_RIGHT - CASE_LEFT - 40),
-          y: CASE_TOP + 10 + Math.random() * (SURFACE_BASE_Y - CASE_TOP + 20),
-          vx: (Math.random() - 0.5) * 5,
-          vy: -1.5 + Math.random() * 3,
-          size: 0.7 + Math.random() * 2.0,
-          alpha: 0.14 + Math.random() * 0.42,
-          life: Math.random() * 100,
-          maxLife: 99999,
-          kind: 'dust',
-          color: '#f5e6c8',
-        });
-      }
+      for (let i = 0; i < 65; i++) this.particles.push(this.makeDustMote());
 
       this.grid.updateSurfaceProfile();
-      this.flareEntranceMouths();
+      this.grid.rebuildNav();
       this.grid.dirtVisualDirty = true;
 
-      // Upgrade existing saved colonies with left/right rocky edge outcrops & clear stale entrance targets
-      if (!this.surfaceProps.some((p) => p.kind === 'outcrop')) {
-        const leftGx = Math.floor((CASE_LEFT + 64) / CELL_SIZE);
-        const rightGx = Math.floor((CASE_RIGHT - 64) / CELL_SIZE);
-        this.surfaceProps.push(
-          {
-            kind: 'outcrop',
-            x: CASE_LEFT + 64,
-            y: this.grid.surfaceY[leftGx],
-            width: 78,
-            height: 35,
-            angle: 0.03,
-            seed: 31.7,
-          },
-          {
-            kind: 'outcrop',
-            x: CASE_RIGHT - 64,
-            y: this.grid.surfaceY[rightGx],
-            width: 78,
-            height: 36,
-            angle: -0.03,
-            seed: 62.4,
-          }
-        );
-      }
+      const ids = new Set(this.ants.map((a) => a.id));
       for (const ant of this.ants) {
         ant.path = [];
+        ant.pathIndex = 0;
         ant.targetPos = null;
-      }
-      for (const m of this.intruders) {
-        m.path = [];
-        m.pathIndex = 0;
-        const mg = this.grid.worldToGrid(m.x, m.y);
-        if (this.grid.isSolid(mg.gx, mg.gy) || !this.grid.isNavigable(mg.gx, mg.gy)) {
-          const safe = this.grid.findNearestNavigable(mg.gx, mg.gy, 8);
-          if (safe) {
-            const w = this.grid.gridToWorld(safe.gx, safe.gy);
-            m.x = w.x;
-            m.y = w.y;
-          }
+        ant.digIdx = -1;
+        if (ant.payloadId !== null && isBroodPayload(ant.payload) && !this.brood.some((b) => b.id === ant.payloadId)) {
+          ant.payloadId = null;
+          ant.payload = PayloadType.NONE;
         }
       }
-
-      for (const sp of this.sprouts) {
-        const gx = clamp(Math.floor(sp.x / CELL_SIZE), 0, GRID_W - 1);
-        sp.y = this.grid.surfaceY[gx];
-      }
-      for (const fa of this.fallenAnts) {
-        if (fa.carriedByAntId !== null && !this.ants.some((a) => a.id === fa.carriedByAntId)) {
-          fa.carriedByAntId = null;
-        }
-        const fgx = clamp(Math.floor(fa.x / CELL_SIZE), 0, GRID_W - 1);
-        const surfY = this.grid.surfaceY[fgx];
-        if (!fa.atMidden && (Math.abs(fa.x - this.entrancePos.x) < 34 || Math.abs(fa.x - 405) < 26) && fa.y > surfY - 6 && fa.y < surfY + 66) {
-          fa.x = clamp(this.middenPos.x + (Math.random() - 0.5) * 20, CASE_LEFT + 32, CASE_RIGHT - 32);
-          fa.y = this.middenPos.y;
-          fa.atMidden = true;
-          fa.carriedByAntId = null;
-        }
-      }
-      for (const fd of this.foods) {
-        if (fd.storedInChamberId === null && !fd.falling) {
-          const fgx = clamp(Math.floor(fd.x / CELL_SIZE), 0, GRID_W - 1);
-          const surfY = this.grid.surfaceY[fgx];
-          if ((Math.abs(fd.x - this.entrancePos.x) < 38 || Math.abs(fd.x - 405) < 28) && fd.y > surfY - 6) {
-            const entX = Math.abs(fd.x - this.entrancePos.x) < 38 ? this.entrancePos.x : 405;
-            const side = fd.x >= entX ? 1 : -1;
-            fd.x = clamp(entX + side * 48, CASE_LEFT + 32, CASE_RIGHT - 32);
-            const nGx = clamp(Math.floor(fd.x / CELL_SIZE), 0, GRID_W - 1);
-            fd.y = this.grid.surfaceY[nGx] - 3;
-          }
-        }
-      }
-
-      const royal = this.getChamber(ChamberType.ROYAL);
-      if (royal) {
-        this.grid.recomputeNestField(royal.x, royal.y);
-      }
-      this.nestFieldDirty = false;
+      for (const b of this.brood) if (b.carriedByAntId !== null && !ids.has(b.carriedByAntId)) b.carriedByAntId = null;
+      for (const fa of this.fallenAnts) if (fa.carriedByAntId !== null && !ids.has(fa.carriedByAntId)) fa.carriedByAntId = null;
+      for (const sp of this.sprouts) sp.y = this.grid.surfaceY[clamp(Math.floor(sp.x / CELL_SIZE), 0, GRID_W - 1)];
       this.sanitizeAntPositions();
       return true;
     } catch {

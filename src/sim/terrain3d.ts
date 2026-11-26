@@ -100,6 +100,7 @@ export class FormicariumEnvironment3D {
   private smoothSoilField = new Float32Array(GRID_W * GRID_H);
   private smoothAirField = new Float32Array(GRID_W * GRID_H);
   private lastRebuildTime = -10;
+  private builtTerrainVersion = -1;
   private lastBackTexTime = -10;
 
   constructor(sim: AntColonySimulation, bank: MaterialBank, maxAnisotropy: number, isSoftwareGl: boolean) {
@@ -244,12 +245,12 @@ export class FormicariumEnvironment3D {
     this.disposables.push(this.curvedCavernMat);
 
     // 7. Densely Populated Exposed-Surface Tiny Dark-Brown Soil Spheres (1 draw call)
-    const granuleGeo = new THREE.SphereGeometry(1, 5, 4);
+    const granuleGeo = new THREE.IcosahedronGeometry(1, 0);
     this.granuleMesh = new THREE.InstancedMesh(granuleGeo, bank.soilFrontMat, MAX_GRANULES);
     this.granuleMesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(MAX_GRANULES * 3), 3);
     this.granuleMesh.count = 0;
     this.granuleMesh.frustumCulled = false;
-    this.granuleMesh.castShadow = !isSoftwareGl;
+    this.granuleMesh.castShadow = false; // sub-ant-sized grains: shadows cost a full extra pass for no visible gain
     this.granuleMesh.receiveShadow = true;
     this.group.add(this.granuleMesh);
     this.disposables.push(granuleGeo);
@@ -442,7 +443,12 @@ export class FormicariumEnvironment3D {
   }
 
   public update(sim: AntColonySimulation, elapsedTime: number): void {
-    if (sim.grid.dirtVisualDirty && elapsedTime - this.lastRebuildTime > 0.22) {
+    // Rebuilding the soil mesh is expensive (tens of ms). Real digging changes a cell or two at a time, so batch the
+    // edits up; moisture-only changes (rain soaking in) can wait much longer.
+    const terrainChanged = sim.grid.terrainVersion !== this.builtTerrainVersion;
+    const due = terrainChanged ? elapsedTime - this.lastRebuildTime > 1.2 : elapsedTime - this.lastRebuildTime > 8;
+    if (sim.grid.dirtVisualDirty && due) {
+      this.builtTerrainVersion = sim.grid.terrainVersion;
       this.rebuildTerrain(sim);
       this.updateBackEarthTexture(sim);
       sim.grid.dirtVisualDirty = false;

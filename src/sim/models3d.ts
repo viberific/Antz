@@ -170,7 +170,7 @@ export function createGeometryBank(): GeometryBank {
   const icosa1 = new THREE.IcosahedronGeometry(1, 1);
   const box1 = new THREE.BoxGeometry(1, 1, 1);
   const tetra0 = new THREE.TetrahedronGeometry(1, 0);
-  const cyl6 = new THREE.CylinderGeometry(1, 1, 1, 6);
+  const cyl6 = new THREE.CylinderGeometry(1, 1, 1, 6, 1, true); // open-ended: leg and antenna caps are never seen
   const cone5 = new THREE.ConeGeometry(1, 1, 5);
   const larvaGeo = createLarvaGeometry();
   const fallenAntGeo = createFallenAntGeometry();

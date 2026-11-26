@@ -52,6 +52,8 @@ export enum AntTask {
   SIGNALING_FOOD = 'Signaling Food Discovery',
   TENDING_FUNGUS = 'Tending Fungus Garden',
   SEEKING_REST = 'Heading Home to Rest',
+  EATING = 'Eating from Stores',
+  REPAIRING = 'Repairing Storm Damage',
 }
 
 export enum PayloadType {
@@ -136,6 +138,18 @@ export interface Ant {
   restChamberId?: number;
   /** >=1: how much longer the rendered 3D walking route is than the 2D sim step (set by the renderer) */
   surfaceStretch?: number;
+  hp?: number;
+  maxHp?: number;
+  /** brood item or queen this ant is currently working for */
+  targetId?: number | null;
+  /** grid index of the cell being excavated, -1 when not digging */
+  digIdx?: number;
+  /** seconds spent outside on the current foraging trip */
+  excursion?: number;
+  /** which navigation goal the current `path` was built for */
+  navKey?: string;
+  attackCd?: number;
+  lastHitTime?: number;
 }
 
 export interface BroodItem {
@@ -148,6 +162,8 @@ export interface BroodItem {
   carriedByAntId: number | null;
   chamberId: number | null;
   wigglePhase: number;
+  /** seconds a larva has gone without food */
+  starve?: number;
 }
 
 export interface FoodSource {
@@ -202,6 +218,9 @@ export interface Intruder {
   path?: Vec2[];
   pathIndex?: number;
   lastPathTime?: number;
+  age?: number;
+  /** has left the home crevice at least once (so it can't 'escape' the moment it spawns) */
+  roamed?: boolean;
 }
 
 export interface FallenAnt {
