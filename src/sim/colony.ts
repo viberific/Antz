@@ -42,6 +42,12 @@ function lerpAngle(a: number, b: number, t: number): number {
   return a + diff * t;
 }
 
+/**
+ * Sustainable colony size: roughly what the surface food supply can feed. A larger cap just overshoots, starves the
+ * brood and cycles back down.
+ */
+const MAX_COLONY = 150;
+
 export class AntColonySimulation {
   public grid: ColonyGrid;
   public ants: Ant[] = [];
@@ -75,6 +81,7 @@ export class AntColonySimulation {
   private intruderTimer: number = 10;
   private fungusTimer: number = 8;
   private queenEggTimer: number = 4;
+  private labourTimer: number = 5;
 
   private static readonly SAVE_KEY = 'formicarium_colony_v1';
 
@@ -394,6 +401,12 @@ export class AntColonySimulation {
       }
     }
 
+    // The founding ants span a range of ages. If they were all born at t=0 they would also all die together,
+    // wiping out every nurse at once and starving the brood (a generation cliff).
+    for (const a of this.ants) {
+      if (a.caste !== AntCaste.QUEEN) a.age = Math.random() * 0.75 * a.maxAge;
+    }
+
     // 9. Atmospheric floating dust motes
     for (let i = 0; i < 65; i++) {
       this.particles.push({
@@ -596,7 +609,8 @@ export class AntColonySimulation {
       hunger: 10 + Math.random() * 25,
       hydration: 80 + Math.random() * 20,
       age: 0,
-      maxAge: caste === AntCaste.QUEEN ? 999999 : 280 + Math.random() * 220,
+      // Workers live tens of minutes (not ~5): long enough for a colony to be a stable, watchable thing.
+      maxAge: caste === AntCaste.QUEEN ? 999999 : 1500 + Math.random() * 1500,
       isCallow,
       callowTimer: isCallow ? 22 : 0,
       task:
@@ -788,9 +802,10 @@ export class AntColonySimulation {
     // Wind-blown seeds & dripping plant honeydew appear dynamically
     this.naturalFoodTimer -= dt;
     if (this.naturalFoodTimer <= 0) {
-      this.naturalFoodTimer = 8 + Math.random() * 10;
+      // Supply sized so a full-grown colony can sustain itself; the queen still throttles laying when stores run low.
+      this.naturalFoodTimer = 6 + Math.random() * 7;
       const surfaceFoods = this.foods.filter((f) => f.storedInChamberId === null);
-      if (surfaceFoods.length < 8) {
+      if (surfaceFoods.length < 10) {
         const r = Math.random();
         if (r < 0.55) {
           // Wind-blown seed drifting from canopy
@@ -892,7 +907,7 @@ export class AntColonySimulation {
       } else if (b.stage === BroodStage.PUPA) {
         b.progress += dt * 2.6;
         if (b.progress >= 100) {
-          if (this.ants.length < 210) {
+          if (this.ants.length < MAX_COLONY) {
             const caste = this.chooseNeededCaste();
             this.spawnAnt(caste, b.x, b.y - 2, true);
           }
@@ -1369,16 +1384,58 @@ export class AntColonySimulation {
   private stepFallenAnts(dt: number): void {
     for (let i = this.fallenAnts.length - 1; i >= 0; i--) {
       const f = this.fallenAnts[i];
-      if (f.atMidden) {
-        f.decayTimer -= dt;
-        if (f.decayTimer <= 0) {
-          this.fallenAnts.splice(i, 1);
-        }
+      if (f.carriedByAntId !== null) continue;
+      // Corpses at the midden are broken down quickly; any left lying elsewhere desiccate and get dismantled
+      // by passers-by far more slowly, so they can never pile up without bound.
+      f.decayTimer -= dt * (f.atMidden ? 1 : 0.12);
+      if (f.decayTimer <= 0) {
+        this.fallenAnts.splice(i, 1);
       }
     }
   }
 
+  /**
+   * Colonies reallocate labour when a task is short-handed. If nurses run low (they age out like everyone else)
+   * a worker switches to brood care, otherwise larvae starve and the colony cannot renew itself.
+   */
+  private rebalanceLabour(dt: number): void {
+    this.labourTimer -= dt;
+    if (this.labourTimer > 0) return;
+    this.labourTimer = 4 + Math.random() * 3;
+
+    let nurses = 0;
+    let total = 0;
+    for (const a of this.ants) {
+      if (a.caste === AntCaste.QUEEN) continue;
+      total++;
+      if (a.caste === AntCaste.NURSE) nurses++;
+    }
+    const needed = Math.max(3, Math.round(total * 0.14));
+    if (nurses >= needed || total < 6) return;
+
+    // Prefer an unladen worker that is already inside the nest, else any unladen worker.
+    let pick: Ant | null = null;
+    let pickInside = false;
+    for (const a of this.ants) {
+      if (a.caste !== AntCaste.WORKER || a.payload !== PayloadType.NONE || a.payloadId !== null || a.recruitFoodPos) continue;
+      const inside = a.y > this.grid.surfaceY[clamp(Math.floor(a.x / CELL_SIZE), 0, GRID_W - 1)] + 14;
+      if (!pick || (inside && !pickInside)) {
+        pick = a;
+        pickInside = inside;
+      }
+      if (inside) break;
+    }
+    if (pick) {
+      pick.caste = AntCaste.NURSE;
+      pick.task = AntTask.MOVING_BROOD;
+      pick.path = [];
+      pick.targetPos = null;
+      pick.speed = 29 + Math.random() * 4;
+    }
+  }
+
   private stepAnts(dt: number): void {
+    this.rebalanceLabour(dt);
     const granary = this.getChamber(ChamberType.GRANARY);
     const nursery = this.getChamber(ChamberType.NURSERY);
     const royal = this.getChamber(ChamberType.ROYAL);
@@ -1391,7 +1448,7 @@ export class AntColonySimulation {
       this.queenEggTimer -= dt;
       if (this.queenEggTimer <= 0) {
         this.queenEggTimer = storedFood > 60 ? 5.2 : 10.5;
-        if (this.brood.length < 52 && this.ants.length + this.brood.length < 235 && storedFood > 15) {
+        if (this.brood.length < 44 && this.ants.length + this.brood.length < MAX_COLONY && storedFood > 15) {
           const queen = this.ants.find((a) => a.caste === AntCaste.QUEEN);
           if (queen) {
             queen.task = AntTask.LAYING_EGG;
@@ -1459,7 +1516,7 @@ export class AntColonySimulation {
         continue;
       }
 
-      ant.hunger = clamp(ant.hunger + dt * (ant.caste === AntCaste.QUEEN ? 0.5 : 0.72), 0, 100);
+      ant.hunger = clamp(ant.hunger + dt * (ant.caste === AntCaste.QUEEN ? 0.2 : 0.12), 0, 100);
       ant.hydration = clamp(ant.hydration - dt * 0.25, 0, 100);
 
       if (ant.hunger > 72 && ant.caste !== AntCaste.QUEEN && ant.payload === PayloadType.NONE) {
@@ -1470,6 +1527,73 @@ export class AntColonySimulation {
           stored.amount = Math.max(0, stored.amount - 5);
           ant.hunger = Math.max(0, ant.hunger - 48);
           ant.energy = Math.min(100, ant.energy + 35);
+        }
+      }
+
+      // Resting: in a real colony a large share of workers are idle at any moment. Rest only happens inside a
+      // chamber (never in traffic lanes), never while carrying, and is cut short when intruders show up.
+      if (ant.task === AntTask.IDLE && ant.caste !== AntCaste.QUEEN) {
+        ant.stateTimer -= dt;
+        ant.vx = 0;
+        ant.vy = 0;
+        ant.path = [];
+        ant.targetPos = null;
+        const alarmed = this.intruderNear(ant, 110) && Math.random() < dt * 1.5;
+        if (ant.stateTimer <= 0 || alarmed) this.endRest(ant);
+        continue;
+      }
+      // Walking home to a chamber to rest
+      if (ant.task === AntTask.SEEKING_REST && ant.caste !== AntCaste.QUEEN) {
+        const ch = this.chambers.find((c) => c.id === ant.restChamberId);
+        ant.stateTimer -= dt;
+        const giveUp = !ch || ant.stateTimer <= 0 || this.intruderNear(ant, 90) || ant.payload !== PayloadType.NONE;
+        if (giveUp) {
+          this.endRest(ant);
+          continue;
+        }
+        if (this.isInsideChamber(ant, ch, 0.55)) {
+          ant.task = AntTask.IDLE;
+          ant.stateTimer = this.napDuration(ant);
+          ant.path = [];
+          ant.targetPos = null;
+          continue;
+        }
+        if (ant.path.length === 0 && this.simTime - ant.lastPathCalcTime > 1.0 && this.pathBudgetThisTick < 4) {
+          this.pathBudgetThisTick++;
+          ant.lastPathCalcTime = this.simTime;
+          ant.path = this.grid.findPath(
+            { x: ant.x, y: ant.y },
+            { x: ch.x + (Math.random() - 0.5) * ch.rx * 0.9, y: ch.y + (Math.random() - 0.5) * ch.ry * 0.5 }
+          );
+          ant.pathIndex = 0;
+        }
+        this.moveAnt(ant, dt);
+        continue;
+      }
+
+      if (ant.caste !== AntCaste.QUEEN) {
+        ant.restCooldown = (ant.restCooldown ?? 10 + Math.random() * 60) - dt;
+        if (ant.restCooldown <= 0 && this.isCalmAndUnladen(ant)) {
+          const here = this.chambers.find((c) => this.isInsideChamber(ant, c, 1.0));
+          if (here && Math.random() < dt * 1.5) {
+            // already in a chamber: just settle down
+            ant.task = AntTask.IDLE;
+            ant.stateTimer = this.napDuration(ant);
+            ant.path = [];
+            ant.targetPos = null;
+            continue;
+          }
+          if (!here && Math.random() < dt * 0.12 && this.chambers.length > 0) {
+            // decide to head home for a rest
+            const ch = this.chambers[Math.floor(Math.random() * this.chambers.length)];
+            ant.task = AntTask.SEEKING_REST;
+            ant.restChamberId = ch.id;
+            ant.stateTimer = 40; // give up if we cannot get there
+            ant.path = [];
+            ant.targetPos = null;
+            ant.lastPathCalcTime = -10;
+            continue;
+          }
         }
       }
 
@@ -1814,9 +1938,13 @@ export class AntColonySimulation {
     }
 
     // Check for fallen nestmate needing undertaker
-    const fallen = this.fallenAnts.find(
-      (f) => !f.atMidden && f.carriedByAntId === null && Math.hypot(f.x - ant.x, f.y - ant.y) < 18
-    );
+    // Undertaking is done by a specialist minority of foragers, not by every worker that walks past a corpse.
+    const fallen =
+      ant.id % 5 === 0
+        ? this.fallenAnts.find(
+            (f) => !f.atMidden && f.carriedByAntId === null && Math.hypot(f.x - ant.x, f.y - ant.y) < 18
+          )
+        : undefined;
     if (fallen) {
       fallen.carriedByAntId = ant.id;
       ant.payload = PayloadType.REFUSE;
@@ -1833,6 +1961,7 @@ export class AntColonySimulation {
     if (nearFood) {
       const take = Math.min(nearFood.amount, 8);
       nearFood.amount -= take;
+      ant.pauseTimer = 0.35 + Math.random() * 0.4; // antennate the find before hauling it off
       ant.payload = nearFood.type;
       ant.payloadValue = take;
       ant.recruitFoodPos = nearFood.amount > 4 ? { x: nearFood.x, y: nearFood.y } : null;
@@ -2213,6 +2342,7 @@ export class AntColonySimulation {
           (Math.abs(ant.x - 405) > 36 && Math.abs(ant.x - 405) < 76);
         if (nearDrop || (nearMoundEdge && Math.abs(ant.x - dropX) < 24)) {
           this.depositSoilGranuleAt(ant.x);
+          ant.pauseTimer = 0.3 + Math.random() * 0.3;
           ant.payload = PayloadType.NONE;
           ant.path = [];
           ant.targetPos = null;
@@ -2426,6 +2556,112 @@ export class AntColonySimulation {
     }
   }
 
+  private isInsideChamber(ant: Ant, c: Chamber, radiusFrac: number): boolean {
+    const dx = (ant.x - c.x) / c.rx;
+    const dy = (ant.y - c.y) / c.ry;
+    return dx * dx + dy * dy < radiusFrac;
+  }
+
+  /** Is any intruder close enough that this ant would notice it (alarm is local, not colony-wide)? */
+  private intruderNear(ant: Ant, radius: number): boolean {
+    for (const m of this.intruders) {
+      if (Math.abs(m.x - ant.x) < radius && Math.abs(m.y - ant.y) < radius) return true;
+    }
+    return false;
+  }
+
+  /** Unladen, calm and not mid-way through something that matters: may consider a rest. */
+  private isCalmAndUnladen(ant: Ant): boolean {
+    if (ant.payload !== PayloadType.NONE || ant.payloadId !== null || ant.recruitFoodPos) return false;
+    if (this.intruderNear(ant, 150)) return false;
+    return !(
+      ant.task === AntTask.DEFENDING ||
+      ant.task === AntTask.FLEEING ||
+      ant.task === AntTask.EXCAVATING ||
+      ant.task === AntTask.CARRYING_SOIL ||
+      ant.task === AntTask.NECROPHORESIS ||
+      ant.task === AntTask.SIGNALING_FOOD
+    );
+  }
+
+  /** Naps are skewed short with the occasional long one; busy castes nap less. */
+  private napDuration(ant: Ant): number {
+    const scale = ant.caste === AntCaste.SOLDIER ? 0.7 : ant.caste === AntCaste.EXCAVATOR ? 0.8 : 1;
+    return (5 + Math.random() * Math.random() * 36) * scale;
+  }
+
+  /** Back to the caste's normal work after a rest (or after giving up on reaching one). */
+  private endRest(ant: Ant): void {
+    ant.task =
+      ant.caste === AntCaste.NURSE
+        ? AntTask.MOVING_BROOD
+        : ant.caste === AntCaste.EXCAVATOR
+        ? AntTask.EXCAVATING
+        : ant.caste === AntCaste.SOLDIER
+        ? AntTask.PATROLLING
+        : AntTask.FORAGING_SCOUT;
+    ant.restCooldown = 45 + Math.random() * 90;
+    ant.path = [];
+    ant.targetPos = null;
+  }
+
+  /**
+   * Locomotion pace: ants never walk at one steady speed. Pace eases toward a task-dependent target with a slow
+   * individual ebb and flow, slows for sharp turns, and drops to zero for brief stops (a scout sampling the air,
+   * an ant antennating food it just found).
+   */
+  private updatePace(ant: Ant, dt: number, turnErr: number): number {
+    let target: number;
+    if ((ant.pauseTimer ?? 0) > 0) {
+      ant.pauseTimer = (ant.pauseTimer ?? 0) - dt;
+      target = 0;
+    } else {
+      let base = 0.9;
+      let pauseRate = 0;
+      switch (ant.task) {
+        case AntTask.FORAGING_SCOUT:
+          base = 0.82;
+          pauseRate = 0.22;
+          break;
+        case AntTask.PATROLLING:
+          base = 0.7;
+          pauseRate = 0.3;
+          break;
+        case AntTask.EXCAVATING:
+          base = 0.72;
+          pauseRate = 0.2;
+          break;
+        case AntTask.MOVING_BROOD:
+        case AntTask.FEEDING_LARVA:
+        case AntTask.TENDING_QUEEN:
+          base = 0.85;
+          pauseRate = 0.1;
+          break;
+        case AntTask.DEFENDING:
+        case AntTask.FLEEING:
+          base = 1.15;
+          break;
+        case AntTask.FOLLOWING_FOOD_TRAIL:
+          base = 1.0;
+          break;
+        case AntTask.RETURNING_WITH_FOOD:
+          base = 0.95;
+          break;
+        default:
+          break;
+      }
+      const ebb = 1 + 0.16 * Math.sin(this.simTime * (0.9 + (ant.id % 7) * 0.13) + ant.id * 1.9);
+      target = base * ebb;
+      if (pauseRate > 0 && ant.payload === PayloadType.NONE && Math.random() < pauseRate * dt) {
+        ant.pauseTimer = 0.25 + Math.random() * 0.9;
+      }
+    }
+    target *= 1 - 0.5 * Math.min(1, turnErr / (Math.PI * 0.6));
+    const cur = ant.pace ?? 1;
+    ant.pace = cur + (target - cur) * Math.min(1, dt * (target > cur ? 6 : 10));
+    return ant.pace;
+  }
+
   /**
    * If the ant is blocked by a wall in its direction of travel and the face is climbable (open space overhead
    * and an open cell beside the wall top within `MAX_CLIMB_CELLS`), returns the y to crawl up to; else null.
@@ -2488,13 +2724,18 @@ export class AntColonySimulation {
       ant.targetAngle += (Math.random() - 0.5) * 1.4 * dt;
     }
 
-    const wanderScale = followingPath ? 0.08 : 1.0;
-    const wander = Math.sin(this.simTime * 3.1 + ant.id * 1.7) * 0.22 * wanderScale;
+    const wanderScale = followingPath ? 0.1 : 1.0;
+    // two incommensurate sine weaves: ants never walk ruler-straight
+    const wander =
+      (Math.sin(this.simTime * 3.1 + ant.id * 1.7) * 0.22 + Math.sin(this.simTime * 1.3 + ant.id * 0.9) * 0.1) *
+      wanderScale;
     const turnRate = followingPath ? 14.0 : 7.5;
+    const turnErr = Math.abs(wrapAngle(ant.targetAngle + wander - ant.angle));
     ant.angle = lerpAngle(ant.angle, ant.targetAngle + wander, Math.min(1, dt * turnRate));
 
     const speedFactor = ant.payload !== PayloadType.NONE ? 0.84 : 1.0;
-    const stepDist = ant.speed * speedFactor * dt;
+    const pace = this.updatePace(ant, dt, turnErr);
+    const stepDist = ant.speed * speedFactor * pace * dt;
 
     let nx = ant.x + Math.cos(ant.angle) * stepDist;
     let ny = ant.y + Math.sin(ant.angle) * stepDist;
@@ -2624,7 +2865,9 @@ export class AntColonySimulation {
     ant.vy = (ant.y - prevY) / Math.max(0.001, dt);
     ant.gaitPhase += moved * 0.95;
 
-    if (Math.hypot(ant.x - ant.prevX, ant.y - ant.prevY) < 0.3 * dt * 20) {
+    if (pace < 0.25) {
+      ant.stuckTimer = 0; // deliberately stopped, not stuck
+    } else if (Math.hypot(ant.x - ant.prevX, ant.y - ant.prevY) < 0.3 * dt * 20) {
       ant.stuckTimer += dt;
       if (ant.stuckTimer > 0.8) {
         const hadPath = ant.path.length > 0;
