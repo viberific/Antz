@@ -6,6 +6,10 @@ import {
   Vec2,
 } from './types';
 
+const NB_DX = [-1, 1, 0, 0, -1, 1, -1, 1];
+const NB_DY = [0, 0, -1, 1, -1, -1, 1, 1];
+const NB_COST = [1, 1, 1.08, 1.08, 1.45, 1.45, 1.45, 1.45];
+
 export class ColonyGrid {
   public terrain: Uint8Array;
   public moisture: Float32Array;
@@ -18,6 +22,12 @@ export class ColonyGrid {
   public surfaceY: Float32Array; // per column gx: world Y of ground surface
   public dirtVisualDirty: boolean = true;
   public dirtyCells: number[] = [];
+  /** cached walkability (see computeNavigable); kept in sync by setTerrain / rebuildNav */
+  public nav: Uint8Array;
+  /** bumped on every terrain edit so dependants (flow fields) know when to refresh */
+  public terrainVersion = 0;
+  private fieldHeapIdx: Int32Array;
+  private fieldHeapScore: Float32Array;
 
   // Reusable A* scratch buffers to eliminate GC pressure
   private gScore: Float32Array;
@@ -50,6 +60,9 @@ export class ColonyGrid {
     this.heapIdx = new Int32Array(size);
     this.heapScore = new Float32Array(size);
     this.visitStamp = new Uint32Array(size);
+    this.nav = new Uint8Array(size);
+    this.fieldHeapIdx = new Int32Array(size * 4);
+    this.fieldHeapScore = new Float32Array(size * 4);
   }
 
   public idx(gx: number, gy: number): number {
@@ -92,6 +105,29 @@ export class ColonyGrid {
    * - In AIR cells above ground: ants walk along the surface terrain contour (up to 2 cells above solid ground or clinging to surface mounds/pebbles).
    */
   public isNavigable(gx: number, gy: number): boolean {
+    if (gx < 0 || gx >= GRID_W || gy < 0 || gy >= GRID_H) return false;
+    return this.nav[gy * GRID_W + gx] === 1;
+  }
+
+  public rebuildNav(): void {
+    for (let gy = 0; gy < GRID_H; gy++) {
+      for (let gx = 0; gx < GRID_W; gx++) {
+        this.nav[gy * GRID_W + gx] = this.computeNavigable(gx, gy) ? 1 : 0;
+      }
+    }
+    this.terrainVersion++;
+  }
+
+  private refreshNavAround(gx: number, gy: number): void {
+    for (let y = gy - 3; y <= gy + 1; y++) {
+      for (let x = gx - 1; x <= gx + 1; x++) {
+        if (x < 0 || x >= GRID_W || y < 0 || y >= GRID_H) continue;
+        this.nav[y * GRID_W + x] = this.computeNavigable(x, y) ? 1 : 0;
+      }
+    }
+  }
+
+  private computeNavigable(gx: number, gy: number): boolean {
     if (!this.inBounds(gx, gy)) return false;
     const t = this.terrain[gy * GRID_W + gx];
     if (t === CellType.TUNNEL) return true;
@@ -132,7 +168,127 @@ export class ColonyGrid {
       this.terrain[i] = type;
       this.dirtyCells.push(i);
       this.dirtVisualDirty = true;
+      this.terrainVersion++;
+      this.refreshNavAround(gx, gy);
     }
+  }
+
+  /** Recompute the ground height of one column (cheap alternative to updateSurfaceProfile). */
+  public updateSurfaceColumn(gx: number): void {
+    if (gx < 0 || gx >= GRID_W) return;
+    let foundY = GRID_H * CELL_SIZE;
+    for (let gy = 0; gy < GRID_H; gy++) {
+      const t = this.terrain[gy * GRID_W + gx];
+      if (t !== CellType.AIR && t !== CellType.GLASS_WALL) {
+        foundY = gy * CELL_SIZE;
+        break;
+      }
+    }
+    this.surfaceY[gx] = foundY;
+  }
+
+  /**
+   * Multi-source Dijkstra over walkable cells. `out[i]` becomes the walking cost from cell i to the nearest source,
+   * so any ant anywhere can find its way by stepping downhill (see `descend`). One field serves every ant heading
+   * to the same kind of place, which is far cheaper than a per-ant A* search.
+   */
+  public buildFlowField(out: Float32Array, sources: number[], sourceCosts?: number[]): void {
+    out.fill(1e6);
+    const hIdx = this.fieldHeapIdx;
+    const hScore = this.fieldHeapScore;
+    const cap = hIdx.length;
+    let size = 0;
+    const push = (node: number, score: number) => {
+      if (size >= cap) return;
+      let i = size++;
+      while (i > 0) {
+        const p = (i - 1) >> 1;
+        if (hScore[p] <= score) break;
+        hIdx[i] = hIdx[p];
+        hScore[i] = hScore[p];
+        i = p;
+      }
+      hIdx[i] = node;
+      hScore[i] = score;
+    };
+    for (let k = 0; k < sources.length; k++) {
+      const s = sources[k];
+      if (this.nav[s] !== 1) continue;
+      const c = sourceCosts ? sourceCosts[k] : 0;
+      if (c < out[s]) {
+        out[s] = c;
+        push(s, c);
+      }
+    }
+    const nav = this.nav;
+    const terrain = this.terrain;
+    while (size > 0) {
+      const cur = hIdx[0];
+      const curScore = hScore[0];
+      size--;
+      if (size > 0) {
+        const lastIdx = hIdx[size];
+        const lastScore = hScore[size];
+        let i = 0;
+        while (true) {
+          const l = (i << 1) + 1;
+          if (l >= size) break;
+          const r = l + 1;
+          const m = r < size && hScore[r] < hScore[l] ? r : l;
+          if (lastScore <= hScore[m]) break;
+          hIdx[i] = hIdx[m];
+          hScore[i] = hScore[m];
+          i = m;
+        }
+        hIdx[i] = lastIdx;
+        hScore[i] = lastScore;
+      }
+      // (out is Float32: compare with a tolerance, or float64 re-relaxations of equal cost requeue endlessly)
+      if (curScore > out[cur] + 1e-3) continue;
+      const cx = cur % GRID_W;
+      const cy = (cur - cx) / GRID_W;
+      for (let k = 0; k < 8; k++) {
+        const dx = NB_DX[k];
+        const dy = NB_DY[k];
+        const nx = cx + dx;
+        const ny = cy + dy;
+        if (nx < 0 || nx >= GRID_W || ny < 0 || ny >= GRID_H) continue;
+        const ni = ny * GRID_W + nx;
+        if (nav[ni] !== 1) continue;
+        if (dx !== 0 && dy !== 0 && this.isSolid(cx + dx, cy) && this.isSolid(cx, cy + dy)) continue;
+        let cost = NB_COST[k];
+        // discourage hovering routes through open air that is not resting on the ground
+        if (terrain[ni] === CellType.AIR && ny + 1 < GRID_H && !this.isSolid(nx, ny + 1)) cost += 0.7;
+        const nd = curScore + cost;
+        if (nd < out[ni] - 1e-3) {
+          out[ni] = nd;
+          push(ni, nd);
+        }
+      }
+    }
+  }
+
+  /** Next cell downhill on a flow field from cell `i`, or -1 at a minimum / dead end. */
+  public descend(field: Float32Array, i: number): number {
+    const cx = i % GRID_W;
+    const cy = (i - cx) / GRID_W;
+    let best = -1;
+    let bestD = field[i];
+    for (let k = 0; k < 8; k++) {
+      const dx = NB_DX[k];
+      const dy = NB_DY[k];
+      const nx = cx + dx;
+      const ny = cy + dy;
+      if (nx < 0 || nx >= GRID_W || ny < 0 || ny >= GRID_H) continue;
+      const ni = ny * GRID_W + nx;
+      if (this.nav[ni] !== 1) continue;
+      if (dx !== 0 && dy !== 0 && this.isSolid(cx + dx, cy) && this.isSolid(cx, cy + dy)) continue;
+      if (field[ni] < bestD - 1e-4) {
+        bestD = field[ni];
+        best = ni;
+      }
+    }
+    return best;
   }
 
   public updateSurfaceProfile(): void {

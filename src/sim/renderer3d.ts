@@ -23,6 +23,7 @@ import {
 } from './models3d';
 import { FormicariumEnvironment3D } from './terrain3d';
 import { resetLegs } from './legs';
+import { MeshBatcher, collectMeshes } from './batcher';
 import {
   AntCaste,
   BroodStage,
@@ -109,6 +110,10 @@ export class Formicarium3DRenderer {
 
   private readonly antRigs = new Map<number, AntRig>();
   private readonly intruderRigs = new Map<number, IntruderRig>();
+  private readonly rigMeshes = new Map<object, THREE.Mesh[]>();
+  private readonly batcher: MeshBatcher;
+  /** coarse buckets of ants by sim position, for the cheap side-by-side passing dodge */
+  private readonly dodgeBuckets = new Map<number, number[]>();
   private readonly sproutMeshes: { mesh: THREE.Group; phase: number; baseX: number; baseY: number }[] = [];
 
   // Instanced pools for repeated small entities
@@ -143,7 +148,9 @@ export class Formicarium3DRenderer {
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 1.15;
-    this.renderer.setPixelRatio(this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, 2));
+    // Phones are fill-rate bound: 1.5x is visually close to their native 3x at a fraction of the pixel cost.
+    const coarse = typeof window.matchMedia === 'function' && window.matchMedia('(pointer: coarse)').matches;
+    this.renderer.setPixelRatio(this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, coarse ? 1.5 : 2));
     this.renderer.shadowMap.enabled = !this.isSoftwareGl;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     this.renderer.setSize(container.clientWidth || window.innerWidth, container.clientHeight || window.innerHeight);
@@ -257,6 +264,7 @@ export class Formicarium3DRenderer {
     this.rainMesh = makeInst(new THREE.BoxGeometry(0.014, 0.24, 0.014), rainMat, 120, false);
     this.crumbMesh = makeInst(new THREE.SphereGeometry(0.036, 6, 4), this.bank.soilCrumbMat, 120, false);
     this.sparkMesh = makeInst(new THREE.IcosahedronGeometry(0.038, 0), sparkMat, 80, false);
+    this.batcher = new MeshBatcher(this.scene, !this.isSoftwareGl);
 
     // OrbitControls: Pinch-to-zoom, 2-finger pan, right-drag pan, left-drag 3D orbit
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
@@ -463,29 +471,54 @@ export class Formicarium3DRenderer {
     const posBlend = Math.min(1, 1 - Math.exp(-16 * dt));
     const flexBlend = Math.min(1, 1 - Math.exp(-11 * dt));
 
+    for (const list of this.dodgeBuckets.values()) list.length = 0;
+    for (let i = 0; i < sim.ants.length; i++) {
+      const a = sim.ants[i];
+      const key = Math.floor(a.y / 10) * 1000 + Math.floor(a.x / 10);
+      let list = this.dodgeBuckets.get(key);
+      if (!list) {
+        list = [];
+        this.dodgeBuckets.set(key, list);
+      }
+      list.push(i);
+    }
+
     for (const ant of sim.ants) {
       activeIds.add(ant.id);
       let rig = this.antRigs.get(ant.id);
       if (!rig || rig.caste !== ant.caste) {
-        if (rig) this.scene.remove(rig.root);
+        const prev = rig;
+        if (prev) this.rigMeshes.delete(prev);
         rig = createAntRig(ant.caste, ant.isCallow, this.bank, this.geo);
         rig.zLane = ((ant.id * 37) % 100) / 100 * 0.42 + 0.02;
+        if (prev && prev.hasInitPos) {
+          // a worker switching jobs keeps its place and pose
+          rig.smoothPos.copy(prev.smoothPos);
+          rig.hasInitPos = true;
+          rig.currentQuat.copy(prev.currentQuat);
+          rig.hasInitOrientation = true;
+          rig.prevWorldPos.copy(prev.prevWorldPos);
+        }
         this.antRigs.set(ant.id, rig);
-        this.scene.add(rig.root);
+        this.rigMeshes.set(rig, collectMeshes(rig.root));
       }
 
       const probeDist =
         ant.caste === AntCaste.QUEEN ? 9.5 : ant.caste === AntCaste.SOLDIER ? 7.5 : 5.8;
       // Subtle dynamic Z-passing dodge when sharing tight 2D coordinates with nearby bugs
       let zDodge = 0;
-      for (let j = 0; j < sim.ants.length; j++) {
-        const o = sim.ants[j];
-        if (o.id === ant.id) continue;
-        if (Math.abs(o.x - ant.x) < 10 && Math.abs(o.y - ant.y) < 10) {
-          const oRig = this.antRigs.get(o.id);
-          const oz = oRig ? oRig.zLane : 0.22;
-          if (Math.abs(rig.zLane - oz) < 0.12) {
-            zDodge += ant.id < o.id ? -0.045 : 0.045;
+      const hx0 = Math.floor(ant.x / 10);
+      const hy0 = Math.floor(ant.y / 10);
+      for (let hy = hy0 - 1; hy <= hy0 + 1; hy++) {
+        for (let hx = hx0 - 1; hx <= hx0 + 1; hx++) {
+          const bucket = this.dodgeBuckets.get(hy * 1000 + hx);
+          if (!bucket) continue;
+          for (let k = 0; k < bucket.length; k++) {
+            const o = sim.ants[bucket[k]];
+            if (o.id === ant.id || Math.abs(o.x - ant.x) >= 10 || Math.abs(o.y - ant.y) >= 10) continue;
+            const oRig = this.antRigs.get(o.id);
+            const oz = oRig ? oRig.zLane : 0.22;
+            if (Math.abs(rig.zLane - oz) < 0.12) zDodge += ant.id < o.id ? -0.045 : 0.045;
           }
         }
       }
@@ -537,11 +570,13 @@ export class Formicarium3DRenderer {
 
       this.groundSim = sim;
       animateAntRig(rig, ant, sim.simTime, this.bank, dt, rig.worldVel, this.sampleGround);
+      rig.root.updateMatrixWorld(true);
+      this.batcher.addAll(this.rigMeshes.get(rig)!);
     }
 
     for (const [id, rig] of this.antRigs) {
       if (!activeIds.has(id)) {
-        this.scene.remove(rig.root);
+        this.rigMeshes.delete(rig);
         this.antRigs.delete(id);
       }
     }
@@ -557,11 +592,11 @@ export class Formicarium3DRenderer {
       activeIds.add(m.id);
       let rig = this.intruderRigs.get(m.id);
       if (!rig || rig.species !== m.species) {
-        if (rig) this.scene.remove(rig.root);
+        if (rig) this.rigMeshes.delete(rig);
         rig = createIntruderRig(m.species, this.bank, this.geo);
         rig.zLane = ((m.id * 53) % 100) / 100 * 0.36 + 0.05;
         this.intruderRigs.set(m.id, rig);
-        this.scene.add(rig.root);
+        this.rigMeshes.set(rig, collectMeshes(rig.root));
       }
 
       const probeDist =
@@ -617,11 +652,13 @@ export class Formicarium3DRenderer {
       rig.smoothBodyDip += (tf.bodyDip - rig.smoothBodyDip) * flexBlend;
 
       animateIntruderRig(rig, m, sim.simTime);
+      rig.root.updateMatrixWorld(true);
+      this.batcher.addAll(this.rigMeshes.get(rig)!);
     }
 
     for (const [id, rig] of this.intruderRigs) {
       if (!activeIds.has(id)) {
-        this.scene.remove(rig.root);
+        this.rigMeshes.delete(rig);
         this.intruderRigs.delete(id);
       }
     }
@@ -806,8 +843,10 @@ export class Formicarium3DRenderer {
 
     this.env3d.update(sim, sim.simTime);
     this.updateLightingAndWeather(sim);
+    this.batcher.begin();
     this.syncAnts(sim, dt);
     this.syncIntruders(sim, dt);
+    this.batcher.end();
     this.syncInstancedEntities(sim);
 
     this.renderer.render(this.scene, this.camera);
@@ -816,6 +855,7 @@ export class Formicarium3DRenderer {
   public dispose(): void {
     this.disposed = true;
     this.controls.dispose();
+    this.batcher.dispose();
     this.env3d.dispose();
     this.geo.dispose();
     this.bank.dispose();
