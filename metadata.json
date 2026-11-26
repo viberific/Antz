@@ -1,0 +1,6 @@
+{
+  "name": "Formicarium",
+  "description": "A hyper-realistic macro ant colony simulation inside a glass cross-section terrarium with emergent pathfinding, brood care, and dynamic ecosystems.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

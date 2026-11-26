@@ -1,0 +1,1318 @@
+import * as THREE from 'three';
+import { AntColonySimulation } from './colony';
+import {
+  MaterialBank,
+  SOIL_BACK_Z,
+  SOIL_FRONT_Z,
+  TANK_HALF_DEPTH,
+  WORLD_SCALE,
+  simToWorldX,
+  simToWorldY,
+} from './materials3d';
+import {
+  CASE_BOTTOM,
+  CASE_LEFT,
+  CASE_RIGHT,
+  CASE_TOP,
+  CELL_SIZE,
+  CellType,
+  GRID_H,
+  GRID_W,
+} from './types';
+
+const MAX_GRANULES = 44000;
+const SOLID_FRONT_Z = SOIL_FRONT_Z - 0.035;
+const CURVED_RIM_Z = SOLID_FRONT_Z - 0.055;
+const CURVED_DEEP_Z = SOIL_BACK_Z - 0.14; // Half-depth concave cavern dome recess
+const ISO_LEVEL = 0.5;
+
+function smoothstep(edge0: number, edge1: number, x: number): number {
+  const t = clamp((x - edge0) / (edge1 - edge0), 0, 1);
+  return t * t * (3 - 2 * t);
+}
+
+const _dummy = new THREE.Object3D();
+const _col = new THREE.Color();
+
+function clamp(v: number, min: number, max: number): number {
+  return v < min ? min : v > max ? max : v;
+}
+
+function deterministicRand(gx: number, gy: number, salt: number): number {
+  const n = Math.sin(gx * 12.9898 + gy * 78.233 + salt * 37.719) * 43758.5453;
+  return n - Math.floor(n);
+}
+
+/**
+ * Maps smoothed cavity distance (in cells from nearest solid wall) to concave Z depth.
+ * Quarter-ellipse profile produces steep cylindrical walls near rims and deep arched cavern domes.
+ */
+export function cavityDepthToZ(depthCells: number): number {
+  const t = clamp(depthCells / 3.4, 0, 1);
+  const arch = Math.sqrt(Math.max(0, 1 - (1 - t) * (1 - t)));
+  return CURVED_RIM_Z - arch * (CURVED_RIM_Z - CURVED_DEEP_Z);
+}
+
+/**
+ * Returns rich dark-brown soil sRGB values (converted cleanly to linear on setRGB).
+ */
+function granuleColorSrgb(type: CellType, moisture: number, gy: number, tint: number): [number, number, number] {
+  const mDark = 1 - Math.min(0.32, moisture * 0.28);
+  const v = 0.82 + tint * 0.34;
+  if (type === CellType.TOPSOIL) {
+    return [0.15 * mDark * v, 0.088 * mDark * v, 0.052 * mDark * v];
+  }
+  if (type === CellType.SUBSOIL) {
+    const depthMix = Math.min(1, Math.max(0, (gy - 48) / 60));
+    const r = (0.215 - depthMix * 0.045) * mDark * v;
+    const g = (0.128 - depthMix * 0.03) * mDark * v;
+    const b = (0.072 - depthMix * 0.018) * mDark * v;
+    return [r, g, b];
+  }
+  if (type === CellType.DEEP_CLAY) {
+    return [0.135 * mDark * v, 0.078 * mDark * v, 0.046 * mDark * v];
+  }
+  if (type === CellType.PEBBLE) {
+    return [0.27 * v, 0.25 * v, 0.23 * v];
+  }
+  if (type === CellType.ROOT) {
+    return [0.18 * mDark * v, 0.105 * mDark * v, 0.06 * mDark * v];
+  }
+  return [0.16 * v, 0.095 * v, 0.055 * v];
+}
+
+export class FormicariumEnvironment3D {
+  public readonly group = new THREE.Group();
+
+  private readonly solidMesh: THREE.Mesh;
+  private readonly curvedCavernMesh: THREE.Mesh;
+  private readonly curvedCavernMat: THREE.MeshStandardMaterial;
+  private readonly granuleMesh: THREE.InstancedMesh;
+  private readonly backEarthMesh: THREE.Mesh;
+  private readonly backEarthCanvas: HTMLCanvasElement;
+  private readonly backEarthCtx: CanvasRenderingContext2D;
+  private readonly backEarthTex: THREE.CanvasTexture;
+
+  private readonly rootMeshes: THREE.Mesh[] = [];
+  private readonly pebbleInstanced: THREE.InstancedMesh | null = null;
+  private readonly disposables: (THREE.BufferGeometry | THREE.Material | THREE.Texture)[] = [];
+
+  private smoothSoilField = new Float32Array(GRID_W * GRID_H);
+  private smoothAirField = new Float32Array(GRID_W * GRID_H);
+  private lastRebuildTime = -10;
+  private lastBackTexTime = -10;
+
+  constructor(sim: AntColonySimulation, bank: MaterialBank, maxAnisotropy: number, isSoftwareGl: boolean) {
+    const leftX = simToWorldX(CASE_LEFT);
+    const rightX = simToWorldX(CASE_RIGHT);
+    const topY = simToWorldY(CASE_TOP);
+    const botY = simToWorldY(CASE_BOTTOM);
+    const width = rightX - leftX;
+    const height = topY - botY;
+    const centerX = (leftX + rightX) * 0.5;
+    const centerY = (topY + botY) * 0.5;
+
+    // 1. Studio dark slate tabletop beneath the glass case
+    const tableGeo = new THREE.PlaneGeometry(92, 54);
+    const tableMesh = new THREE.Mesh(tableGeo, bank.studioTable);
+    tableMesh.rotation.x = -Math.PI * 0.5;
+    tableMesh.position.set(centerX, botY - 0.55, 0);
+    tableMesh.receiveShadow = true;
+    this.group.add(tableMesh);
+    this.disposables.push(tableGeo);
+
+    // 2. Walnut wood plinth base & lid frame
+    const plinthGeo = new THREE.BoxGeometry(width + 1.1, 0.58, TANK_HALF_DEPTH * 2 + 0.8);
+    const plinth = new THREE.Mesh(plinthGeo, bank.walnutWood);
+    plinth.position.set(centerX, botY - 0.25, 0);
+    plinth.castShadow = true;
+    plinth.receiveShadow = true;
+    this.group.add(plinth);
+    this.disposables.push(plinthGeo);
+
+    const rimH = 0.24;
+    const rimFBGeo = new THREE.BoxGeometry(width + 0.5, rimH, 0.16);
+    const rimFront = new THREE.Mesh(rimFBGeo, bank.walnutWood);
+    rimFront.position.set(centerX, topY + rimH * 0.5, TANK_HALF_DEPTH + 0.04);
+    const rimBack = new THREE.Mesh(rimFBGeo, bank.walnutWood);
+    rimBack.position.set(centerX, topY + rimH * 0.5, -TANK_HALF_DEPTH - 0.04);
+    this.group.add(rimFront, rimBack);
+    this.disposables.push(rimFBGeo);
+
+    const rimSideGeo = new THREE.BoxGeometry(0.18, rimH, TANK_HALF_DEPTH * 2 + 0.24);
+    const rimLeft = new THREE.Mesh(rimSideGeo, bank.walnutWood);
+    rimLeft.position.set(leftX - 0.06, topY + rimH * 0.5, 0);
+    const rimRight = new THREE.Mesh(rimSideGeo, bank.walnutWood);
+    rimRight.position.set(rightX + 0.06, topY + rimH * 0.5, 0);
+    this.group.add(rimLeft, rimRight);
+    this.disposables.push(rimSideGeo);
+
+    // Vertical walnut corner posts & brushed brass brackets
+    const postGeo = new THREE.BoxGeometry(0.24, height + 0.2, 0.24);
+    const bracketGeo = new THREE.BoxGeometry(0.32, 0.52, 0.32);
+    const corners = [
+      [leftX - 0.08, TANK_HALF_DEPTH + 0.02],
+      [rightX + 0.08, TANK_HALF_DEPTH + 0.02],
+      [leftX - 0.08, -TANK_HALF_DEPTH - 0.02],
+      [rightX + 0.08, -TANK_HALF_DEPTH - 0.02],
+    ];
+    for (const [cx, cz] of corners) {
+      const post = new THREE.Mesh(postGeo, bank.walnutWood);
+      post.position.set(cx, centerY, cz);
+      post.castShadow = true;
+      this.group.add(post);
+
+      const botBracket = new THREE.Mesh(bracketGeo, bank.brushedBrass);
+      botBracket.position.set(cx, botY + 0.14, cz);
+      const topBracket = new THREE.Mesh(bracketGeo, bank.brushedBrass);
+      topBracket.position.set(cx, topY - 0.02, cz);
+      this.group.add(botBracket, topBracket);
+    }
+    this.disposables.push(postGeo, bracketGeo);
+
+    // 3. Glass enclosure panes
+    const sideGlassGeo = new THREE.PlaneGeometry(TANK_HALF_DEPTH * 2, height);
+    const leftGlass = new THREE.Mesh(sideGlassGeo, bank.sideGlass);
+    leftGlass.rotation.y = -Math.PI * 0.5;
+    leftGlass.position.set(leftX, centerY, 0);
+    leftGlass.renderOrder = 11;
+
+    const rightGlass = new THREE.Mesh(sideGlassGeo, bank.sideGlass);
+    rightGlass.rotation.y = Math.PI * 0.5;
+    rightGlass.position.set(rightX, centerY, 0);
+    rightGlass.renderOrder = 11;
+    this.group.add(leftGlass, rightGlass);
+    this.disposables.push(sideGlassGeo);
+
+    const backGlassGeo = new THREE.PlaneGeometry(width, height);
+    const backGlass = new THREE.Mesh(backGlassGeo, bank.sideGlass);
+    backGlass.position.set(centerX, centerY, -TANK_HALF_DEPTH);
+    backGlass.renderOrder = 1;
+    this.group.add(backGlass);
+    this.disposables.push(backGlassGeo);
+
+    const frontGlassGeo = new THREE.PlaneGeometry(width, height);
+    const frontGlass = new THREE.Mesh(frontGlassGeo, bank.frontGlass);
+    frontGlass.position.set(centerX, centerY, TANK_HALF_DEPTH);
+    frontGlass.renderOrder = 12;
+    this.group.add(frontGlass);
+    this.disposables.push(frontGlassGeo);
+
+    // 4. Deep dark-brown fallback shadow mask behind curved caverns (prevents any crevice light bleed)
+    this.backEarthCanvas = document.createElement('canvas');
+    this.backEarthCanvas.width = GRID_W;
+    this.backEarthCanvas.height = GRID_H;
+    this.backEarthCtx = this.backEarthCanvas.getContext('2d')!;
+    this.backEarthTex = new THREE.CanvasTexture(this.backEarthCanvas);
+    this.backEarthTex.colorSpace = THREE.SRGBColorSpace;
+    this.backEarthTex.anisotropy = maxAnisotropy;
+    this.backEarthTex.magFilter = THREE.LinearFilter;
+    this.disposables.push(this.backEarthTex);
+
+    const soilAreaW = GRID_W * CELL_SIZE * WORLD_SCALE;
+    const backEarthMat = new THREE.MeshStandardMaterial({
+      map: this.backEarthTex,
+      alphaTest: 0.5,
+      roughness: 0.98,
+      metalness: 0.0,
+    });
+    const backEarthGeo = new THREE.PlaneGeometry(soilAreaW, GRID_H * CELL_SIZE * WORLD_SCALE);
+    this.backEarthMesh = new THREE.Mesh(backEarthGeo, backEarthMat);
+    this.backEarthMesh.position.set(0, simToWorldY(GRID_H * CELL_SIZE * 0.5), CURVED_DEEP_Z - 0.08);
+    this.backEarthMesh.receiveShadow = true;
+    this.group.add(this.backEarthMesh);
+    this.disposables.push(backEarthGeo, backEarthMat);
+
+    // 5. Solid Deformed Dark-Brown Soil Mass Underneath Exposed Granules
+    this.solidMesh = new THREE.Mesh(new THREE.BufferGeometry(), bank.soilWallMat);
+    this.solidMesh.castShadow = !isSoftwareGl;
+    this.solidMesh.receiveShadow = true;
+    this.group.add(this.solidMesh);
+
+    // 6. Smooth Concave Curved Cavern & Cylindrical Tunnel Back Walls
+    this.curvedCavernMat = new THREE.MeshStandardMaterial({
+      map: bank.soilGrainTex,
+      vertexColors: true,
+      roughness: 0.96,
+      metalness: 0.0,
+      flatShading: false,
+    });
+    this.curvedCavernMesh = new THREE.Mesh(new THREE.BufferGeometry(), this.curvedCavernMat);
+    this.curvedCavernMesh.castShadow = !isSoftwareGl;
+    this.curvedCavernMesh.receiveShadow = true;
+    this.group.add(this.curvedCavernMesh);
+    this.disposables.push(this.curvedCavernMat);
+
+    // 7. Densely Populated Exposed-Surface Tiny Dark-Brown Soil Spheres (1 draw call)
+    const granuleGeo = new THREE.SphereGeometry(1, 5, 4);
+    this.granuleMesh = new THREE.InstancedMesh(granuleGeo, bank.soilFrontMat, MAX_GRANULES);
+    this.granuleMesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(MAX_GRANULES * 3), 3);
+    this.granuleMesh.count = 0;
+    this.granuleMesh.frustumCulled = false;
+    this.granuleMesh.castShadow = !isSoftwareGl;
+    this.granuleMesh.receiveShadow = true;
+    this.group.add(this.granuleMesh);
+    this.disposables.push(granuleGeo);
+
+    // 8. 3D Subterranean Roots
+    for (const poly of sim.rootPolylines) {
+      if (poly.length < 2) continue;
+      const pts = poly.map(
+        (p, idx) =>
+          new THREE.Vector3(
+            simToWorldX(p.x),
+            simToWorldY(p.y),
+            0.12 + Math.sin(idx * 0.7 + p.x * 0.02) * 0.22
+          )
+      );
+      const curve = new THREE.CatmullRomCurve3(pts);
+      const tubeGeo = new THREE.TubeGeometry(curve, Math.max(6, pts.length * 2), 0.048, 5, false);
+      const rootMesh = new THREE.Mesh(tubeGeo, bank.rootMat);
+      rootMesh.castShadow = !isSoftwareGl;
+      rootMesh.receiveShadow = true;
+      this.group.add(rootMesh);
+      this.rootMeshes.push(rootMesh);
+      this.disposables.push(tubeGeo);
+    }
+
+    // 9. 3D Embedded River Pebbles
+    const pebbleCoords: { x: number; y: number; gx: number; gy: number }[] = [];
+    for (let gy = 30; gy < GRID_H - 8; gy += 2) {
+      for (let gx = 10; gx < GRID_W - 10; gx += 2) {
+        if (sim.grid.terrain[sim.grid.idx(gx, gy)] === CellType.PEBBLE) {
+          pebbleCoords.push({
+            x: simToWorldX((gx + 0.5) * CELL_SIZE),
+            y: simToWorldY((gy + 0.5) * CELL_SIZE),
+            gx,
+            gy,
+          });
+        }
+      }
+    }
+    if (pebbleCoords.length > 0) {
+      const pebGeo = new THREE.IcosahedronGeometry(0.11, 0);
+      this.pebbleInstanced = new THREE.InstancedMesh(pebGeo, bank.pebbleMat, pebbleCoords.length);
+      this.pebbleInstanced.castShadow = !isSoftwareGl;
+      this.pebbleInstanced.receiveShadow = true;
+      const col = new THREE.Color();
+      for (let i = 0; i < pebbleCoords.length; i++) {
+        const p = pebbleCoords[i];
+        const j = deterministicRand(p.gx, p.gy, 1) - 0.5;
+        _dummy.position.set(p.x, p.y, SOIL_FRONT_Z - 0.05 + j * 0.08);
+        _dummy.rotation.set(j * 2.1, j * 3.4, j * 1.7);
+        _dummy.scale.set(1.1 + j * 0.35, 0.8 + j * 0.25, 0.9);
+        _dummy.updateMatrix();
+        this.pebbleInstanced.setMatrixAt(i, _dummy.matrix);
+        const tone = 0.28 + j * 0.08;
+        col.setRGB(tone, tone * 0.94, tone * 0.88, THREE.SRGBColorSpace);
+        this.pebbleInstanced.setColorAt(i, col);
+      }
+      this.pebbleInstanced.instanceMatrix.needsUpdate = true;
+      if (this.pebbleInstanced.instanceColor) this.pebbleInstanced.instanceColor.needsUpdate = true;
+      this.pebbleInstanced.computeBoundingSphere();
+      this.group.add(this.pebbleInstanced);
+      this.disposables.push(pebGeo);
+    }
+
+    this.rebuildTerrain(sim);
+    this.updateBackEarthTexture(sim);
+  }
+
+  /**
+   * Bilinearly samples the curved cavern/tunnel back-wall Z position at world simulation coordinates
+   * so ants and brood walking on chamber walls hug the concave curvature cleanly.
+   */
+  public sampleCavernBackZ(sim: AntColonySimulation, sx: number, sy: number): number {
+    const fx = clamp(sx / CELL_SIZE - 0.5, 0, GRID_W - 1.001);
+    const fy = clamp(sy / CELL_SIZE - 0.5, 0, GRID_H - 1.001);
+    const gx0 = Math.floor(fx);
+    const gy0 = Math.floor(fy);
+    const gx1 = Math.min(GRID_W - 1, gx0 + 1);
+    const gy1 = Math.min(GRID_H - 1, gy0 + 1);
+    const tx = fx - gx0;
+    const ty = fy - gy0;
+    const cd = sim.grid.cavityDepth;
+    const d00 = cd[gy0 * GRID_W + gx0];
+    const d10 = cd[gy0 * GRID_W + gx1];
+    const d01 = cd[gy1 * GRID_W + gx0];
+    const d11 = cd[gy1 * GRID_W + gx1];
+    const dTop = d00 * (1 - tx) + d10 * tx;
+    const dBot = d01 * (1 - tx) + d11 * tx;
+    const d = Math.max(0.5, dTop * (1 - ty) + dBot * ty);
+    return cavityDepthToZ(d);
+  }
+
+  private sampleField(f: Float32Array, fx: number, fy: number): number {
+    const leftGx = Math.floor(CASE_LEFT / CELL_SIZE);
+    const rightGx = Math.floor(CASE_RIGHT / CELL_SIZE);
+    const topGy = Math.floor(CASE_TOP / CELL_SIZE);
+    const bottomGy = Math.floor(CASE_BOTTOM / CELL_SIZE);
+    const cx = clamp(fx, leftGx, rightGx - 0.001);
+    const cy = clamp(fy, topGy, bottomGy - 0.001);
+    const x0 = Math.floor(cx);
+    const y0 = Math.floor(cy);
+    const x1 = Math.min(rightGx, x0 + 1);
+    const y1 = Math.min(bottomGy, y0 + 1);
+    const tx = cx - x0;
+    const ty = cy - y0;
+    const a = f[y0 * GRID_W + x0] * (1 - tx) + f[y0 * GRID_W + x1] * tx;
+    const b = f[y1 * GRID_W + x0] * (1 - tx) + f[y1 * GRID_W + x1] * tx;
+    return a * (1 - ty) + b * ty;
+  }
+
+  /**
+   * Samples the continuous smooth Marching Squares soil contour and concave cavern back wall
+   * so ants and intruders walk and tilt fluidly along curved 3D geometry instead of flat grid chunks.
+   */
+  public sampleSurfaceContact(
+    sim: AntColonySimulation,
+    sx: number,
+    sy: number,
+    zLane: number,
+    outPos: THREE.Vector3,
+    outUp: THREE.Vector3
+  ): void {
+    const fx = sx / CELL_SIZE - 0.5;
+    const fy = sy / CELL_SIZE - 0.5;
+    const s = this.sampleField(this.smoothSoilField, fx, fy);
+    const airBlend = clamp(this.sampleField(this.smoothAirField, fx, fy) * 1.7, 0, 1);
+
+    const h = 0.85;
+    const dsDx =
+      (this.sampleField(this.smoothSoilField, fx + h, fy) -
+        this.sampleField(this.smoothSoilField, fx - h, fy)) /
+      (2 * h);
+    const dsDy =
+      (this.sampleField(this.smoothSoilField, fx, fy + h) -
+        this.sampleField(this.smoothSoilField, fx, fy - h)) /
+      (2 * h);
+
+    // Outward 2D normal pointing from solid earth into open air/tunnel
+    const wnx = -dsDx;
+    const wny = dsDy;
+    const gradMag = Math.hypot(wnx, wny);
+    const wallW = smoothstep(0.06, 0.34, gradMag);
+
+    let ux = 0;
+    let uy = 1;
+    let wx = simToWorldX(sx);
+    let wy = simToWorldY(sy);
+
+    if (wallW > 1e-4 && gradMag > 1e-4) {
+      ux = wnx / gradMag;
+      uy = wny / gradMag;
+      const cellsFromIso = (s - 0.45) / Math.max(0.24, gradMag);
+      const pullCells = clamp(cellsFromIso, -1.1, 1.3) * wallW;
+      const shift = pullCells * CELL_SIZE * WORLD_SCALE;
+      wx += ux * shift;
+      wy += uy * shift;
+    }
+
+    const zBack = this.sampleCavernBackZ(sim, sx, sy);
+    const eps = CELL_SIZE * 0.75;
+    const dWorld = 2 * eps * WORLD_SCALE;
+    const dzDx = (this.sampleCavernBackZ(sim, sx + eps, sy) - this.sampleCavernBackZ(sim, sx - eps, sy)) / dWorld;
+    const dzDy = (this.sampleCavernBackZ(sim, sx, sy - eps) - this.sampleCavernBackZ(sim, sx, sy + eps)) / dWorld;
+    const bLen = Math.hypot(dzDx, dzDy, 1) || 1;
+    const bnx = -dzDx / bLen;
+    const bny = -dzDy / bLen;
+    const bnz = 1 / bLen;
+
+    const airW = smoothstep(0.24, 0.62, airBlend);
+    const extZ = clamp(zLane, SOIL_BACK_Z + 0.10, SOLID_FRONT_Z - 0.13);
+    const tunnelWallZ = Math.max(zBack + 0.025, clamp(zLane, zBack + 0.025, SOLID_FRONT_Z - 0.12));
+    const undergroundZ = (zBack + 0.022) * (1 - wallW) + tunnelWallZ * wallW;
+    const wz = clamp(undergroundZ * (1 - airW) + extZ * airW, SOIL_BACK_Z - 0.14, SOLID_FRONT_Z - 0.09);
+
+    const wallNz = 0.16 * (1 - airW);
+    outUp.set(
+      bnx * (1 - wallW) + ux * wallW,
+      bny * (1 - wallW) + uy * wallW,
+      bnz * (1 - wallW) + wallNz * wallW
+    );
+    if (outUp.lengthSq() < 1e-6) {
+      outUp.set(0, 1, 0);
+    } else {
+      outUp.normalize();
+    }
+    outPos.set(wx, wy, wz);
+  }
+
+  public update(sim: AntColonySimulation, elapsedTime: number): void {
+    if (sim.grid.dirtVisualDirty && elapsedTime - this.lastRebuildTime > 0.22) {
+      this.rebuildTerrain(sim);
+      this.updateBackEarthTexture(sim);
+      sim.grid.dirtVisualDirty = false;
+      this.lastRebuildTime = elapsedTime;
+      this.lastBackTexTime = elapsedTime;
+    } else if (elapsedTime - this.lastBackTexTime > 2.5) {
+      this.updateBackEarthTexture(sim);
+      this.lastBackTexTime = elapsedTime;
+    }
+  }
+
+  private updateBackEarthTexture(sim: AntColonySimulation): void {
+    const img = this.backEarthCtx.createImageData(GRID_W, GRID_H);
+    const data = img.data;
+    const terrain = sim.grid.terrain;
+    const moisture = sim.grid.moisture;
+
+    for (let gy = 0; gy < GRID_H; gy++) {
+      for (let gx = 0; gx < GRID_W; gx++) {
+        const i = gy * GRID_W + gx;
+        const p = i * 4;
+        const t = terrain[i];
+        const m = moisture[i];
+        const j = (deterministicRand(gx, gy, 3) - 0.5) * 6;
+
+        if (t === CellType.AIR || t === CellType.GLASS_WALL) {
+          data[p] = 0;
+          data[p + 1] = 0;
+          data[p + 2] = 0;
+          data[p + 3] = 0;
+          continue;
+        }
+
+        const isTunnel = t === CellType.TUNNEL;
+        const mDark = 1 - Math.min(0.32, m * 0.28);
+        const tunnelFade = isTunnel ? 0.45 : 0.72;
+        const depthRatio = Math.min(1, Math.max(0, (gy - 38) / 90));
+        data[p] = Math.max(5, Math.min(255, (30 - depthRatio * 10) * mDark * tunnelFade + j));
+        data[p + 1] = Math.max(3, Math.min(255, (17 - depthRatio * 6) * mDark * tunnelFade + j * 0.6));
+        data[p + 2] = Math.max(2, Math.min(255, (10 - depthRatio * 4) * mDark * tunnelFade + j * 0.4));
+        data[p + 3] = 255;
+      }
+    }
+
+    this.backEarthCtx.putImageData(img, 0, 0);
+    this.backEarthTex.needsUpdate = true;
+  }
+
+  private rebuildTerrain(sim: AntColonySimulation): void {
+    sim.grid.updateCavityDepthField();
+    const terrain = sim.grid.terrain;
+    const moisture = sim.grid.moisture;
+    const cavityDepth = sim.grid.cavityDepth;
+
+    const leftGx = Math.floor(CASE_LEFT / CELL_SIZE);
+    const rightGx = Math.floor(CASE_RIGHT / CELL_SIZE);
+    const topGy = Math.floor(CASE_TOP / CELL_SIZE);
+    const bottomGy = Math.floor(CASE_BOTTOM / CELL_SIZE);
+    const minGx = leftGx + 1;
+    const maxGx = rightGx - 1;
+    const minGy = topGy + 1;
+    const maxGy = bottomGy - 1;
+
+    const isSolid = (gx: number, gy: number) => {
+      if (gx < 0 || gx >= GRID_W || gy < 0 || gy >= GRID_H) return false;
+      const t = terrain[gy * GRID_W + gx];
+      return t !== CellType.AIR && t !== CellType.TUNNEL && t !== CellType.GLASS_WALL;
+    };
+
+    const hasNeighborTunnel = (gx: number, gy: number) => {
+      for (let oy = -1; oy <= 1; oy++) {
+        for (let ox = -1; ox <= 1; ox++) {
+          if (ox === 0 && oy === 0) continue;
+          const nx = gx + ox;
+          const ny = gy + oy;
+          if (nx >= 0 && nx < GRID_W && ny >= 0 && ny < GRID_H) {
+            if (terrain[ny * GRID_W + nx] === CellType.TUNNEL) return true;
+          }
+        }
+      }
+      return false;
+    };
+
+    // --- 1. Build smoothed scalar soil occupancy & air-exposure fields ---
+    const len = GRID_W * GRID_H;
+    const fieldA = new Float32Array(len);
+    const fieldB = new Float32Array(len);
+    const airA = new Float32Array(len);
+    const airB = new Float32Array(len);
+
+    for (let gy = minGy; gy <= maxGy; gy++) {
+      const row = gy * GRID_W;
+      for (let gx = minGx; gx <= maxGx; gx++) {
+        const i = row + gx;
+        const t = terrain[i];
+        if (t === CellType.AIR) {
+          fieldA[i] = 0.0;
+          airA[i] = 1.0;
+        } else if (t === CellType.TUNNEL) {
+          // Negative bias keeps narrow tunnels comfortably open and organic after smoothing
+          fieldA[i] = -0.35;
+          airA[i] = 0.0;
+        } else if (t === CellType.GLASS_WALL) {
+          fieldA[i] = 0.0;
+          airA[i] = 0.0;
+        } else {
+          fieldA[i] = 1.0;
+          airA[i] = 0.0;
+        }
+      }
+    }
+
+    const blurPass = (
+      src: Float32Array,
+      dst: Float32Array,
+      centerW: number,
+      orthoW: number,
+      diagW: number,
+      topAirVal: number
+    ) => {
+      const totalW = centerW + orthoW * 4 + diagW * 4;
+      for (let gy = minGy; gy <= maxGy; gy++) {
+        const row = gy * GRID_W;
+        for (let gx = minGx; gx <= maxGx; gx++) {
+          let sum = 0;
+          for (let oy = -1; oy <= 1; oy++) {
+            const ny = gy + oy;
+            for (let ox = -1; ox <= 1; ox++) {
+              const nx = gx + ox;
+              const w = ox === 0 && oy === 0 ? centerW : ox === 0 || oy === 0 ? orthoW : diagW;
+              if (ny <= topGy) {
+                sum += topAirVal * w;
+              } else {
+                const cx = clamp(nx, minGx, maxGx);
+                const cy = clamp(ny, minGy, maxGy);
+                sum += src[cy * GRID_W + cx] * w;
+              }
+            }
+          }
+          dst[row + gx] = sum / totalW;
+        }
+      }
+    };
+
+    // Two gentle Gaussian passes turn grid stair-steps into smooth curvy contours
+    blurPass(fieldA, fieldB, 4, 2, 1, 0.0);
+    blurPass(fieldB, fieldA, 8, 2, 1, 0.0);
+    blurPass(airA, airB, 4, 2, 1, 1.0);
+    blurPass(airB, airA, 8, 2, 1, 1.0);
+
+    // Mirror perimeter samples onto tank glass boundary ring so earth seals cleanly to side/bottom glass
+    const mirrorBoundary = (f: Float32Array, topVal: number) => {
+      for (let gx = leftGx; gx <= rightGx; gx++) {
+        const cx = clamp(gx, minGx, maxGx);
+        f[topGy * GRID_W + gx] = topVal;
+        f[bottomGy * GRID_W + gx] = f[maxGy * GRID_W + cx];
+      }
+      for (let gy = minGy; gy <= maxGy; gy++) {
+        f[gy * GRID_W + leftGx] = f[gy * GRID_W + minGx];
+        f[gy * GRID_W + rightGx] = f[gy * GRID_W + maxGx];
+      }
+      f[bottomGy * GRID_W + leftGx] = f[maxGy * GRID_W + minGx];
+      f[bottomGy * GRID_W + rightGx] = f[maxGy * GRID_W + maxGx];
+    };
+    mirrorBoundary(fieldA, 0.0);
+    mirrorBoundary(airA, 1.0);
+    this.smoothSoilField = fieldA;
+    this.smoothAirField = airA;
+
+    const sampleSimX = (gx: number) =>
+      gx <= leftGx ? CASE_LEFT : gx >= rightGx ? CASE_RIGHT : (gx + 0.5) * CELL_SIZE;
+    const sampleSimY = (gy: number) =>
+      gy <= topGy ? CASE_TOP : gy >= bottomGy ? CASE_BOTTOM : (gy + 0.5) * CELL_SIZE;
+
+    const sampleSmooth = (f: Float32Array, fx: number, fy: number): number => {
+      const cx = clamp(fx, leftGx, rightGx - 0.001);
+      const cy = clamp(fy, topGy, bottomGy - 0.001);
+      const x0 = Math.floor(cx);
+      const y0 = Math.floor(cy);
+      const x1 = Math.min(rightGx, x0 + 1);
+      const y1 = Math.min(bottomGy, y0 + 1);
+      const tx = cx - x0;
+      const ty = cy - y0;
+      const a = f[y0 * GRID_W + x0] * (1 - tx) + f[y0 * GRID_W + x1] * tx;
+      const b = f[y1 * GRID_W + x0] * (1 - tx) + f[y1 * GRID_W + x1] * tx;
+      return a * (1 - ty) + b * ty;
+    };
+
+    const frontZAt = (wx: number, wy: number): number =>
+      SOLID_FRONT_Z +
+      Math.sin(wx * 5.2 + wy * 3.1) * 0.014 +
+      Math.cos(wx * 11.3 - wy * 8.7) * 0.008;
+
+    const soilColorAtSim = (sx: number, sy: number): [number, number, number] => {
+      const gx = clamp(Math.floor(sx / CELL_SIZE), minGx, maxGx);
+      const gy = clamp(Math.floor(sy / CELL_SIZE), minGy, maxGy);
+      const idx = gy * GRID_W + gx;
+      let t = terrain[idx];
+      if (t === CellType.AIR || t === CellType.TUNNEL || t === CellType.GLASS_WALL) {
+        t = gy < 52 ? CellType.TOPSOIL : gy > 105 ? CellType.DEEP_CLAY : CellType.SUBSOIL;
+      }
+      const m = moisture[idx];
+      const tint =
+        0.5 +
+        0.3 * Math.sin(sx * 0.19 + sy * 0.13) +
+        0.2 * Math.cos(sx * 0.43 - sy * 0.37);
+      const [sr, sg, sb] = granuleColorSrgb(t, m, gy, tint);
+      _col.setRGB(sr, sg, sb, THREE.SRGBColorSpace);
+      return [_col.r, _col.g, _col.b];
+    };
+
+    // --- PART A: Smooth Marching Squares Cross-Section + Multi-Ring Rounded Tunnel Bevels ---
+    const positions: number[] = [];
+    const normals: number[] = [];
+    const uvs: number[] = [];
+    const colors: number[] = [];
+
+    const pushTri = (
+      ax: number, ay: number, az: number, au: number, av: number,
+      bx: number, by: number, bz: number, bu: number, bv: number,
+      cx: number, cy: number, cz: number, cu: number, cv: number,
+      na: [number, number, number],
+      nb: [number, number, number],
+      nc: [number, number, number],
+      ca: [number, number, number],
+      cb: [number, number, number],
+      cc: [number, number, number]
+    ) => {
+      positions.push(ax, ay, az, bx, by, bz, cx, cy, cz);
+      normals.push(na[0], na[1], na[2], nb[0], nb[1], nb[2], nc[0], nc[1], nc[2]);
+      uvs.push(au, av, bu, bv, cu, cv);
+      colors.push(ca[0], ca[1], ca[2], cb[0], cb[1], cb[2], cc[0], cc[1], cc[2]);
+    };
+
+    const FRONT_N: [number, number, number] = [0, 0, 1];
+
+    interface ContourPt {
+      sx: number;
+      sy: number;
+      wx: number;
+      wy: number;
+      z0: number;
+      col: [number, number, number];
+    }
+
+    const pushFrontTri = (a: ContourPt, b: ContourPt, c: ContourPt) => {
+      pushTri(
+        a.wx, a.wy, a.z0, a.wx * 0.25, a.wy * 0.25,
+        b.wx, b.wy, b.z0, b.wx * 0.25, b.wy * 0.25,
+        c.wx, c.wy, c.z0, c.wx * 0.25, c.wy * 0.25,
+        FRONT_N, FRONT_N, FRONT_N,
+        a.col, b.col, c.col
+      );
+    };
+
+    interface BevelSample {
+      wx: number[];
+      wy: number[];
+      wz: number[];
+      nx: number[];
+      ny: number[];
+      nz: number[];
+      col: [number, number, number][];
+      airBlend: number;
+    }
+
+    const makeBevelProfile = (pt: ContourPt): BevelSample => {
+      const fx = pt.sx / CELL_SIZE - 0.5;
+      const fy = pt.sy / CELL_SIZE - 0.5;
+      const dsDx = sampleSmooth(fieldA, fx + 0.55, fy) - sampleSmooth(fieldA, fx - 0.55, fy);
+      const dsDy = sampleSmooth(fieldA, fx, fy + 0.55) - sampleSmooth(fieldA, fx, fy - 0.55);
+
+      // Outward into open tunnel/air = (-dsDx, +dsDy) in world XY
+      let nx = -dsDx;
+      let ny = dsDy;
+      const onLeftEdge = pt.sx <= CASE_LEFT + 1.5;
+      const onRightEdge = pt.sx >= CASE_RIGHT - 1.5;
+      const onBottomEdge = pt.sy >= CASE_BOTTOM - 1.5;
+      if (onLeftEdge || onRightEdge) nx = 0;
+      if (onBottomEdge) ny = 0;
+      const nLen = Math.hypot(nx, ny);
+      if (nLen > 1e-4) {
+        nx /= nLen;
+        ny /= nLen;
+      } else {
+        nx = 0;
+        ny = 1;
+      }
+
+      const airBlend = clamp(sampleSmooth(airA, fx, fy) * 1.7, 0, 1);
+      const zCavern = this.sampleCavernBackZ(sim, pt.sx, pt.sy);
+      const zTunnelBack = Math.min(CURVED_RIM_Z - 0.1, zCavern - 0.04);
+      const zBack = zTunnelBack * (1 - airBlend) + SOIL_BACK_Z * airBlend;
+      const tuckShift = airBlend < 0.5 ? 0.056 : 0.044;
+
+      const c0 = pt.col;
+      const c1: [number, number, number] = [c0[0] * 0.94, c0[1] * 0.94, c0[2] * 0.94];
+      const c2: [number, number, number] = [c0[0] * 0.82, c0[1] * 0.82, c0[2] * 0.82];
+      const c3: [number, number, number] = [c0[0] * 0.60, c0[1] * 0.60, c0[2] * 0.60];
+
+      return {
+        wx: [pt.wx, pt.wx + nx * 0.021, pt.wx + nx * 0.044, pt.wx + nx * tuckShift],
+        wy: [pt.wy, pt.wy + ny * 0.021, pt.wy + ny * 0.044, pt.wy + ny * tuckShift],
+        wz: [pt.z0, pt.z0 - 0.04, pt.z0 - 0.112, zBack],
+        nx: [0, nx * 0.54, nx * 0.9, nx * 0.96],
+        ny: [0, ny * 0.54, ny * 0.9, ny * 0.96],
+        nz: [1, 0.84, 0.436, 0.28],
+        col: [c0, c1, c2, c3],
+        airBlend,
+      };
+    };
+
+    // Granule accumulation counter
+    let granuleCount = 0;
+    const pushSphere = (
+      wx: number,
+      wy: number,
+      wz: number,
+      r: number,
+      cr: number,
+      cg: number,
+      cb: number
+    ) => {
+      if (granuleCount >= MAX_GRANULES) return;
+      _dummy.position.set(wx, wy, wz);
+      _dummy.rotation.set(0, 0, 0);
+      _dummy.scale.setScalar(r);
+      _dummy.updateMatrix();
+      this.granuleMesh.setMatrixAt(granuleCount, _dummy.matrix);
+      _col.setRGB(cr, cg, cb, THREE.SRGBColorSpace);
+      this.granuleMesh.setColorAt(granuleCount, _col);
+      granuleCount++;
+    };
+
+    const pushContourBevelAndGranules = (a: ContourPt, b: ContourPt, cellGx: number, cellGy: number, segIdx: number) => {
+      const pa = makeBevelProfile(a);
+      const pb = makeBevelProfile(b);
+
+      // Emit 3-ring rounded fillet strip from A -> B (CCW: A_i -> A_{i+1} -> B_{i+1}, A_i -> B_{i+1} -> B_i)
+      for (let r = 0; r < 3; r++) {
+        const na0: [number, number, number] = [pa.nx[r], pa.ny[r], pa.nz[r]];
+        const na1: [number, number, number] = [pa.nx[r + 1], pa.ny[r + 1], pa.nz[r + 1]];
+        const nb0: [number, number, number] = [pb.nx[r], pb.ny[r], pb.nz[r]];
+        const nb1: [number, number, number] = [pb.nx[r + 1], pb.ny[r + 1], pb.nz[r + 1]];
+
+        const ua = (pa.wx[r] + pa.wy[r]) * 0.25;
+        const ub = (pb.wx[r] + pb.wy[r]) * 0.25;
+        const vr0 = r * 0.35;
+        const vr1 = (r + 1) * 0.35;
+
+        pushTri(
+          pa.wx[r], pa.wy[r], pa.wz[r], ua, vr0,
+          pa.wx[r + 1], pa.wy[r + 1], pa.wz[r + 1], ua, vr1,
+          pb.wx[r + 1], pb.wy[r + 1], pb.wz[r + 1], ub, vr1,
+          na0, na1, nb1,
+          pa.col[r], pa.col[r + 1], pb.col[r + 1]
+        );
+        pushTri(
+          pa.wx[r], pa.wy[r], pa.wz[r], ua, vr0,
+          pb.wx[r + 1], pb.wy[r + 1], pb.wz[r + 1], ub, vr1,
+          pb.wx[r], pb.wy[r], pb.wz[r], ub, vr0,
+          na0, nb1, nb0,
+          pa.col[r], pb.col[r + 1], pb.col[r]
+        );
+      }
+
+      // Place tiny dark-brown dirt granules directly anchored on the emitted smooth bevel quads
+      const canUseDeepGround = pa.airBlend >= 0.72 && pb.airBlend >= 0.72;
+      const count = canUseDeepGround ? 7 : 3;
+      const cGy = clamp(cellGy, minGy, maxGy);
+      const cGx = clamp(cellGx, minGx, maxGx);
+      const cIdx = cGy * GRID_W + cGx;
+      const cellType = terrain[cIdx];
+      const m = moisture[cIdx];
+
+      for (let k = 0; k < count; k++) {
+        const salt = segIdx * 31 + k * 7;
+        const tSeg = clamp((k + 0.15 + deterministicRand(cellGx, cellGy, salt) * 0.7) / count, 0.04, 0.96);
+        const [gr, gg, gb] = granuleColorSrgb(
+          cellType === CellType.AIR || cellType === CellType.TUNNEL
+            ? cGy < 52
+              ? CellType.TOPSOIL
+              : cGy > 105
+              ? CellType.DEEP_CLAY
+              : CellType.SUBSOIL
+            : cellType,
+          m,
+          cGy,
+          deterministicRand(cellGx, cellGy, salt + 1)
+        );
+        const rad = 0.020 + deterministicRand(cellGx, cellGy, salt + 2) * 0.013;
+
+        let r = 0;
+        let subT = 0.5;
+        if (canUseDeepGround) {
+          if (k === 0) {
+            r = 0;
+            subT = 0.25 + deterministicRand(cellGx, cellGy, salt + 3) * 0.65;
+          } else if (k === 1) {
+            r = 1;
+            subT = 0.2 + deterministicRand(cellGx, cellGy, salt + 3) * 0.7;
+          } else {
+            r = 2;
+            subT = clamp((k - 2 + deterministicRand(cellGx, cellGy, salt + 3) * 0.85) / 5, 0.06, 0.94);
+          }
+        } else {
+          r = k % 2;
+          subT = 0.12 + deterministicRand(cellGx, cellGy, salt + 3) * 0.78;
+        }
+
+        const rNext = r + 1;
+        const wxA = pa.wx[r] * (1 - tSeg) + pb.wx[r] * tSeg;
+        const wyA = pa.wy[r] * (1 - tSeg) + pb.wy[r] * tSeg;
+        const wzA = pa.wz[r] * (1 - tSeg) + pb.wz[r] * tSeg;
+        const wxB = pa.wx[rNext] * (1 - tSeg) + pb.wx[rNext] * tSeg;
+        const wyB = pa.wy[rNext] * (1 - tSeg) + pb.wy[rNext] * tSeg;
+        const wzB = pa.wz[rNext] * (1 - tSeg) + pb.wz[rNext] * tSeg;
+
+        const nxA = pa.nx[r] * (1 - tSeg) + pb.nx[r] * tSeg;
+        const nyA = pa.ny[r] * (1 - tSeg) + pb.ny[r] * tSeg;
+        const nzA = pa.nz[r] * (1 - tSeg) + pb.nz[r] * tSeg;
+        const nxB = pa.nx[rNext] * (1 - tSeg) + pb.nx[rNext] * tSeg;
+        const nyB = pa.ny[rNext] * (1 - tSeg) + pb.ny[rNext] * tSeg;
+        const nzB = pa.nz[rNext] * (1 - tSeg) + pb.nz[rNext] * tSeg;
+
+        let nx = nxA * (1 - subT) + nxB * subT;
+        let ny = nyA * (1 - subT) + nyB * subT;
+        let nz = nzA * (1 - subT) + nzB * subT;
+        const nLen = Math.hypot(nx, ny, nz) || 1;
+        nx /= nLen;
+        ny /= nLen;
+        nz /= nLen;
+
+        // Sink center slightly into the mesh so each grain is visibly attached and never floats
+        const embed = rad * 0.35;
+        const wx = wxA * (1 - subT) + wxB * subT - nx * embed;
+        const wy = wyA * (1 - subT) + wyB * subT - ny * embed;
+        let wz = wzA * (1 - subT) + wzB * subT - nz * embed;
+        if (canUseDeepGround) {
+          wz = clamp(wz, SOIL_BACK_Z + rad * 0.35, SOLID_FRONT_Z - rad * 0.25);
+        } else {
+          wz = Math.min(wz, SOLID_FRONT_Z - rad * 0.25);
+        }
+
+        const shade = canUseDeepGround
+          ? wz < -0.08
+            ? 0.7
+            : wz < 0.2
+            ? 0.84
+            : wz < 0.45
+            ? 0.93
+            : 1.0
+          : 0.98 - (r + subT) * 0.1;
+        pushSphere(wx, wy, wz, rad, gr * shade, gg * shade, gb * shade);
+      }
+    };
+
+    const makeCornerPt = (gx: number, gy: number): ContourPt => {
+      const sx = sampleSimX(gx);
+      const sy = sampleSimY(gy);
+      const wx = simToWorldX(sx);
+      const wy = simToWorldY(sy);
+      return { sx, sy, wx, wy, z0: frontZAt(wx, wy), col: soilColorAtSim(sx, sy) };
+    };
+
+    const interpContourPt = (pA: ContourPt, pB: ContourPt, vA: number, vB: number): ContourPt => {
+      const denom = vB - vA;
+      const t = Math.abs(denom) < 1e-6 ? 0.5 : clamp((ISO_LEVEL - vA) / denom, 0.02, 0.98);
+      const sx = pA.sx + (pB.sx - pA.sx) * t;
+      const sy = pA.sy + (pB.sy - pA.sy) * t;
+      const wx = simToWorldX(sx);
+      const wy = simToWorldY(sy);
+      return {
+        sx,
+        sy,
+        wx,
+        wy,
+        z0: frontZAt(wx, wy),
+        col: [
+          pA.col[0] + (pB.col[0] - pA.col[0]) * t,
+          pA.col[1] + (pB.col[1] - pA.col[1]) * t,
+          pA.col[2] + (pB.col[2] - pA.col[2]) * t,
+        ],
+      };
+    };
+
+    // Precompute dual sample grid corners
+    const cornerPts: ContourPt[] = new Array(len);
+    for (let gy = topGy; gy <= bottomGy; gy++) {
+      for (let gx = leftGx; gx <= rightGx; gx++) {
+        cornerPts[gy * GRID_W + gx] = makeCornerPt(gx, gy);
+      }
+    }
+
+    // Emit Marching Squares front cross-section + smooth bevel contour across tank
+    for (let gy = topGy; gy < bottomGy; gy++) {
+      for (let gx = leftGx; gx < rightGx; gx++) {
+        const iTL = gy * GRID_W + gx;
+        const iTR = gy * GRID_W + (gx + 1);
+        const iBR = (gy + 1) * GRID_W + (gx + 1);
+        const iBL = (gy + 1) * GRID_W + gx;
+
+        const vTL = fieldA[iTL];
+        const vTR = fieldA[iTR];
+        const vBR = fieldA[iBR];
+        const vBL = fieldA[iBL];
+
+        const mask =
+          (vTL >= ISO_LEVEL ? 8 : 0) |
+          (vTR >= ISO_LEVEL ? 4 : 0) |
+          (vBR >= ISO_LEVEL ? 2 : 0) |
+          (vBL >= ISO_LEVEL ? 1 : 0);
+
+        if (mask === 0) continue;
+
+        const pTL = cornerPts[iTL];
+        const pTR = cornerPts[iTR];
+        const pBR = cornerPts[iBR];
+        const pBL = cornerPts[iBL];
+
+        if (mask === 15) {
+          pushFrontTri(pBL, pBR, pTR);
+          pushFrontTri(pBL, pTR, pTL);
+          continue;
+        }
+
+        const eTop = (vTL >= ISO_LEVEL) !== (vTR >= ISO_LEVEL) ? interpContourPt(pTL, pTR, vTL, vTR) : pTL;
+        const eRight = (vTR >= ISO_LEVEL) !== (vBR >= ISO_LEVEL) ? interpContourPt(pTR, pBR, vTR, vBR) : pTR;
+        const eBottom = (vBR >= ISO_LEVEL) !== (vBL >= ISO_LEVEL) ? interpContourPt(pBR, pBL, vBR, vBL) : pBR;
+        const eLeft = (vBL >= ISO_LEVEL) !== (vTL >= ISO_LEVEL) ? interpContourPt(pBL, pTL, vBL, vTL) : pBL;
+
+        switch (mask) {
+          case 1:
+            pushFrontTri(pBL, eBottom, eLeft);
+            pushContourBevelAndGranules(eBottom, eLeft, gx, gy, 0);
+            break;
+          case 2:
+            pushFrontTri(eBottom, pBR, eRight);
+            pushContourBevelAndGranules(eRight, eBottom, gx, gy, 0);
+            break;
+          case 4:
+            pushFrontTri(eRight, pTR, eTop);
+            pushContourBevelAndGranules(eTop, eRight, gx, gy, 0);
+            break;
+          case 8:
+            pushFrontTri(eLeft, eTop, pTL);
+            pushContourBevelAndGranules(eLeft, eTop, gx, gy, 0);
+            break;
+          case 3:
+            pushFrontTri(pBL, pBR, eRight);
+            pushFrontTri(pBL, eRight, eLeft);
+            pushContourBevelAndGranules(eRight, eLeft, gx, gy, 0);
+            break;
+          case 6:
+            pushFrontTri(eBottom, pBR, pTR);
+            pushFrontTri(eBottom, pTR, eTop);
+            pushContourBevelAndGranules(eTop, eBottom, gx, gy, 0);
+            break;
+          case 12:
+            pushFrontTri(eLeft, eRight, pTR);
+            pushFrontTri(eLeft, pTR, pTL);
+            pushContourBevelAndGranules(eLeft, eRight, gx, gy, 0);
+            break;
+          case 9:
+            pushFrontTri(pBL, eBottom, eTop);
+            pushFrontTri(pBL, eTop, pTL);
+            pushContourBevelAndGranules(eBottom, eTop, gx, gy, 0);
+            break;
+          case 7:
+            pushFrontTri(pBL, pBR, pTR);
+            pushFrontTri(pBL, pTR, eTop);
+            pushFrontTri(pBL, eTop, eLeft);
+            pushContourBevelAndGranules(eTop, eLeft, gx, gy, 0);
+            break;
+          case 11:
+            pushFrontTri(pBL, pBR, eRight);
+            pushFrontTri(pBL, eRight, eTop);
+            pushFrontTri(pBL, eTop, pTL);
+            pushContourBevelAndGranules(eRight, eTop, gx, gy, 0);
+            break;
+          case 13:
+            pushFrontTri(pBL, eBottom, eRight);
+            pushFrontTri(pBL, eRight, pTR);
+            pushFrontTri(pBL, pTR, pTL);
+            pushContourBevelAndGranules(eBottom, eRight, gx, gy, 0);
+            break;
+          case 14:
+            pushFrontTri(eBottom, pBR, pTR);
+            pushFrontTri(eBottom, pTR, pTL);
+            pushFrontTri(eBottom, pTL, eLeft);
+            pushContourBevelAndGranules(eLeft, eBottom, gx, gy, 0);
+            break;
+          case 5: {
+            const centerSolid = 0.25 * (vTL + vTR + vBR + vBL) >= ISO_LEVEL;
+            if (centerSolid) {
+              pushFrontTri(pBL, eBottom, eRight);
+              pushFrontTri(pBL, eRight, pTR);
+              pushFrontTri(pBL, pTR, eTop);
+              pushFrontTri(pBL, eTop, eLeft);
+              pushContourBevelAndGranules(eBottom, eRight, gx, gy, 0);
+              pushContourBevelAndGranules(eTop, eLeft, gx, gy, 1);
+            } else {
+              pushFrontTri(pBL, eBottom, eLeft);
+              pushFrontTri(eRight, pTR, eTop);
+              pushContourBevelAndGranules(eBottom, eLeft, gx, gy, 0);
+              pushContourBevelAndGranules(eTop, eRight, gx, gy, 1);
+            }
+            break;
+          }
+          case 10: {
+            const centerSolid = 0.25 * (vTL + vTR + vBR + vBL) >= ISO_LEVEL;
+            if (centerSolid) {
+              pushFrontTri(eBottom, pBR, eRight);
+              pushFrontTri(eBottom, eRight, eTop);
+              pushFrontTri(eBottom, eTop, pTL);
+              pushFrontTri(eBottom, pTL, eLeft);
+              pushContourBevelAndGranules(eRight, eTop, gx, gy, 0);
+              pushContourBevelAndGranules(eLeft, eBottom, gx, gy, 1);
+            } else {
+              pushFrontTri(eBottom, pBR, eRight);
+              pushFrontTri(eLeft, eTop, pTL);
+              pushContourBevelAndGranules(eRight, eBottom, gx, gy, 0);
+              pushContourBevelAndGranules(eLeft, eTop, gx, gy, 1);
+            }
+            break;
+          }
+        }
+      }
+    }
+
+    // Seal outer left/right/bottom tank glass edges so orbiting sideways reveals solid earth behind side glass
+    const pushSideWallSpan = (
+      x: number,
+      yTop: number,
+      yBot: number,
+      zFTop: number,
+      zFBot: number,
+      nx: number,
+      colTop: [number, number, number],
+      colBot: [number, number, number]
+    ) => {
+      const nSide: [number, number, number] = [nx, 0, 0];
+      const cBTop: [number, number, number] = [colTop[0] * 0.62, colTop[1] * 0.62, colTop[2] * 0.62];
+      const cBBot: [number, number, number] = [colBot[0] * 0.62, colBot[1] * 0.62, colBot[2] * 0.62];
+      if (nx < 0) {
+        pushTri(x, yBot, zFBot, 0, 0, x, yTop, zFTop, 0, 1, x, yTop, SOIL_BACK_Z, 1, 1, nSide, nSide, nSide, colBot, colTop, cBTop);
+        pushTri(x, yBot, zFBot, 0, 0, x, yTop, SOIL_BACK_Z, 1, 1, x, yBot, SOIL_BACK_Z, 1, 0, nSide, nSide, nSide, colBot, cBTop, cBBot);
+      } else {
+        pushTri(x, yTop, zFTop, 0, 1, x, yBot, zFBot, 0, 0, x, yBot, SOIL_BACK_Z, 1, 0, nSide, nSide, nSide, colTop, colBot, cBBot);
+        pushTri(x, yTop, zFTop, 0, 1, x, yBot, SOIL_BACK_Z, 1, 0, x, yTop, SOIL_BACK_Z, 1, 1, nSide, nSide, nSide, colTop, cBBot, cBTop);
+      }
+    };
+
+    for (let gy = topGy; gy < bottomGy; gy++) {
+      // Left tank glass border
+      const vLT = fieldA[gy * GRID_W + leftGx];
+      const vLB = fieldA[(gy + 1) * GRID_W + leftGx];
+      if (vLT >= ISO_LEVEL || vLB >= ISO_LEVEL) {
+        const pTop = cornerPts[gy * GRID_W + leftGx];
+        const pBot = cornerPts[(gy + 1) * GRID_W + leftGx];
+        const aTop = vLT >= ISO_LEVEL ? pTop : interpContourPt(pTop, pBot, vLT, vLB);
+        const aBot = vLB >= ISO_LEVEL ? pBot : interpContourPt(pTop, pBot, vLT, vLB);
+        pushSideWallSpan(aTop.wx, aTop.wy, aBot.wy, aTop.z0, aBot.z0, -1, aTop.col, aBot.col);
+      }
+      // Right tank glass border
+      const vRT = fieldA[gy * GRID_W + rightGx];
+      const vRB = fieldA[(gy + 1) * GRID_W + rightGx];
+      if (vRT >= ISO_LEVEL || vRB >= ISO_LEVEL) {
+        const pTop = cornerPts[gy * GRID_W + rightGx];
+        const pBot = cornerPts[(gy + 1) * GRID_W + rightGx];
+        const aTop = vRT >= ISO_LEVEL ? pTop : interpContourPt(pTop, pBot, vRT, vRB);
+        const aBot = vRB >= ISO_LEVEL ? pBot : interpContourPt(pTop, pBot, vRT, vRB);
+        pushSideWallSpan(aTop.wx, aTop.wy, aBot.wy, aTop.z0, aBot.z0, 1, aTop.col, aBot.col);
+      }
+    }
+
+    const nBot: [number, number, number] = [0, -1, 0];
+    for (let gx = leftGx; gx < rightGx; gx++) {
+      const pL = cornerPts[bottomGy * GRID_W + gx];
+      const pR = cornerPts[bottomGy * GRID_W + (gx + 1)];
+      const cBL: [number, number, number] = [pL.col[0] * 0.62, pL.col[1] * 0.62, pL.col[2] * 0.62];
+      const cBR: [number, number, number] = [pR.col[0] * 0.62, pR.col[1] * 0.62, pR.col[2] * 0.62];
+      pushTri(pR.wx, pR.wy, pR.z0, 1, 0, pL.wx, pL.wy, pL.z0, 0, 0, pL.wx, pL.wy, SOIL_BACK_Z, 0, 1, nBot, nBot, nBot, pR.col, pL.col, cBL);
+      pushTri(pR.wx, pR.wy, pR.z0, 1, 0, pL.wx, pL.wy, SOIL_BACK_Z, 0, 1, pR.wx, pR.wy, SOIL_BACK_Z, 1, 1, nBot, nBot, nBot, pR.col, cBL, cBR);
+    }
+
+    // --- PART B: Indexed Smooth Concave Curved Cavern & Cylindrical Tunnel Back Shell ---
+    const curvedVertexDepth = (vx: number, vy: number): number => {
+      let sum = 0;
+      let count = 0;
+      let hasSolid = false;
+      for (let oy = -1; oy <= 0; oy++) {
+        for (let ox = -1; ox <= 0; ox++) {
+          const cx = vx + ox;
+          const cy = vy + oy;
+          if (cx < 0 || cx >= GRID_W || cy < 0 || cy >= GRID_H) continue;
+          const idx = cy * GRID_W + cx;
+          const t = terrain[idx];
+          if (t === CellType.TUNNEL) {
+            sum += cavityDepth[idx];
+            count++;
+          } else if (t === CellType.AIR) {
+            sum += 0.9;
+            count++;
+          } else if (t !== CellType.GLASS_WALL) {
+            hasSolid = true;
+            count++;
+          }
+        }
+      }
+      if (count === 0) return 0;
+      const avg = sum / count;
+      return hasSolid ? avg * 0.45 : avg;
+    };
+
+    const stride = GRID_W + 1;
+    const vCount = (GRID_W + 1) * (GRID_H + 1);
+    const curvedVertexMap = new Int32Array(vCount).fill(-1);
+    const cPositions: number[] = [];
+    const cUvs: number[] = [];
+    const cColors: number[] = [];
+    const cIndices: number[] = [];
+
+    const ensureCurvedVertex = (vx: number, vy: number, m: number): number => {
+      const key = vy * stride + vx;
+      const existing = curvedVertexMap[key];
+      if (existing !== -1) return existing;
+
+      const idx = cPositions.length / 3;
+      curvedVertexMap[key] = idx;
+
+      const d = curvedVertexDepth(vx, vy);
+      const baseX = simToWorldX(vx * CELL_SIZE);
+      const baseY = simToWorldY(vy * CELL_SIZE);
+      const edgeLock = vx <= leftGx + 1 || vx >= rightGx - 1 || vy >= bottomGy - 1 ? 0.12 : 1.0;
+      const dx = (deterministicRand(vx, vy, 61) - 0.5) * 0.018 * edgeLock;
+      const dy = (deterministicRand(vx, vy, 62) - 0.5) * 0.018 * edgeLock;
+      const dz = (deterministicRand(vx, vy, 63) - 0.5) * 0.024;
+      cPositions.push(baseX + dx, baseY + dy, cavityDepthToZ(d) + dz);
+      cUvs.push(vx * 0.06, (GRID_H - vy) * 0.06);
+
+      const depthShade = clamp(0.82 - d * 0.075, 0.44, 0.85);
+      const [sr, sg, sb] = granuleColorSrgb(
+        vy < 52 ? CellType.TOPSOIL : vy > 105 ? CellType.DEEP_CLAY : CellType.SUBSOIL,
+        m,
+        vy,
+        deterministicRand(vx, vy, 71)
+      );
+      _col.setRGB(sr * depthShade, sg * depthShade, sb * depthShade, THREE.SRGBColorSpace);
+      cColors.push(_col.r, _col.g, _col.b);
+      return idx;
+    };
+
+    const cellW = CELL_SIZE * WORLD_SCALE;
+    for (let gy = 1; gy < GRID_H - 1; gy++) {
+      for (let gx = 1; gx < GRID_W - 1; gx++) {
+        const idx = gy * GRID_W + gx;
+        const t = terrain[idx];
+        const m = moisture[idx];
+
+        const emitCurvedShell = t === CellType.TUNNEL || (isSolid(gx, gy) && hasNeighborTunnel(gx, gy));
+        if (emitCurvedShell) {
+          const iBL = ensureCurvedVertex(gx, gy + 1, m);
+          const iBR = ensureCurvedVertex(gx + 1, gy + 1, m);
+          const iTR = ensureCurvedVertex(gx + 1, gy, m);
+          const iTL = ensureCurvedVertex(gx, gy, m);
+          cIndices.push(iBL, iBR, iTR, iBL, iTR, iTL);
+
+          if (t === CellType.TUNNEL) {
+            const cellDepth = cavityDepth[idx];
+            const backShade = clamp(0.84 - cellDepth * 0.07, 0.48, 0.88);
+
+            // Place 3 spheres using exact barycentric coordinates on the rendered curved cavern triangles
+            for (let k = 0; k < 3; k++) {
+              const useTri0 = k % 2 === 0;
+              const ia = iBL;
+              const ib = useTri0 ? iBR : iTR;
+              const ic = useTri0 ? iTR : iTL;
+
+              const ax = cPositions[ia * 3];
+              const ay = cPositions[ia * 3 + 1];
+              const az = cPositions[ia * 3 + 2];
+              const bx = cPositions[ib * 3];
+              const by = cPositions[ib * 3 + 1];
+              const bz = cPositions[ib * 3 + 2];
+              const cx = cPositions[ic * 3];
+              const cy = cPositions[ic * 3 + 1];
+              const cz = cPositions[ic * 3 + 2];
+
+              let u = deterministicRand(gx, gy, 11 + k * 5);
+              let v = deterministicRand(gx, gy, 12 + k * 5);
+              if (u + v > 1) {
+                u = 1 - u;
+                v = 1 - v;
+              }
+              let w0 = 1 - u - v;
+              // Keep slightly inside triangle interior and compute triangle normal
+              w0 = w0 * 0.82 + 0.06;
+              const w1 = u * 0.82 + 0.06;
+              const w2 = 1 - w0 - w1;
+
+              const e1x = bx - ax;
+              const e1y = by - ay;
+              const e1z = bz - az;
+              const e2x = cx - ax;
+              const e2y = cy - ay;
+              const e2z = cz - az;
+              let nx = e1y * e2z - e1z * e2y;
+              let ny = e1z * e2x - e1x * e2z;
+              let nz = e1x * e2y - e1y * e2x;
+              if (nz < 0) {
+                nx = -nx;
+                ny = -ny;
+                nz = -nz;
+              }
+              const nLen = Math.hypot(nx, ny, nz) || 1;
+              nx /= nLen;
+              ny /= nLen;
+              nz /= nLen;
+
+              const rad = 0.021 + deterministicRand(gx, gy, 13 + k * 5) * 0.013;
+              const offset = rad * 0.25;
+              const px = ax * w0 + bx * w1 + cx * w2 + nx * offset;
+              const py = ay * w0 + by * w1 + cy * w2 + ny * offset;
+              const pz = az * w0 + bz * w1 + cz * w2 + nz * offset;
+
+              const [r, g, b] = granuleColorSrgb(
+                gy > 105 ? CellType.DEEP_CLAY : CellType.SUBSOIL,
+                m,
+                gy,
+                deterministicRand(gx, gy, 14 + k * 5)
+              );
+              pushSphere(px, py, pz, rad, r * backShade, g * backShade, b * backShade);
+            }
+          }
+        }
+        void cellW;
+      }
+    }
+
+    const solidGeo = new THREE.BufferGeometry();
+    solidGeo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    solidGeo.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+    solidGeo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+    solidGeo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+    solidGeo.computeBoundingSphere();
+
+    this.solidMesh.geometry.dispose();
+    this.solidMesh.geometry = solidGeo;
+
+    const curvedGeo = new THREE.BufferGeometry();
+    curvedGeo.setAttribute('position', new THREE.Float32BufferAttribute(cPositions, 3));
+    curvedGeo.setAttribute('uv', new THREE.Float32BufferAttribute(cUvs, 2));
+    curvedGeo.setAttribute('color', new THREE.Float32BufferAttribute(cColors, 3));
+    curvedGeo.setIndex(cIndices);
+    curvedGeo.computeVertexNormals();
+    curvedGeo.computeBoundingSphere();
+
+    this.curvedCavernMesh.geometry.dispose();
+    this.curvedCavernMesh.geometry = curvedGeo;
+
+    this.granuleMesh.count = granuleCount;
+    this.granuleMesh.instanceMatrix.needsUpdate = true;
+    if (this.granuleMesh.instanceColor) {
+      this.granuleMesh.instanceColor.needsUpdate = true;
+    }
+    this.granuleMesh.computeBoundingSphere();
+  }
+
+  public dispose(): void {
+    this.solidMesh.geometry.dispose();
+    this.curvedCavernMesh.geometry.dispose();
+    this.granuleMesh.geometry.dispose();
+    for (const d of this.disposables) d.dispose();
+  }
+}
