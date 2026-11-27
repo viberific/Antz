@@ -1,9 +1,9 @@
 import * as THREE from 'three';
-import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { AntColonySimulation } from './colony';
 import {
   MaterialBank,
+  SOIL_FRONT_Z,
   WORLD_SCALE,
   detectSoftwareWebGL,
   simToWorldX,
@@ -22,12 +22,19 @@ import {
   createSurfacePropMesh,
 } from './models3d';
 import { FormicariumEnvironment3D } from './terrain3d';
+import { FlatCameraController } from './camera2d';
 import { resetLegs } from './legs';
 import { MeshBatcher, collectMeshes } from './batcher';
 import {
   AntCaste,
   BroodStage,
+  CASE_BOTTOM,
+  CASE_LEFT,
+  CASE_RIGHT,
+  CASE_TOP,
   CELL_SIZE,
+  CellType,
+  GRID_H,
   GRID_W,
   PayloadType,
   WORLD_H,
@@ -66,17 +73,22 @@ const _tfOut = {
   bodyDip: 0,
 };
 const _dummy = new THREE.Object3D();
+const _pick = new THREE.Vector3();
 const _skyDay = new THREE.Color(0x162231);
 const _skyDusk = new THREE.Color(0x281822);
 const _skyNight = new THREE.Color(0x06080d);
 const _skyTmp = new THREE.Color();
+const _skyOvercast = new THREE.Color(0x2a3038);
+const _skyFog = new THREE.Color(0x3a4550);
+const _skyRain = new THREE.Color(0x111a24);
+const _skySnow = new THREE.Color(0x4a5560);
+const _skyFlash = new THREE.Color(0xc8d4ff);
+const _flyEuler = new THREE.Euler();
 const _sunDay = new THREE.Color(0xfff1d6);
 const _sunDusk = new THREE.Color(0xff9c5a);
 const _sunNight = new THREE.Color(0x6d8cc4);
 const _sunTmp = new THREE.Color();
 
-const HERO_CAM_POS = new THREE.Vector3(0.7, 1.8, 20.8);
-const HERO_TARGET = new THREE.Vector3(0, -0.35, 0.14);
 
 function clamp(v: number, min: number, max: number): number {
   return v < min ? min : v > max ? max : v;
@@ -87,7 +99,7 @@ export class Formicarium3DRenderer {
   public readonly renderer: THREE.WebGLRenderer;
   public readonly scene: THREE.Scene;
   public readonly camera: THREE.PerspectiveCamera;
-  public readonly controls: OrbitControls;
+  public readonly camCtl: FlatCameraController;
 
   private readonly container: HTMLElement;
   private readonly bank: MaterialBank;
@@ -100,6 +112,9 @@ export class Formicarium3DRenderer {
     const sx = wx / WORLD_SCALE + WORLD_W * 0.5;
     const sy = WORLD_H * 0.5 - wy / WORLD_SCALE;
     this.env3d.sampleSurfaceContact(this.groundSim, sx, sy, wz, out, _footUp);
+  };
+  private readonly airGround = (wx: number, wy: number, wz: number, out: THREE.Vector3): void => {
+    out.set(wx, wy - 0.025, wz);
   };
   private readonly envMapTex: THREE.Texture;
 
@@ -134,8 +149,14 @@ export class Formicarium3DRenderer {
   private readonly instancedGeos: THREE.BufferGeometry[] = [];
   private readonly extraMats: THREE.Material[] = [];
 
-  private resettingCamera = false;
   private disposed = false;
+  private lightningFlash = 0;
+  private readonly snowMesh: THREE.InstancedMesh;
+  private readonly snowCapMesh: THREE.InstancedMesh;
+  private readonly floodMesh: THREE.InstancedMesh;
+  private readonly aphidMesh: THREE.InstancedMesh;
+  private readonly debrisMesh: THREE.InstancedMesh;
+  private floodKey = '';
 
   constructor(container: HTMLElement, sim: AntColonySimulation) {
     this.container = container;
@@ -167,7 +188,6 @@ export class Formicarium3DRenderer {
 
     const aspect = (container.clientWidth || window.innerWidth) / Math.max(1, container.clientHeight || window.innerHeight);
     this.camera = new THREE.PerspectiveCamera(42, aspect, 0.2, 160);
-    this.camera.position.copy(HERO_CAM_POS);
 
     // Studio RoomEnvironment reflection map
     const pmrem = new THREE.PMREMGenerator(this.renderer);
@@ -261,37 +281,40 @@ export class Formicarium3DRenderer {
     this.fallenMesh = makeInst(this.geo.fallenAntGeo, this.bank.fallenAntMat, 40, true, false);
     // Real dust motes are specks, not pebbles: keep them far smaller than an ant's head (~0.04 across).
     this.dustMesh = makeInst(new THREE.IcosahedronGeometry(0.011, 1), dustMat, 140, false);
-    this.rainMesh = makeInst(new THREE.BoxGeometry(0.014, 0.24, 0.014), rainMat, 120, false);
+    this.rainMesh = makeInst(new THREE.BoxGeometry(0.014, 0.24, 0.014), rainMat, 220, false);
+    const snowMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.9 });
+    const snowCapMat = new THREE.MeshStandardMaterial({ color: 0xf4f7fb, roughness: 0.9, metalness: 0 });
+    const floodMat = new THREE.MeshStandardMaterial({
+      color: 0x5b7f96,
+      roughness: 0.08,
+      metalness: 0.1,
+      transparent: true,
+      opacity: 0.5,
+      depthWrite: false,
+    });
+    this.extraMats.push(snowMat, snowCapMat, floodMat);
+    this.snowMesh = makeInst(new THREE.IcosahedronGeometry(0.022, 0), snowMat, 220, false);
+    this.snowCapMesh = makeInst(new THREE.BoxGeometry(CELL_SIZE * 2 * WORLD_SCALE * 1.05, 0.06, 1.0), snowCapMat, GRID_W, true);
+    this.floodMesh = makeInst(new THREE.BoxGeometry(CELL_SIZE * WORLD_SCALE * 1.02, CELL_SIZE * WORLD_SCALE * 1.02, 0.7), floodMat, 1600, false);
+    this.aphidMesh = makeInst(new THREE.IcosahedronGeometry(0.035, 1), this.bank.aphidMat, 60);
+    this.debrisMesh = makeInst(new THREE.IcosahedronGeometry(0.06, 0), this.bank.debrisMat, 16);
     this.crumbMesh = makeInst(new THREE.SphereGeometry(0.036, 6, 4), this.bank.soilCrumbMat, 120, false);
     this.sparkMesh = makeInst(new THREE.IcosahedronGeometry(0.038, 0), sparkMat, 80, false);
     this.batcher = new MeshBatcher(this.scene, !this.isSoftwareGl);
 
-    // OrbitControls: Pinch-to-zoom, 2-finger pan, right-drag pan, left-drag 3D orbit
-    this.controls = new OrbitControls(this.camera, this.renderer.domElement);
-    this.controls.target.copy(HERO_TARGET);
-    this.controls.enableDamping = !this.isSoftwareGl;
-    this.controls.dampingFactor = 0.075;
-    this.controls.enableRotate = true;
-    this.controls.enablePan = true;
-    this.controls.enableZoom = true;
-    this.controls.zoomSpeed = 1.05;
-    this.controls.panSpeed = 0.85;
-    this.controls.rotateSpeed = 0.65;
-    this.controls.screenSpacePanning = true;
-    this.controls.minDistance = 4.2;
-    this.controls.maxDistance = 38.0;
-    this.controls.minAzimuthAngle = -Math.PI * 0.3;
-    this.controls.maxAzimuthAngle = Math.PI * 0.3;
-    this.controls.minPolarAngle = Math.PI * 0.28;
-    this.controls.maxPolarAngle = Math.PI * 0.64;
-    this.controls.touches = {
-      ONE: THREE.TOUCH.ROTATE,
-      TWO: THREE.TOUCH.DOLLY_PAN,
-    };
-
-    this.controls.addEventListener('start', () => {
-      this.resettingCamera = false;
-    });
+    // Flat observation camera: pan, pinch/wheel zoom, tap an ant to follow it. No orbiting.
+    this.camCtl = new FlatCameraController(
+      this.camera,
+      this.renderer.domElement,
+      {
+        left: simToWorldX(CASE_LEFT),
+        right: simToWorldX(CASE_RIGHT),
+        top: simToWorldY(CASE_TOP),
+        bottom: simToWorldY(CASE_BOTTOM),
+        z: SOIL_FRONT_Z,
+      },
+      (lx, ly) => this.pickAnt(lx, ly)
+    );
 
     if (!this.isSoftwareGl) {
       this.renderer.compile(this.scene, this.camera);
@@ -299,7 +322,30 @@ export class Formicarium3DRenderer {
   }
 
   public resetCamera(): void {
-    this.resettingCamera = true;
+    this.camCtl.reset();
+  }
+
+  /** Picks the ant drawn nearest a canvas-local pixel and starts following it. */
+  private pickAnt(lx: number, ly: number): boolean {
+    const w = this.renderer.domElement.clientWidth || 1;
+    const h = this.renderer.domElement.clientHeight || 1;
+    const radius = Math.max(28, Math.min(w, h) * 0.06);
+    let best = -1;
+    let bestD = radius * radius;
+    for (const [id, rig] of this.antRigs) {
+      _pick.copy(rig.root.position).project(this.camera);
+      if (_pick.z > 1) continue;
+      const px = (_pick.x * 0.5 + 0.5) * w;
+      const py = (-_pick.y * 0.5 + 0.5) * h;
+      const d = (px - lx) * (px - lx) + (py - ly) * (py - ly);
+      if (d < bestD) {
+        bestD = d;
+        best = id;
+      }
+    }
+    if (best < 0) return false;
+    this.camCtl.follow(best);
+    return true;
   }
 
   public resize(): void {
@@ -309,6 +355,7 @@ export class Formicarium3DRenderer {
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(w, h);
+    this.camCtl.fit();
   }
 
   private updateLightingAndWeather(sim: AntColonySimulation): void {
@@ -328,19 +375,30 @@ export class Formicarium3DRenderer {
     _sunTmp.copy(_sunNight).lerp(_sunDay, dayFactor).lerp(_sunDusk, clamp(duskFactor * 0.75, 0, 1));
     this.sunLight.color.copy(_sunTmp);
 
-    const weatherDim = sim.weather === 'Light Rain' ? 0.65 : sim.weather === 'Misty' ? 0.8 : 1.0;
-    this.sunLight.intensity = (0.35 + dayFactor * 2.1) * weatherDim;
-    this.hemiLight.intensity = (0.32 + dayFactor * 0.58) * weatherDim;
+    // real cloud cover dims and greys the light; rain darkens it further; snow on the ground brightens the bounce
+    const rain = sim.rainIntensity();
+    const cloud = sim.climate.cloud;
+    const weatherDim = clamp(1 - cloud * 0.38 - rain * 0.22 - (sim.weather === 'Fog' ? 0.15 : 0), 0.35, 1);
+    // thunderstorms: occasional lightning flashes
+    if (sim.weather === 'Thunderstorm' && this.lightningFlash <= 0 && Math.random() < 0.004) this.lightningFlash = 1;
+    const flash = this.lightningFlash > 0 ? Math.max(0, this.lightningFlash) * (0.6 + 0.4 * Math.sin(this.lightningFlash * 40)) : 0;
+    this.lightningFlash -= 0.06;
+    this.sunLight.intensity = (0.35 + dayFactor * 2.1) * weatherDim * (1 - cloud * 0.35) + flash * 3;
+    this.hemiLight.intensity = (0.32 + dayFactor * 0.58) * weatherDim + sim.snowCover * 0.25 * dayFactor + flash * 1.5;
     this.chamberLight.intensity = 1.55 - dayFactor * 0.45;
 
     _skyTmp.copy(_skyNight).lerp(_skyDay, dayFactor).lerp(_skyDusk, clamp(duskFactor * 0.65, 0, 1));
-    if (sim.weather === 'Misty') _skyTmp.lerp(new THREE.Color(0x283545), 0.35);
-    if (sim.weather === 'Light Rain') _skyTmp.lerp(new THREE.Color(0x131d29), 0.45);
+    _skyTmp.lerp(_skyOvercast, clamp(cloud * 0.45 * dayFactor, 0, 0.45));
+    if (sim.weather === 'Fog') _skyTmp.lerp(_skyFog, 0.4);
+    if (rain > 0) _skyTmp.lerp(_skyRain, clamp(rain * 0.45, 0, 0.5));
+    if (sim.weather === 'Snow') _skyTmp.lerp(_skySnow, 0.3 * dayFactor + 0.1);
+    if (flash > 0) _skyTmp.lerp(_skyFlash, clamp(flash, 0, 0.8));
 
     (this.scene.background as THREE.Color).copy(_skyTmp);
     if (this.scene.fog instanceof THREE.FogExp2) {
       this.scene.fog.color.copy(_skyTmp);
-      this.scene.fog.density = sim.weather === 'Misty' ? 0.019 : sim.weather === 'Light Rain' ? 0.015 : 0.01;
+      this.scene.fog.density =
+        sim.weather === 'Fog' ? 0.024 : sim.weather === 'Snow' ? 0.017 : rain > 0 ? 0.011 + rain * 0.006 : 0.01;
     }
   }
 
@@ -522,9 +580,26 @@ export class Formicarium3DRenderer {
           }
         }
       }
+      if (ant.flying) {
+        // airborne alate: free flight through the case, body along the direction of travel
+        _targetPos.set(simToWorldX(ant.x), simToWorldY(ant.y), 0.3);
+        rig.smoothPos.lerp(_targetPos, posBlend);
+        rig.root.position.copy(rig.smoothPos);
+        _flyEuler.set(0, 0, -ant.angle);
+        rig.root.quaternion.setFromEuler(_flyEuler);
+        rig.currentQuat.copy(rig.root.quaternion);
+        rig.prevWorldPos.copy(rig.smoothPos);
+        // legs hang beneath the body: solve them against an imaginary floor just under the ant
+        rig.worldVel.set(0, 0, 0);
+        animateAntRig(rig, ant, sim.simTime, this.bank, dt, rig.worldVel, this.airGround);
+        rig.root.updateMatrixWorld(true);
+        this.batcher.addAll(this.rigMeshes.get(rig)!);
+        continue;
+      }
       const effectiveZ = clamp(rig.zLane + zDodge, 0.03, 0.44);
       const tf = this.compute3DSurfaceTransform(sim, ant.x, ant.y, ant.angle, effectiveZ, probeDist);
       _targetPos.set(tf.x, tf.y, tf.z);
+      if (ant.carriedById != null) _targetPos.y += 0.05; // lifted off the ground in a nestmate's jaws
 
       let justSnapped = false;
       if (!rig.hasInitPos || rig.smoothPos.distanceToSquared(_targetPos) > 2.25) {
@@ -705,7 +780,7 @@ export class Formicarium3DRenderer {
     let proteinC = 0;
     let fungusC = 0;
     for (const f of sim.foods) {
-      const s = 0.55 + (f.amount / Math.max(1, f.maxAmount)) * 0.65;
+      const s = f.large ? 2.6 : 0.55 + (f.amount / Math.max(1, f.maxAmount)) * 0.65;
       let z = 0.12 + Math.sin(f.id * 2.1) * 0.2;
       if (f.storedInChamberId !== null) {
         z = Math.max(this.env3d.sampleCavernBackZ(sim, f.x, f.y) + 0.03, z);
@@ -739,7 +814,7 @@ export class Formicarium3DRenderer {
     let rainC = 0;
     for (const d of sim.droplets) {
       const z = 0.1 + Math.sin(d.id * 3.1) * 0.36;
-      if (!d.settled && rainC < 120) {
+      if (!d.settled && rainC < 220) {
         _dummy.position.set(simToWorldX(d.x), simToWorldY(d.y), z);
         _dummy.rotation.set(0, 0, -sim.windStrength * 0.08);
         _dummy.scale.setScalar(1);
@@ -775,6 +850,7 @@ export class Formicarium3DRenderer {
     // 5. Particles (dust motes, excavation crumbs, combat sparks)
     let dustC = 0;
     let crumbC = 0;
+    let snowC = 0;
     let sparkC = 0;
     for (let i = 0; i < sim.particles.length; i++) {
       const p = sim.particles[i];
@@ -789,6 +865,10 @@ export class Formicarium3DRenderer {
         _dummy.scale.setScalar(0.65 + p.size * 0.3);
         _dummy.updateMatrix();
         this.crumbMesh.setMatrixAt(crumbC++, _dummy.matrix);
+      } else if (p.kind === 'snow' && snowC < 220) {
+        _dummy.scale.setScalar(0.7 + p.size * 0.4);
+        _dummy.updateMatrix();
+        this.snowMesh.setMatrixAt(snowC++, _dummy.matrix);
       } else if ((p.kind === 'spark' || p.kind === 'mist') && sparkC < 80) {
         const s = (1 - p.life / Math.max(0.01, p.maxLife)) * 1.1;
         _dummy.scale.setScalar(Math.max(0.05, s));
@@ -799,34 +879,94 @@ export class Formicarium3DRenderer {
     this.dustMesh.count = dustC;
     this.crumbMesh.count = crumbC;
     this.sparkMesh.count = sparkC;
+    this.snowMesh.count = snowC;
+    this.snowMesh.instanceMatrix.needsUpdate = true;
+    this.syncWeatherEntities(sim);
     this.dustMesh.instanceMatrix.needsUpdate = true;
     this.crumbMesh.instanceMatrix.needsUpdate = true;
     this.sparkMesh.instanceMatrix.needsUpdate = true;
   }
 
+  /** Snow lying on the ground, floodwater in the tunnels, aphids on the plants, trail debris. */
+  private syncWeatherEntities(sim: AntColonySimulation): void {
+    // snow cap: a white crust following the ground profile, thickening as snow settles
+    let capC = 0;
+    if (sim.snowCover > 0.02) {
+      for (let gx = 9; gx < GRID_W - 9 && capC < GRID_W; gx += 2) {
+        const y0 = sim.grid.surfaceY[gx];
+        const y1 = sim.grid.surfaceY[Math.min(GRID_W - 1, gx + 2)];
+        const x = simToWorldX((gx + 1) * CELL_SIZE);
+        _dummy.position.set(x, simToWorldY((y0 + y1) / 2) + 0.015 + sim.snowCover * 0.05, 0.18);
+        // lie along the slope instead of stepping
+        _dummy.rotation.set(0, 0, Math.atan2(y0 - y1, CELL_SIZE * 2));
+        _dummy.scale.set(1, 0.4 + sim.snowCover * 1.6, 1);
+        _dummy.updateMatrix();
+        this.snowCapMesh.setMatrixAt(capC++, _dummy.matrix);
+      }
+    }
+    this.snowCapMesh.count = capC;
+    this.snowCapMesh.instanceMatrix.needsUpdate = true;
+
+    // floodwater fills open cells below the water line (rebuilt only when the level or the nest changes)
+    const key = sim.floodDepth > 0.5 ? `${Math.round(sim.floodDepth)}:${sim.grid.terrainVersion}` : '';
+    if (key !== this.floodKey) {
+      this.floodKey = key;
+      let fc = 0;
+      if (key) {
+        const lineGy = Math.floor(sim.floodLineY() / CELL_SIZE);
+        for (let gy = Math.max(0, lineGy); gy < GRID_H && fc < 1600; gy++) {
+          for (let gx = 0; gx < GRID_W && fc < 1600; gx++) {
+            if (sim.grid.terrain[gy * GRID_W + gx] !== CellType.TUNNEL) continue;
+            _dummy.position.set(simToWorldX((gx + 0.5) * CELL_SIZE), simToWorldY((gy + 0.5) * CELL_SIZE), 0.17);
+            _dummy.rotation.set(0, 0, 0);
+            _dummy.scale.setScalar(1);
+            _dummy.updateMatrix();
+            this.floodMesh.setMatrixAt(fc++, _dummy.matrix);
+          }
+        }
+      }
+      this.floodMesh.count = fc;
+      this.floodMesh.instanceMatrix.needsUpdate = true;
+    }
+
+    let aphC = 0;
+    for (const a of sim.aphids) {
+      if (aphC >= 60) break;
+      _dummy.position.set(simToWorldX(a.x), simToWorldY(a.y), 0.12 + Math.sin(a.id * 1.3) * 0.2);
+      _dummy.rotation.set(0, a.id, Math.sin(a.phase * 2) * 0.1);
+      const fat = 0.8 + (a.honeydew / 12) * 0.45;
+      _dummy.scale.set(1.25 * fat, 0.85 * fat, 0.9 * fat);
+      _dummy.updateMatrix();
+      this.aphidMesh.setMatrixAt(aphC++, _dummy.matrix);
+    }
+    this.aphidMesh.count = aphC;
+    this.aphidMesh.instanceMatrix.needsUpdate = true;
+
+    let debC = 0;
+    for (const d of sim.debris) {
+      if (debC >= 16 || d.carriedById != null) continue;
+      _dummy.position.set(simToWorldX(d.x), simToWorldY(d.y), 0.1 + Math.sin(d.id * 2.3) * 0.2);
+      _dummy.rotation.set(d.id, d.id * 0.7, 0);
+      _dummy.scale.set(d.size * 1.4, d.size * 0.6, d.size);
+      _dummy.updateMatrix();
+      this.debrisMesh.setMatrixAt(debC++, _dummy.matrix);
+    }
+    this.debrisMesh.count = debC;
+    this.debrisMesh.instanceMatrix.needsUpdate = true;
+  }
+
   public render(sim: AntColonySimulation, dt: number): void {
     if (this.disposed) return;
 
-    // Smooth camera reset animation (cancels if user interacts)
-    if (this.resettingCamera) {
-      const k = 1 - Math.exp(-6 * dt);
-      this.camera.position.lerp(HERO_CAM_POS, k);
-      this.controls.target.lerp(HERO_TARGET, k);
-      if (
-        this.camera.position.distanceTo(HERO_CAM_POS) < 0.03 &&
-        this.controls.target.distanceTo(HERO_TARGET) < 0.03
-      ) {
-        this.camera.position.copy(HERO_CAM_POS);
-        this.controls.target.copy(HERO_TARGET);
-        this.resettingCamera = false;
+    let followPos: THREE.Vector3 | null = null;
+    if (this.camCtl.followId !== null) {
+      const ant = sim.ants.find((a) => a.id === this.camCtl.followId);
+      if (ant) {
+        const rig = this.antRigs.get(ant.id);
+        followPos = rig && rig.hasInitPos ? rig.root.position : _pick.set(simToWorldX(ant.x), simToWorldY(ant.y), 0.2);
       }
     }
-
-    this.controls.update();
-    // Keep pan target bounded inside the terrarium frame
-    this.controls.target.x = clamp(this.controls.target.x, -13.5, 13.5);
-    this.controls.target.y = clamp(this.controls.target.y, -7.8, 7.6);
-    this.controls.target.z = clamp(this.controls.target.z, -0.45, 0.75);
+    this.camCtl.update(dt, followPos);
 
     // Wind sway on 3D surface sprouts + keep seated on growing entrance mounds
     const keepSproutsSeated = sim.grid.dirtVisualDirty;
@@ -854,7 +994,7 @@ export class Formicarium3DRenderer {
 
   public dispose(): void {
     this.disposed = true;
-    this.controls.dispose();
+    this.camCtl.dispose();
     this.batcher.dispose();
     this.env3d.dispose();
     this.geo.dispose();

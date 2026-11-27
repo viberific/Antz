@@ -1,8 +1,10 @@
 import { ColonyGrid } from './pathfinding';
+import type { LiveWeather, WeatherCondition } from './realworld';
 import {
   Ant,
   AntCaste,
   AntTask,
+  Aphid,
   BroodItem,
   BroodStage,
   CASE_BOTTOM,
@@ -13,6 +15,7 @@ import {
   CellType,
   Chamber,
   ChamberType,
+  Debris,
   FallenAnt,
   FoodSource,
   GRID_H,
@@ -46,8 +49,35 @@ function lerpAngle(a: number, b: number, t: number): number {
 const MAX_COLONY = 160;
 const MAX_BROOD = 60;
 const SIDE_ENTRANCE_X = 405;
-/** seconds per full day/night cycle */
+/** sim seconds per day/night cycle when no real clock is available (tests / headless runs) */
 const DAY_LENGTH = 200;
+
+export type Season = 'Spring' | 'Summer' | 'Autumn' | 'Winter';
+
+export interface Climate {
+  tempC: number;
+  /** 0..1 */
+  humidity: number;
+  rainMmH: number;
+  snowCmH: number;
+  /** 0..1 */
+  cloud: number;
+  windKmh: number;
+  windDir: number;
+}
+
+/**
+ * Ants are ectotherms: their pace follows temperature. Near-torpid below ~5 °C, rising steeply to an optimum
+ * around 25-33 °C, then falling off as heat stress sets in. Returns a 0..1 work/speed multiplier.
+ */
+export function antActivity(tC: number): number {
+  if (tC <= 3) return 0.06;
+  if (tC < 12) return 0.06 + ((tC - 3) / 9) * 0.39;
+  if (tC < 25) return 0.45 + ((tC - 12) / 13) * 0.55;
+  if (tC <= 33) return 1;
+  if (tC < 45) return 1 - ((tC - 33) / 12) * 0.75;
+  return 0.25;
+}
 const INF = 1e6;
 const N_CELLS = GRID_W * GRID_H;
 /** world units: radius of the open crater kept clear around each entrance hole */
@@ -122,6 +152,12 @@ const BUSY_TASKS = new Set<AntTask>([
   AntTask.SIGNALING_FOOD,
   AntTask.EATING,
   AntTask.DRINKING_DEW,
+  AntTask.ALLOGROOMING,
+  AntTask.HELPING_ECLOSION,
+  AntTask.HUSKING_SEED,
+  AntTask.TENDING_APHIDS,
+  AntTask.CANNIBALIZING,
+  AntTask.SEALING_ENTRANCE,
 ]);
 
 export class AntColonySimulation {
@@ -142,9 +178,34 @@ export class AntColonySimulation {
   public simTime: number = 0;
   public timeOfDay: number = 0.3;
   public dayCount: number = 1;
-  public weather: 'Clear' | 'Misty' | 'Light Rain' = 'Clear';
+  public weather: WeatherCondition = 'Clear';
   public windStrength: number = 0.35;
   private weatherTimer: number = 70;
+  /** current (smoothed) outdoor climate, and the reading it is easing toward */
+  public climate: Climate = { tempC: 21, humidity: 0.6, rainMmH: 0, snowCmH: 0, cloud: 0.2, windKmh: 8, windDir: 270 };
+  private climateGoal: Climate = { ...this.climate };
+  /** true once real weather for the player's location has arrived */
+  public liveWeather = false;
+  /** follow the player's real local clock for day and night (false = fast DAY_LENGTH cycle, for headless runs) */
+  public realClock = typeof window !== 'undefined';
+  /** local sunrise / sunset, minutes after local midnight */
+  private sunriseMin = 6.5 * 60;
+  private sunsetMin = 18.5 * 60;
+  public latitude = 40;
+  public season: Season = 'Autumn';
+  /** soil-buffered temperature down in the nest, and the sun-baked ground temperature outside */
+  public nestTempC = 20;
+  public surfaceTempC = 21;
+  /** 0..1 snow lying on the surface */
+  public snowCover = 0;
+  /** height (world px) of rainwater pooled in the bottom of the nest after a downpour */
+  public floodDepth = 0;
+  /** 0..1, how freshly the ground has been soaked (rises in rain, fades after) */
+  public wetness = 0;
+  private wasForageWeather = true;
+  private nestBottomY = CASE_BOTTOM;
+  private nestBottomVersion = -1;
+  private foundedAt = Date.now();
 
   public entrancePos: Vec2 = { x: 700, y: SURFACE_BASE_Y };
   public middenPos: Vec2 = { x: 1290, y: SURFACE_BASE_Y };
@@ -169,7 +230,17 @@ export class AntColonySimulation {
   private damageTimer: number = 4;
   private pherAccum = 0;
   /** running totals, handy for tuning and debugging */
-  public counters = { pickups: 0, deliveries: 0, digs: 0, deposits: 0, larvaFeeds: 0, queenFeeds: 0 };
+  public counters = { pickups: 0, deliveries: 0, digs: 0, deposits: 0, larvaFeeds: 0, queenFeeds: 0, tandems: 0, rescues: 0, flights: 0 };
+  public aphids: Aphid[] = [];
+  public debris: Debris[] = [];
+  private repleteTimer = 5;
+  /** nuptial flight under way */
+  public swarming = false;
+  private queenlessTimer = 120;
+  private lastFamineLog = -999;
+  private sealTimer = 0;
+  private sealed = false;
+  private sealedCells: number[] = [];
   /** A* searches still allowed this step */
   private pathBudget = 0;
 
@@ -792,18 +863,19 @@ export class AntColonySimulation {
 
     const prevTod = this.timeOfDay;
     const wasNight = this.isNight();
-    this.timeOfDay = (this.timeOfDay + dt / DAY_LENGTH) % 1;
-    if (this.timeOfDay < prevTod) this.dayCount++;
+    this.stepClock(dt);
+    if (!this.realClock && this.timeOfDay < prevTod) this.dayCount++;
     if (wasNight !== this.isNight()) {
-      this.log(this.isNight() ? 'Night falls: foragers head underground' : `Day ${this.dayCount} dawns: foragers stream out`);
+      this.log(this.isNight() ? 'Night falls: most foragers head underground' : `Day ${this.dayCount} dawns: foragers stream out`);
     }
 
-    this.windStrength = 0.3 + 0.45 * Math.sin(this.simTime * 0.14) + 0.25 * Math.cos(this.simTime * 0.37);
     this.stepWeather(dt);
 
     this.pherAccum += dt;
     if (this.pherAccum >= 0.12) {
-      this.grid.stepPheromonesAndMoisture(this.pherAccum, this.weather);
+      const c = this.climate;
+      const dryness = clamp((1 - c.humidity) * 0.6 + clamp((this.surfaceTempC - 20) / 25, 0, 1) * 0.3 + clamp(c.windKmh / 50, 0, 1) * 0.4, 0, 1);
+      this.grid.stepPheromonesAndMoisture(this.pherAccum, this.rainIntensity(), this.weather === 'Fog', dryness);
       this.pherAccum = 0;
     }
 
@@ -811,6 +883,13 @@ export class AntColonySimulation {
     this.stepDroplets(dt);
     this.stepEcosystem(dt);
     this.stepStormDamage(dt);
+    this.updateBroodClimate(dt);
+    this.stepAphids(dt);
+    this.stepRepletes(dt);
+    this.stepDebris(dt);
+    this.stepQueenless(dt);
+    this.stepNuptialFlight(dt);
+    this.stepEntranceSealing(dt);
     this.stepBrood(dt);
     this.stepQueenLaying(dt);
     this.planExpansion(dt);
@@ -821,38 +900,213 @@ export class AntColonySimulation {
     this.refreshClaims();
     this.stepIntruders(dt);
     this.stepAnts(dt);
+    this.stepGroupTransport(dt);
     this.resolveEntityCrowding(dt);
     this.stepFallenAnts(dt);
     this.stepParticles(dt);
   }
 
-  private stepWeather(dt: number): void {
+  // ================================================================================================================
+  // Real clock, seasons and weather
+  // ================================================================================================================
+
+  /** Live weather (or the cached last reading) for the player's location. */
+  public applyLiveWeather(wx: LiveWeather, cached: boolean): void {
+    const prev = this.weather;
+    const first = !this.liveWeather;
+    this.liveWeather = true;
+    this.climateGoal = {
+      tempC: wx.tempC,
+      humidity: clamp(wx.humidity, 0, 1),
+      rainMmH: Math.max(0, wx.rainMmH),
+      snowCmH: Math.max(0, wx.snowCmH),
+      cloud: clamp(wx.cloud, 0, 1),
+      windKmh: Math.max(0, wx.windKmh),
+      windDir: wx.windDir,
+    };
+    // the first reading replaces the made-up weather outright instead of easing out of it
+    if (first) this.climate = { ...this.climateGoal };
+    this.weather = wx.condition;
+    this.latitude = wx.latitude;
+    const minutes = (ms: number) => {
+      const d = new Date(ms);
+      return d.getHours() * 60 + d.getMinutes();
+    };
+    const rise = minutes(wx.sunrise);
+    const set = minutes(wx.sunset);
+    if (set - rise > 60) {
+      this.sunriseMin = rise;
+      this.sunsetMin = set;
+    }
+    if (!cached && prev !== this.weather) this.logWeatherChange(prev);
+  }
+
+  private logWeatherChange(prev: WeatherCondition): void {
+    const w = this.weather;
+    if (w === 'Heavy Rain' || w === 'Thunderstorm') this.log(`${w}: foragers shelter, nurses guard the brood from flooding`, 'danger');
+    else if (w === 'Rain' || w === 'Drizzle') this.log('Rain begins: trails wash out and the mound starts to erode', 'danger');
+    else if (w === 'Snow') this.log('Snow: the colony withdraws deep underground', 'danger');
+    else if (prev === 'Rain' || prev === 'Heavy Rain' || prev === 'Thunderstorm' || prev === 'Drizzle') this.log('The rain has passed: damp soil, easy digging');
+  }
+
+  /** 0 dry .. ~1.2 thunderstorm */
+  public rainIntensity(): number {
+    switch (this.weather) {
+      case 'Drizzle':
+        return 0.25;
+      case 'Rain':
+        return 0.55;
+      case 'Heavy Rain':
+        return 1;
+      case 'Thunderstorm':
+        return 1.2;
+      default:
+        return 0;
+    }
+  }
+
+  private seasonFor(date: Date, lat: number): Season {
+    let m = date.getMonth(); // 0 = Jan
+    if (lat < 0) m = (m + 6) % 12;
+    return m <= 1 || m === 11 ? 'Winter' : m <= 4 ? 'Spring' : m <= 7 ? 'Summer' : 'Autumn';
+  }
+
+  /** typical mean temperature for the season, what deep soil settles toward */
+  private seasonMeanC(): number {
+    const tropics = Math.abs(this.latitude) < 23;
+    if (tropics) return 25;
+    return this.season === 'Summer' ? 21 : this.season === 'Winter' ? 4 : 13;
+  }
+
+  /** 0..1 egg-laying / brood-rearing drive through the year (queens shut down in winter, peak in summer) */
+  public seasonalBreeding(): number {
+    if (Math.abs(this.latitude) < 23) return 1;
+    return this.season === 'Summer' ? 1 : this.season === 'Spring' ? 0.85 : this.season === 'Autumn' ? 0.45 : 0.18;
+  }
+
+  private stepClock(dt: number): void {
+    if (!this.realClock) {
+      this.timeOfDay = (this.timeOfDay + dt / DAY_LENGTH) % 1;
+      return;
+    }
+    // Map the real local clock onto the sky: sunrise -> 0.2, sunset -> 0.7 (the renderer's horizon crossings).
+    const now = new Date();
+    const m = now.getHours() * 60 + now.getMinutes() + now.getSeconds() / 60;
+    const rise = this.sunriseMin;
+    const set = this.sunsetMin;
+    let t: number;
+    if (m >= rise && m <= set) t = 0.2 + (0.5 * (m - rise)) / (set - rise);
+    else {
+      const nightLen = 1440 - (set - rise);
+      const since = (m - set + 1440) % 1440;
+      t = 0.7 + (0.5 * since) / nightLen;
+    }
+    this.timeOfDay = ((t % 1) + 1) % 1;
+    this.dayCount = Math.max(1, Math.floor((now.getTime() - this.foundedAt) / 86400e3) + 1);
+    this.season = this.seasonFor(now, this.latitude);
+  }
+
+  /** Daylight strength 0..1, matching the renderer's sun. */
+  public daylight(): number {
+    const sunElev = Math.sin((this.timeOfDay - 0.2) * Math.PI * 2);
+    return clamp(sunElev * 0.85 + 0.35, 0, 1);
+  }
+
+  /** Made-up weather for when the real thing isn't available (offline, no location). */
+  private stepSimulatedWeather(dt: number): void {
     this.weatherTimer -= dt;
-    if (this.weatherTimer <= 0) {
-      const prev = this.weather;
-      const r = Math.random();
-      this.weather = r < 0.5 ? 'Clear' : r < 0.72 ? 'Misty' : 'Light Rain';
-      this.weatherTimer = this.weather === 'Clear' ? 70 + Math.random() * 60 : 30 + Math.random() * 25;
-      if (this.weather !== prev) {
-        if (this.weather === 'Light Rain') this.log('Rain begins: the mound and shallow tunnels are at risk', 'danger');
-        else if (prev === 'Light Rain') this.log('The rain has passed');
+    if (this.weatherTimer > 0) return;
+    const prev = this.weather;
+    const r = Math.random();
+    const cold = this.season === 'Winter';
+    this.weather = r < 0.42 ? 'Clear' : r < 0.6 ? 'Cloudy' : r < 0.7 ? 'Fog' : r < 0.82 ? 'Drizzle' : r < 0.93 ? 'Rain' : cold ? 'Snow' : 'Heavy Rain';
+    this.weatherTimer = this.weather === 'Clear' || this.weather === 'Cloudy' ? 120 + Math.random() * 120 : 40 + Math.random() * 40;
+    const base = this.seasonMeanC() + 6 * this.daylight() - 3;
+    const g = this.climateGoal;
+    g.tempC = this.weather === 'Snow' ? Math.min(base, -1) : base + (Math.random() - 0.5) * 4;
+    g.cloud = this.weather === 'Clear' ? 0.1 : this.weather === 'Cloudy' ? 0.7 : 0.95;
+    g.rainMmH = this.rainIntensity() * 5;
+    g.snowCmH = this.weather === 'Snow' ? 0.4 : 0;
+    g.humidity = this.weather === 'Clear' ? 0.5 : 0.9;
+    g.windKmh = 4 + Math.random() * (this.weather === 'Heavy Rain' ? 40 : 18);
+    g.windDir = Math.random() < 0.5 ? 270 : 90;
+    if (this.weather !== prev) this.logWeatherChange(prev);
+  }
+
+  private stepWeather(dt: number): void {
+    if (!this.liveWeather) this.stepSimulatedWeather(dt);
+
+    // ease toward the latest reading so a 15-minute weather update doesn't snap
+    const c = this.climate;
+    const g = this.climateGoal;
+    const k = 1 - Math.exp(-dt / 20);
+    c.tempC += (g.tempC - c.tempC) * k;
+    c.humidity += (g.humidity - c.humidity) * k;
+    c.rainMmH += (g.rainMmH - c.rainMmH) * k;
+    c.snowCmH += (g.snowCmH - c.snowCmH) * k;
+    c.cloud += (g.cloud - c.cloud) * k;
+    c.windKmh += (g.windKmh - c.windKmh) * k;
+    c.windDir = g.windDir;
+
+    // Sun bakes bare ground well above air temperature; soil buffers the nest toward the seasonal mean.
+    const sun = this.daylight() * (1 - c.cloud * 0.8);
+    this.surfaceTempC = c.tempC + sun * 11 - this.wetness * 2 - this.snowCover * 3;
+    const nestGoal = clamp(0.4 * c.tempC + 0.6 * this.seasonMeanC(), 1, 30);
+    this.nestTempC += (nestGoal - this.nestTempC) * (1 - Math.exp(-dt / 300));
+
+    // wind: real speed and direction, with gusts (positive blows left -> right)
+    const dirX = -Math.sin((c.windDir * Math.PI) / 180);
+    const gust = 0.75 + 0.25 * Math.sin(this.simTime * 0.9) + 0.15 * Math.sin(this.simTime * 2.3);
+    this.windStrength = (c.windKmh / 22) * (Math.abs(dirX) < 0.2 ? 0.2 * Math.sign(dirX || 1) : dirX) * gust;
+
+    const rain = this.rainIntensity();
+    this.wetness = clamp(this.wetness + (rain > 0 ? rain * dt * 0.02 : -dt * 0.0015), 0, 1);
+
+    // snow settles on cold ground, melts when it warms
+    if (this.weather === 'Snow' && this.surfaceTempC < 3) this.snowCover = Math.min(1, this.snowCover + dt * 0.004);
+    else if (this.surfaceTempC > 1) this.snowCover = Math.max(0, this.snowCover - dt * 0.0012 * (this.surfaceTempC - 1));
+
+    // downpours pool water in the bottom of the nest; it soaks away once the rain stops
+    if (rain >= 1) this.floodDepth = Math.min(130, this.floodDepth + dt * (rain - 0.8) * 1.2);
+    else this.floodDepth = Math.max(0, this.floodDepth - dt * (rain > 0 ? 0.25 : 0.7));
+
+    const forage = this.forageWeather();
+    if (forage !== this.wasForageWeather) {
+      this.wasForageWeather = forage;
+      if (!forage && this.weather !== 'Snow' && rain < 0.5) {
+        this.log(this.surfaceTempC > 30 ? 'Too hot on the surface: foragers wait for cooler hours' : 'Too cold for foraging: the colony stays in', 'danger');
       }
     }
 
-    if (this.weather === 'Light Rain' && Math.random() < dt * 13) {
+    if (rain > 0 && Math.random() < dt * 30 * rain) {
       const rx = CASE_LEFT + 16 + Math.random() * (CASE_RIGHT - CASE_LEFT - 32);
       this.droplets.push({
         id: this.allocId(),
         x: rx,
         y: CASE_TOP + 8,
-        vy: 155 + Math.random() * 65,
-        radius: 1.6 + Math.random() * 1.1,
+        vy: 155 + Math.random() * 65 + rain * 60,
+        radius: 1.3 + Math.random() * 1.1 + rain * 0.6,
         volume: 9,
         settled: false,
       });
     }
 
-    if (this.weather === 'Misty' && Math.random() < dt * 2.4 && this.particles.length < 110) {
+    if (this.weather === 'Snow' && Math.random() < dt * 14 && this.particles.length < 200) {
+      this.particles.push({
+        x: CASE_LEFT + 10 + Math.random() * (CASE_RIGHT - CASE_LEFT - 20),
+        y: CASE_TOP + 6,
+        vx: this.windStrength * 12,
+        vy: 14 + Math.random() * 10,
+        size: 1 + Math.random(),
+        alpha: 0.9,
+        life: 0,
+        maxLife: 30,
+        kind: 'snow',
+        color: '#ffffff',
+      });
+    }
+
+    if (this.weather === 'Fog' && Math.random() < dt * 2.4 && this.particles.length < 110) {
       const fromLeft = this.windStrength >= 0;
       this.particles.push({
         x: fromLeft ? CASE_LEFT + 18 : CASE_RIGHT - 18,
@@ -868,6 +1122,42 @@ export class AntColonySimulation {
       });
     }
   }
+
+  /** Is it currently worth going out? (temperature window, no downpour, no snow, not a gale) */
+  public forageWeather(): boolean {
+    const t = this.surfaceTempC;
+    return t >= 10 && t <= 40 && this.rainIntensity() < 0.5 && this.weather !== 'Snow' && this.snowCover < 0.3 && this.climate.windKmh < 45;
+  }
+
+  /** world y below which tunnels are under water */
+  public floodLineY(): number {
+    // water collects in the lowest galleries first
+    if (this.nestBottomVersion !== this.grid.terrainVersion) {
+      this.nestBottomVersion = this.grid.terrainVersion;
+      let deepest = SURFACE_BASE_Y + 60;
+      for (let gy = GRID_H - 2; gy > 0; gy--) {
+        let hit = false;
+        for (let gx = 0; gx < GRID_W; gx++) {
+          if (this.grid.terrain[gy * GRID_W + gx] === CellType.TUNNEL) {
+            hit = true;
+            break;
+          }
+        }
+        if (hit) {
+          deepest = (gy + 1) * CELL_SIZE;
+          break;
+        }
+      }
+      this.nestBottomY = deepest;
+    }
+    return this.nestBottomY - this.floodDepth;
+  }
+
+  /** Temperature-driven pace for an ant at (x, y). */
+  public activityAt(x: number, y: number): number {
+    return Math.max(0.12, antActivity(this.tempAt(x, y)));
+  }
+
 
   private stepDroplets(dt: number): void {
     for (let i = this.droplets.length - 1; i >= 0; i--) {
@@ -917,11 +1207,22 @@ export class AntColonySimulation {
     this.naturalFoodTimer -= dt;
     if (this.naturalFoodTimer <= 0) {
       // Supply sized so a full-grown colony can sustain itself; the queen still throttles laying when stores run low.
-      this.naturalFoodTimer = 5 + Math.random() * 6;
+      // food follows the seasons: abundant in summer, scarce in winter, nothing falls in a snowstorm
+      const seasonK = this.season === 'Summer' ? 0.85 : this.season === 'Spring' ? 1 : this.season === 'Autumn' ? 1.3 : 2.4;
+      this.naturalFoodTimer = (5 + Math.random() * 6) * seasonK * (this.weather === 'Snow' ? 3 : 1);
       const surfaceFoods = this.foods.filter((f) => f.storedInChamberId === null);
       if (surfaceFoods.length < 14) {
         const r = Math.random();
-        if (r < 0.55) {
+        // rain drowns insects: right after a shower there are carcasses everywhere
+        const prey = this.wetness > 0.2 && this.rainIntensity() < 0.5 ? 0.35 : 0.12;
+        if (Math.random() < prey && !this.foods.some((f) => f.large)) {
+          const rx = CASE_LEFT + 120 + Math.random() * (CASE_RIGHT - CASE_LEFT - 240);
+          this.spawnSurfaceFood(PayloadType.PROTEIN, rx, false);
+          const big = this.foods[this.foods.length - 1];
+          big.large = true;
+          big.amount = big.maxAmount = 110;
+          big.radius = 11;
+        } else if (r < 0.55) {
           // Wind-blown seed drifting from canopy
           const rx = CASE_LEFT + 70 + Math.random() * (CASE_RIGHT - CASE_LEFT - 140);
           this.spawnSurfaceFood(PayloadType.SEED, rx, true);
@@ -985,7 +1286,7 @@ export class AntColonySimulation {
       if (f.amount <= 0.5) {
         this.foods.splice(i, 1);
       } else {
-        f.radius = 2.8 + (f.amount / f.maxAmount) * 5;
+        f.radius = f.large ? 11 : 2.8 + (f.amount / f.maxAmount) * 5;
       }
     }
   }
@@ -1356,14 +1657,16 @@ export class AntColonySimulation {
   // Brood & queen
   // ================================================================================================================
 
-  private stepBrood(dt: number): void {
+  private stepBrood(stepDt: number): void {
     for (let i = this.brood.length - 1; i >= 0; i--) {
       const b = this.brood[i];
+      // brood grows only as fast as its chamber's temperature allows (and stalls in a cold winter nest)
+      const dt = stepDt * this.activityAt(b.x, b.y);
       b.wigglePhase += dt * (b.stage === BroodStage.LARVA ? 4.8 : 1.2);
 
       if (b.carriedByAntId === null) {
         const g = this.grid.worldToGrid(b.x, b.y + 3);
-        if (this.grid.inBounds(g.gx, g.gy) && !this.grid.isSolid(g.gx, g.gy)) b.y += 18 * dt;
+        if (this.grid.inBounds(g.gx, g.gy) && !this.grid.isSolid(g.gx, g.gy)) b.y += 18 * stepDt;
         const own = this.grid.worldToGrid(b.x, b.y);
         if (this.grid.isSolid(own.gx, own.gy)) {
           // buried by a collapse: pop it back into the nearest open space
@@ -1376,12 +1679,20 @@ export class AntColonySimulation {
         }
       }
 
+      if (b.trophic) {
+        // trophic eggs are food, not offspring: they don't develop and spoil if nobody eats them
+        b.progress += dt;
+        if (b.progress > 90) this.brood.splice(i, 1);
+        continue;
+      }
       if (b.stage === BroodStage.EGG) {
         b.progress += dt * 3.2;
         if (b.progress >= 100) {
           b.stage = BroodStage.LARVA;
           b.progress = 0;
           b.nutrition = 50;
+          // caste is decided by how the larva is fed: in the breeding season some are raised as winged sexuals
+          if (!b.sexual) b.sexual = this.wantSexual() ?? undefined;
         }
       } else if (b.stage === BroodStage.LARVA) {
         b.nutrition = Math.max(0, b.nutrition - dt * 0.7);
@@ -1397,12 +1708,14 @@ export class AntColonySimulation {
           b.progress = 0;
         }
       } else {
-        b.progress += dt * 2.4;
+        b.progress = Math.min(100, b.progress + dt * 2.4);
         if (b.progress >= 100) {
+          if (!this.tryHelpEclosion(b, stepDt)) continue;
           if (this.ants.length < MAX_COLONY) {
-            const caste = this.chooseNeededCaste();
+            const caste = b.sexual === 'gyne' ? AntCaste.GYNE : b.sexual === 'male' ? AntCaste.MALE : this.chooseNeededCaste();
             const a = this.spawnAnt(caste, b.x, b.y - 2, true);
             a.age = 0;
+            if (b.sexual) this.log(`A winged ${b.sexual === 'gyne' ? 'young queen' : 'male'} has emerged`, 'good');
           }
           this.brood.splice(i, 1);
         }
@@ -1424,11 +1737,26 @@ export class AntColonySimulation {
     if (!queen) return;
     const royal = this.nearestChamber(ChamberType.ROYAL, queen.x, queen.y);
     if (!royal) return;
-    this.queenEggTimer -= dt;
+    // laying follows the seasons and the warmth of the royal chamber
+    this.queenEggTimer -= dt * this.seasonalBreeding() * this.activityAt(queen.x, queen.y);
     if (this.queenEggTimer > 0) return;
     const stored = this.storedFoodCache;
     this.queenEggTimer = (stored > 120 ? 4.5 : stored > 40 ? 8 : 16) + this.brood.length * 0.06;
-    if (queen.hunger > 80 || stored < 12) return;
+    if (queen.hunger > 80) return;
+    if (stored < 12) {
+      // short of food: lay a non-viable trophic egg for nurses to feed to the hungriest larva
+      const hungry = this.brood.some((b) => b.stage === BroodStage.LARVA && b.nutrition < 40);
+      const trophics = this.brood.filter((b) => b.trophic).length;
+      if (hungry && trophics < 4 && queen.hunger < 60 && !BUSY_TASKS.has(queen.task)) {
+        const egg = this.makeBrood(BroodStage.EGG, queen.x - Math.cos(queen.angle) * 14, queen.y - Math.sin(queen.angle) * 6, royal.id, 0, 100);
+        egg.trophic = true;
+        this.brood.push(egg);
+        queen.task = AntTask.LAYING_EGG;
+        queen.stateTimer = 1.6;
+        queen.hunger = Math.min(100, queen.hunger + 3);
+      }
+      return;
+    }
     if (this.brood.length >= MAX_BROOD || this.ants.length + this.brood.length >= MAX_COLONY + 10) return;
     if (BUSY_TASKS.has(queen.task) && queen.task !== AntTask.IDLE) return;
     queen.task = AntTask.LAYING_EGG;
@@ -1693,6 +2021,7 @@ export class AntColonySimulation {
     let diggers = 0;
     let foragers = 0;
     for (const a of this.ants) {
+      if (a.replete !== undefined) continue;
       if (a.caste === AntCaste.NURSE) nurses++;
       else if (a.caste === AntCaste.EXCAVATOR) diggers++;
       else if (a.caste === AntCaste.WORKER) foragers++;
@@ -1721,6 +2050,7 @@ export class AntColonySimulation {
     let pick: Ant | null = null;
     for (const a of this.ants) {
       if (a.caste !== fromCaste || a.payload !== PayloadType.NONE || a.payloadId !== null || a.isCallow) continue;
+      if (a.replete !== undefined || a.carriedById != null || a.carryingAntId != null || a.buried !== undefined) continue;
       if (a.targetId != null || a.task === AntTask.DEFENDING) continue;
       if (!pick) pick = a;
       else if (needCaste === AntCaste.NURSE ? a.age < pick.age : a.age > pick.age) pick = a;
@@ -1739,10 +2069,12 @@ export class AntColonySimulation {
   // ================================================================================================================
 
   private stepStormDamage(dt: number): void {
-    if (this.weather !== 'Light Rain') return;
+    const rain = this.rainIntensity();
+    if (rain < 0.25) return;
     this.damageTimer -= dt;
     if (this.damageTimer > 0) return;
-    this.damageTimer = 2.2 + Math.random() * 3;
+    // real rain lasts hours, not seconds: wear the nest down steadily rather than in a burst
+    this.damageTimer = (14 + Math.random() * 22) / rain;
     if (Math.random() < 0.6) this.erodeMound();
     else this.collapseShallowTunnel();
   }
@@ -1828,7 +2160,12 @@ export class AntColonySimulation {
         const cx = gx + (k % 3) - 1;
         const cy = gy + Math.floor(k / 3) - 1;
         const i = this.grid.idx(cx, cy);
-        if (this.grid.terrain[i] !== CellType.TUNNEL || this.cellOccupied(cx, cy)) continue;
+        if (this.grid.terrain[i] !== CellType.TUNNEL) continue;
+        // occasionally the slump lands right on a worker, which must then be rescued
+        if (this.cellOccupied(cx, cy)) {
+          if (Math.random() > 0.35) continue;
+          this.buryAntsAt(cx, cy);
+        }
         this.grid.setTerrain(cx, cy, CellType.SUBSOIL);
         this.digPlan[i] = 2;
         n++;
@@ -2264,9 +2601,12 @@ export class AntColonySimulation {
     for (let i = 0; i < this.ants.length; i++) {
       const a = this.ants[i];
       if (BUSY_TASKS.has(a.task) && a.task !== AntTask.IDLE) continue;
+      if (this.pinned(a)) continue;
       this.forAntsNear(a.x, a.y, 11, (b) => {
-        if (b.id <= a.id) return;
+        if (b.id <= a.id || this.pinned(b)) return;
         if (a.trophallaxisPartnerId === b.id) return;
+        // tandem pairs and carriers are supposed to touch
+        if (a.tandemLeaderId === b.id || b.tandemLeaderId === a.id || a.carryingAntId === b.id || b.carryingAntId === a.id) return;
         const minDist = a.caste === AntCaste.QUEEN || b.caste === AntCaste.QUEEN ? 10.5 : 7.0;
         nudgePair(a, b, minDist, 0.5);
       });
@@ -2279,8 +2619,15 @@ export class AntColonySimulation {
         nudgePair(m, o, 12, 0.65);
       }
       const standoff = m.species === 'rival_ant' || m.species === 'mite' ? 9.0 : 12.0;
-      this.forAntsNear(m.x, m.y, standoff, (a) => nudgePair(a, m, standoff, 0.65));
+      this.forAntsNear(m.x, m.y, standoff, (a) => {
+        if (!this.pinned(a)) nudgePair(a, m, standoff, 0.65);
+      });
     }
+  }
+
+  /** ants whose position is dictated by something else (carried, buried, airborne, gripping prey, hanging replete) */
+  private pinned(a: Ant): boolean {
+    return a.carriedById != null || a.buried !== undefined || !!a.flying || a.replete !== undefined || a.task === AntTask.GROUP_TRANSPORT;
   }
 
   private stepFallenAnts(dt: number): void {
@@ -2296,9 +2643,10 @@ export class AntColonySimulation {
   // Ants
   // ================================================================================================================
 
-  private killAnt(index: number, cause: 'age' | 'combat' | 'starvation'): void {
+  private killAnt(index: number, cause: 'age' | 'combat' | 'starvation' | 'buried'): void {
     const ant = this.ants[index];
     this.releasePayload(ant);
+    this.unlinkAnt(ant);
     let fx = ant.x;
     let fy = ant.y;
     const gx = clamp(Math.floor(ant.x / CELL_SIZE), 0, GRID_W - 1);
@@ -2312,14 +2660,18 @@ export class AntColonySimulation {
     this.fallenAnts.push({ id: this.allocId(), x: fx, y: fy, angle: ant.angle, carriedByAntId: null, atMidden: false, decayTimer: 25 });
     this.ants.splice(index, 1);
     if (ant.caste === AntCaste.QUEEN) this.log('The queen has died! The colony cannot raise new workers', 'danger');
-    else if (cause === 'combat') this.log(`A ${ant.caste.toLowerCase()} fell defending the colony`, 'danger');
+    else if (cause === 'buried') this.log('A buried worker suffocated before it could be dug out', 'danger');
+    else if (cause === 'combat') this.log(`${/^[aeiou]/i.test(ant.caste) ? 'An' : 'A'} ${ant.caste.toLowerCase()} fell defending the colony`, 'danger');
     else if (cause === 'starvation') this.log(this.storedFoodCache < 10 ? 'A worker starved: the stores are empty' : 'A worker starved', 'danger');
   }
 
   /** Drop whatever is carried (brood goes back on the floor, food lands where the ant stands). */
   private releasePayload(ant: Ant): void {
     if (ant.payloadId !== null) {
-      if (ant.payload === PayloadType.REFUSE) {
+      if (ant.payload === PayloadType.DEBRIS) {
+        const d = this.debris.find((dd) => dd.id === ant.payloadId);
+        if (d) d.carriedById = null;
+      } else if (ant.payload === PayloadType.REFUSE) {
         const fa = this.fallenAnts.find((f) => f.id === ant.payloadId);
         if (fa) fa.carriedByAntId = null;
       } else {
@@ -2336,10 +2688,22 @@ export class AntColonySimulation {
     ant.digIdx = -1;
   }
 
-  private stepAnts(dt: number): void {
-    const night = this.isNight();
+  private stepAnts(stepDt: number): void {
+    const isNight = this.isNight();
+    const goodWeather = this.forageWeather();
+    // When the larder is bare, hungry colonies gamble on marginal weather (but never a downpour, snow or frost).
+    const desperate =
+      this.storedFoodCache < 15 && this.rainIntensity() < 1 && this.weather !== 'Snow' && this.surfaceTempC > 7 && this.surfaceTempC < 44;
+    const floodY = this.floodLineY();
     for (let i = this.ants.length - 1; i >= 0; i--) {
       const ant = this.ants[i];
+      // Ectotherms: everything an ant does (walking, working, burning food, even ageing) runs at the pace the
+      // local temperature allows. Wading through floodwater slows them further.
+      let act = this.activityAt(ant.x, ant.y);
+      if (this.floodDepth > 0 && ant.y > floodY && !this.isOutside(ant.x, ant.y)) act *= 0.45;
+      const dt = stepDt * act;
+      // A third of the foragers are the night shift; the rest stay in after dark. Bad weather keeps everyone in.
+      const night = (isNight && ant.id % 3 !== 0) || (!goodWeather && !desperate);
       ant.age += dt;
       ant.greetCooldown = Math.max(0, ant.greetCooldown - dt);
       ant.signalCooldown = Math.max(0, (ant.signalCooldown ?? 0) - dt);
@@ -2350,7 +2714,9 @@ export class AntColonySimulation {
         if (ant.callowTimer <= 0) ant.isCallow = false;
       }
 
-      ant.hunger = clamp(ant.hunger + dt * (ant.caste === AntCaste.QUEEN ? 0.22 : ant.task === AntTask.IDLE ? 0.06 : 0.11), 0, 100);
+      // shut in by bad weather the colony goes quiescent and burns far less food (how real nests ride out storms)
+      const quiescence = goodWeather || desperate ? 1 : 0.3;
+      ant.hunger = clamp(ant.hunger + dt * quiescence * (ant.caste === AntCaste.QUEEN ? 0.22 : ant.task === AntTask.IDLE ? 0.06 : 0.11), 0, 100);
       ant.hydration = clamp(ant.hydration - dt * 0.2, 0, 100);
       if (ant.hunger >= 100) ant.hp = (ant.hp ?? 24) - dt * 0.6;
       else if (ant.hunger < 60 && this.simTime - (ant.lastHitTime ?? -99) > 6) ant.hp = Math.min(ant.maxHp ?? 24, (ant.hp ?? 24) + dt * 0.8);
@@ -2362,6 +2728,26 @@ export class AntColonySimulation {
       if (ant.caste !== AntCaste.QUEEN && ant.age > ant.maxAge) {
         this.killAnt(i, 'age');
         continue;
+      }
+
+      // --- special states: carried, buried, airborne, living honeypot ------------------------------------------
+      if (ant.carriedById != null) {
+        this.stepCarried(ant);
+        if (ant.carriedById != null) continue;
+      }
+      if (ant.buried !== undefined) {
+        if (!this.stepBuried(ant, i, dt) || ant.buried !== undefined) continue;
+      }
+      if (ant.flying) {
+        this.stepFlying(ant, i, stepDt);
+        continue;
+      }
+      if (ant.replete !== undefined) {
+        this.stepReplete(ant, dt);
+        continue;
+      }
+      if (ant.task === AntTask.GROUP_TRANSPORT && ant.targetId != null && this.foods.some((f) => f.id === ant.targetId && f.large)) {
+        continue; // moved with the prey in stepGroupTransport
       }
 
       if (ant.caste === AntCaste.QUEEN) {
@@ -2405,6 +2791,15 @@ export class AntColonySimulation {
         continue;
       }
 
+      if (fight !== 'moving' && (this.stepRescuer(ant, dt) || this.stepTandem(ant, dt))) {
+        this.syncCarried(ant);
+        continue;
+      }
+      if (fight !== 'moving' && this.stepCarryingNestmate(ant)) {
+        this.moveAnt(ant, dt);
+        continue;
+      }
+
       if (fight !== 'moving') {
         // --- casual greeting between passing nestmates -----------------------------------------------------------
         if (ant.payload === PayloadType.NONE && ant.greetCooldown <= 0 && Math.random() < dt * 0.4 && this.intruders.length === 0) {
@@ -2419,9 +2814,11 @@ export class AntColonySimulation {
             const o = other as Ant;
             // Trophallaxis if one is hungry and the other well fed, otherwise a quick antennal greeting
             const share = Math.abs(ant.hunger - o.hunger) > 35;
+            // ...or one grooms the other clean (allogrooming), especially foragers back from outside
+            const groom = !share && Math.random() < ((ant.excursion ?? 0) === 0 && ant.caste === AntCaste.WORKER ? 0.45 : 0.25);
             for (const [p, q] of [[ant, o], [o, ant]] as const) {
-              p.task = share ? AntTask.TROPHALLAXIS : AntTask.GREETING;
-              p.stateTimer = share ? 1.8 : 0.7;
+              p.task = share ? AntTask.TROPHALLAXIS : groom ? AntTask.ALLOGROOMING : AntTask.GREETING;
+              p.stateTimer = share ? 1.8 : groom ? 2.6 : 0.7;
               p.greetCooldown = 18 + Math.random() * 10;
               p.trophallaxisPartnerId = q.id;
               this.stopMoving(p);
@@ -2436,7 +2833,10 @@ export class AntColonySimulation {
           ant.greetCooldown = 3;
         }
 
-        if (ant.caste === AntCaste.WORKER) this.stepForager(ant, dt, night);
+        if (this.isAlate(ant)) this.stepAlate(ant, dt);
+        else if (this.tryCluster(ant)) {
+          /* overwintering */
+        } else if (ant.caste === AntCaste.WORKER) this.stepForager(ant, dt, night);
         else if (ant.caste === AntCaste.NURSE) this.stepNurse(ant, dt);
         else if (ant.caste === AntCaste.EXCAVATOR) this.stepExcavator(ant, dt);
         else if (ant.caste === AntCaste.SOLDIER) this.stepSoldier(ant, dt, night);
@@ -2565,8 +2965,789 @@ export class AntColonySimulation {
       return;
     }
     if (ant.stateTimer <= 0) {
+      // queens sleep in fewer, longer bouts than workers' hundreds of short naps
+      if (Math.random() < 0.15) {
+        ant.stateTimer = 15 + Math.random() * 25;
+        this.stopMoving(ant);
+        return;
+      }
       ant.stateTimer = 3 + Math.random() * 4;
       this.goTo(ant, royal.x + (Math.random() - 0.5) * royal.rx * 0.7, royal.y + royal.ry * 0.3);
+    }
+  }
+
+  // ================================================================================================================
+  // Extended real-ant behaviours
+  // ================================================================================================================
+
+  private isAlate(a: Ant): boolean {
+    return a.caste === AntCaste.GYNE || a.caste === AntCaste.MALE;
+  }
+
+  private antById(id: number | null | undefined): Ant | undefined {
+    if (id == null) return undefined;
+    return this.ants.find((a) => a.id === id);
+  }
+
+  /** Clears every social link an ant holds (called when it dies or its errand is cancelled). */
+  private unlinkAnt(ant: Ant): void {
+    const carrier = this.antById(ant.carriedById);
+    if (carrier) carrier.carryingAntId = null;
+    const carried = this.antById(ant.carryingAntId);
+    if (carried) {
+      carried.carriedById = null;
+      carried.task = AntTask.IDLE;
+      carried.stateTimer = 4;
+    }
+    const leader = this.antById(ant.tandemLeaderId);
+    if (leader) leader.tandemFollowerId = null;
+    const follower = this.antById(ant.tandemFollowerId);
+    if (follower) follower.tandemLeaderId = null;
+    for (const a of this.aphids) if (a.tenderId === ant.id) a.tenderId = null;
+    for (const d of this.debris) if (d.carriedById === ant.id) d.carriedById = null;
+    ant.carriedById = null;
+    ant.carryingAntId = null;
+    ant.tandemLeaderId = null;
+    ant.tandemFollowerId = null;
+  }
+
+  // --- tandem running ----------------------------------------------------------------------------------------------
+  /**
+   * A forager that found food teaches one nestmate the way: the follower keeps tapping the leader's gaster with
+   * its antennae and the leader stops and waits whenever that contact breaks (Temnothorax-style tandem running).
+   */
+  private startTandem(leader: Ant): void {
+    if (!leader.recruitFoodPos || leader.tandemFollowerId != null) return;
+    let follower: Ant | null = null;
+    this.forAntsNear(leader.x, leader.y, 60, (m) => {
+      if (
+        m.id !== leader.id &&
+        m.caste === AntCaste.WORKER &&
+        m.payload === PayloadType.NONE &&
+        !m.recruitFoodPos &&
+        m.tandemLeaderId == null &&
+        m.carriedById == null &&
+        !BUSY_TASKS.has(m.task)
+      ) {
+        follower = m;
+        return true;
+      }
+    });
+    if (!follower) return;
+    const f = follower as Ant;
+    leader.tandemFollowerId = f.id;
+    leader.tandemTimer = 90;
+    f.tandemLeaderId = leader.id;
+    this.counters.tandems++;
+  }
+
+  /** Returns true if the ant is busy with a tandem run this step. */
+  private stepTandem(ant: Ant, dt: number): boolean {
+    if (ant.tandemLeaderId != null) {
+      const leader = this.antById(ant.tandemLeaderId);
+      if (!leader || leader.tandemFollowerId !== ant.id) {
+        ant.tandemLeaderId = null;
+        return false;
+      }
+      ant.task = AntTask.TANDEM_FOLLOWING;
+      // stay at the leader's gaster
+      const bx = leader.x - Math.cos(leader.angle) * 6;
+      const by = leader.y - Math.sin(leader.angle) * 6;
+      if (Math.hypot(bx - ant.x, by - ant.y) > 3) this.goTo(ant, bx, by);
+      else this.stopMoving(ant);
+      this.moveAnt(ant, dt);
+      return true;
+    }
+    if (ant.tandemFollowerId != null) {
+      const follower = this.antById(ant.tandemFollowerId);
+      const rp = ant.recruitFoodPos;
+      ant.tandemTimer = (ant.tandemTimer ?? 0) - dt;
+      if (!follower || !rp || ant.tandemTimer <= 0 || ant.payload !== PayloadType.NONE) {
+        if (follower) follower.tandemLeaderId = null;
+        ant.tandemFollowerId = null;
+        return false;
+      }
+      ant.task = AntTask.TANDEM_LEADING;
+      if (Math.abs(ant.x - rp.x) < 14 && this.isOutside(ant.x, ant.y)) {
+        // arrived: the follower has learned the route
+        follower.recruitFoodPos = { x: rp.x, y: rp.y };
+        follower.tandemLeaderId = null;
+        ant.tandemFollowerId = null;
+        return false;
+      }
+      // contact lost: wait for the follower to catch up and touch the gaster again
+      if (Math.hypot(follower.x - ant.x, follower.y - ant.y) > 16) {
+        this.stopMoving(ant);
+        ant.pace = 0;
+        return true;
+      }
+      if (this.isOutside(ant.x, ant.y)) {
+        const t = this.surfaceTarget(rp.x);
+        if (!ant.targetPos || Math.abs(ant.targetPos.x - t.x) > 4) this.goTo(ant, t.x, t.y);
+      } else this.go(ant, 'surface');
+      // tandem leaders walk slowly so the follower can keep up
+      this.moveAnt(ant, dt * 0.6);
+      return true;
+    }
+    return false;
+  }
+
+  // --- aphid farming -----------------------------------------------------------------------------------------------
+  private seedAphids(): void {
+    if (this.aphids.length > 0 || this.sprouts.length === 0) return;
+    const hosts = this.sprouts.filter((s) => s.kind === 'clover' || s.kind === 'fern' || s.kind === 'grass');
+    for (let k = 0; k < Math.min(4, hosts.length); k++) {
+      const h = hosts[Math.floor(Math.random() * hosts.length)];
+      for (let n = 0; n < 2 + Math.floor(Math.random() * 3); n++) {
+        this.aphids.push({
+          id: this.allocId(),
+          x: h.x + (Math.random() - 0.5) * 6,
+          y: h.y - 3 - Math.random() * Math.max(4, h.height * 0.6),
+          honeydew: Math.random() * 6,
+          tenderId: null,
+          phase: Math.random() * 6.28,
+        });
+      }
+    }
+  }
+
+  private stepAphids(dt: number): void {
+    this.seedAphids();
+    // aphids feed on plant sap and excrete honeydew; warm growing weather means more of it, winter none
+    const rate = this.season === 'Winter' ? 0 : 0.35 * antActivity(this.surfaceTempC) * (this.rainIntensity() > 0.5 ? 0.3 : 1);
+    for (const a of this.aphids) {
+      a.honeydew = Math.min(12, a.honeydew + rate * dt);
+      a.phase += dt;
+      if (a.tenderId != null && !this.antById(a.tenderId)) a.tenderId = null;
+    }
+  }
+
+  /** Foragers milk aphids: stroking them with their antennae until they release a honeydew droplet. */
+  private tryTendAphids(ant: Ant): boolean {
+    if (this.aphids.length === 0) return false;
+    let best: Aphid | null = null;
+    let bestD = 160;
+    for (const a of this.aphids) {
+      if (a.honeydew < 8 || (a.tenderId != null && a.tenderId !== ant.id)) continue;
+      const d = Math.abs(a.x - ant.x) + Math.abs(a.y - ant.y);
+      if (d < bestD) {
+        bestD = d;
+        best = a;
+      }
+    }
+    if (!best) return false;
+    const a = best as Aphid;
+    a.tenderId = ant.id;
+    ant.task = AntTask.TENDING_APHIDS;
+    if (Math.hypot(a.x - ant.x, a.y - ant.y) < 9) {
+      // milk it: the droplet becomes the ant's load
+      const drop = Math.min(10, a.honeydew);
+      a.honeydew -= drop;
+      a.tenderId = null;
+      ant.payload = PayloadType.HONEYDEW;
+      ant.payloadValue = drop;
+      ant.recruitFoodPos = { x: a.x, y: a.y };
+      this.busy(ant, AntTask.TENDING_APHIDS, 2.2);
+      return true;
+    }
+    this.goTo(ant, a.x, a.y);
+    return true;
+  }
+
+  // --- seed husking ------------------------------------------------------------------------------------------------
+  /** Harvester ants strip the husks off stored seeds and dump the chaff on the midden. */
+  private tryHuskSeed(ant: Ant): boolean {
+    const g = this.nearestChamber(ChamberType.GRANARY, ant.x, ant.y);
+    if (!g || !this.isInsideChamber(ant, g, 1.0)) return false;
+    const seed = this.foods.find((f) => f.storedInChamberId === g.id && f.type === PayloadType.SEED && !f.husked && f.amount > 4);
+    if (!seed) return false;
+    if (Math.hypot(seed.x - ant.x, seed.y - ant.y) > 9) {
+      ant.task = AntTask.HUSKING_SEED;
+      this.goTo(ant, seed.x, seed.y);
+      return true;
+    }
+    seed.husked = true;
+    this.spawnCrumbs(seed.x, seed.y - 2, '#c9a86a', 4);
+    this.busy(ant, AntTask.HUSKING_SEED, 3);
+    ant.payload = PayloadType.CHAFF;
+    ant.payloadValue = 0;
+    return true;
+  }
+
+  private carryChaff(ant: Ant): void {
+    ant.task = AntTask.CARRYING_CHAFF;
+    const d = this.go(ant, 'midden');
+    if (d <= 0.5 || (this.isOutside(ant.x, ant.y) && Math.abs(ant.x - this.middenPos.x) < 26)) {
+      this.spawnCrumbs(ant.x, ant.y, '#c9a86a', 3);
+      ant.payload = PayloadType.NONE;
+      ant.task = AntTask.FORAGING_SCOUT;
+      this.stopMoving(ant);
+    }
+  }
+
+  // --- repletes ----------------------------------------------------------------------------------------------------
+  /**
+   * Honeypot repletes: a few workers hang still in the granary and act as living storage jars, swelling with
+   * liquid food when the colony has a surplus and regurgitating it back when stores run short.
+   */
+  private stepRepletes(dt: number): void {
+    this.repleteTimer -= dt;
+    if (this.repleteTimer > 0) return;
+    this.repleteTimer = 4;
+    const g = this.getChamber(ChamberType.GRANARY);
+    if (!g) return;
+    const repletes = this.ants.filter((a) => a.replete !== undefined);
+    const workers = this.ants.filter((a) => a.caste === AntCaste.WORKER || a.caste === AntCaste.NURSE).length;
+    const want = workers >= 40 ? Math.min(6, Math.floor(workers * 0.05)) : 0;
+    if (repletes.length < want && this.storedFoodCache > 140) {
+      // recruit a young, idle nurse: repletes are chosen while still soft-bodied enough to stretch
+      let pick: Ant | null = null;
+      for (const a of this.ants) {
+        if (a.caste !== AntCaste.NURSE || a.payload !== PayloadType.NONE || a.targetId != null || a.carriedById != null) continue;
+        if (!pick || a.age < pick.age) pick = a;
+      }
+      if (pick) {
+        pick.replete = 0;
+        pick.task = AntTask.REPLETE;
+        this.stopMoving(pick);
+        this.log('A young worker becomes a replete: a living honeypot for the granary', 'good');
+      }
+    }
+    const piles = this.foods.filter((f) => f.storedInChamberId === g.id && f.type !== PayloadType.SEED);
+    if (this.storedFoodCache > 160 && piles.length > 0) {
+      // surplus liquid food is pumped into the emptiest replete
+      const r = repletes.filter((a) => (a.replete ?? 0) < 1).sort((a, b) => (a.replete ?? 0) - (b.replete ?? 0))[0];
+      const pile = piles.reduce((a, b) => (a.amount > b.amount ? a : b));
+      if (r && pile.amount > 6) {
+        pile.amount -= 6;
+        r.replete = Math.min(1, (r.replete ?? 0) + 0.08);
+      }
+    } else if (this.storedFoodCache < 25) {
+      // lean times: repletes regurgitate their stores back into the granary
+      const r = repletes.filter((a) => (a.replete ?? 0) > 0.05).sort((a, b) => (b.replete ?? 0) - (a.replete ?? 0))[0];
+      if (r) {
+        r.replete = Math.max(0, (r.replete ?? 0) - 0.1);
+        this.dropFoodAt(r.x, r.y + 3, PayloadType.HONEYDEW, 7.5);
+        const f = this.foods[this.foods.length - 1];
+        if (f && f.type === PayloadType.HONEYDEW) f.storedInChamberId = g.id;
+        r.task = AntTask.TROPHALLAXIS;
+        r.stateTimer = 2;
+      }
+    }
+  }
+
+  private stepReplete(ant: Ant, dt: number): void {
+    const g = this.nearestChamber(ChamberType.GRANARY, ant.x, ant.y);
+    ant.hunger = Math.max(0, ant.hunger - dt * 0.2); // feeds itself from its own crop
+    if (g && !this.isInsideChamber(ant, g, 0.7)) {
+      ant.task = AntTask.REPLETE;
+      this.go(ant, 'granary');
+      this.moveAnt(ant, dt * 0.5);
+      return;
+    }
+    ant.stateTimer -= dt;
+    if (ant.task === AntTask.TROPHALLAXIS && ant.stateTimer > 0) return;
+    // hang from the granary ceiling, barely moving
+    ant.task = AntTask.REPLETE;
+    this.stopMoving(ant);
+    ant.vx = 0;
+    ant.vy = 0;
+  }
+
+  // --- cooperative transport ---------------------------------------------------------------------------------------
+  /** A big carcass is too heavy for one ant: several grip it and drag it home together. */
+  private tryGroupTransport(ant: Ant): boolean {
+    let prey: FoodSource | null = null;
+    let bestD = 160;
+    for (const f of this.foods) {
+      if (!f.large || f.storedInChamberId !== null || f.falling) continue;
+      const d = Math.abs(f.x - ant.x) + Math.abs(f.y - ant.y) * 2;
+      if (d < bestD) {
+        bestD = d;
+        prey = f;
+      }
+    }
+    if (!prey) return false;
+    const p = prey as FoodSource;
+    const carriers = this.ants.filter((a) => a.targetId === p.id && a.task === AntTask.GROUP_TRANSPORT && a.id !== ant.id);
+    if (carriers.length >= 4) return false;
+    ant.task = AntTask.GROUP_TRANSPORT;
+    if (Math.hypot(p.x - ant.x, p.y - ant.y) < p.radius + 6) {
+      ant.targetId = p.id;
+      this.stopMoving(ant);
+    } else this.goTo(ant, p.x, p.y - 1);
+    return true;
+  }
+
+  private stepGroupTransport(dt: number): void {
+    for (const f of this.foods) {
+      if (!f.large || f.storedInChamberId !== null || f.falling) continue;
+      const team = this.ants.filter((a) => a.targetId === f.id && a.task === AntTask.GROUP_TRANSPORT && a.carriedById == null);
+      if (team.length === 0) continue;
+      const home = Math.abs(f.x - this.entrancePos.x) < Math.abs(f.x - SIDE_ENTRANCE_X) ? this.entrancePos.x : SIDE_ENTRANCE_X;
+      const dir = Math.sign(home - f.x);
+      // one ant alone just tugs on it; two or more make headway, faster the more help there is
+      const speed = team.length >= 2 ? 5 + team.length * 3.5 : 0;
+      f.x += dir * speed * dt * this.activityAt(f.x, f.y);
+      f.y = this.surfaceTarget(f.x).y - 2;
+      team.forEach((a, k) => {
+        const ang = (k / Math.max(1, team.length)) * Math.PI * 2 + 0.5;
+        a.x = f.x + Math.cos(ang) * (f.radius + 2.5);
+        a.y = Math.min(f.y + 2, f.y + Math.sin(ang) * 3);
+        a.angle = Math.atan2(f.y - a.y, f.x - a.x);
+        a.vx = dir * speed;
+        a.vy = 0;
+      });
+      if (Math.abs(f.x - home) < CRATER_MAIN + 4) {
+        // at the entrance it is cut up into loads one ant can carry down
+        const pieces = Math.max(2, Math.round(f.amount / 20));
+        for (let k = 0; k < pieces; k++) this.dropFoodAt(home + (Math.random() - 0.5) * 14, f.y, PayloadType.PROTEIN, f.amount / pieces);
+        f.amount = 0;
+        for (const a of team) {
+          a.targetId = null;
+          a.task = AntTask.FORAGING_SCOUT;
+        }
+        this.log('A team dragged a large insect home and is cutting it up', 'good');
+      }
+    }
+  }
+
+  // --- eclosion help -----------------------------------------------------------------------------------------------
+  /** Callows can't free themselves easily: nurses chew open the cocoon and pull the new adult out. */
+  private tryHelpEclosion(b: BroodItem, dt: number): boolean {
+    b.ecloseWait = (b.ecloseWait ?? 0) + dt;
+    if (b.ecloseWait < 27) {
+      let helper: Ant | null = null;
+      this.forAntsNear(b.x, b.y, 14, (a) => {
+        if (a.caste === AntCaste.NURSE && a.payload === PayloadType.NONE && a.replete === undefined && (!BUSY_TASKS.has(a.task) || a.task === AntTask.GROOMING)) {
+          helper = a;
+          return true;
+        }
+      });
+      if (helper) {
+        const h = helper as Ant;
+        this.busy(h, AntTask.HELPING_ECLOSION, 2.6);
+        h.angle = Math.atan2(b.y - h.y, b.x - h.x);
+        b.ecloseWait = 27.4; // freed in ~2.6 s of chewing and pulling
+      }
+    }
+    // with help it is out in moments; alone it struggles for half a minute
+    return b.ecloseWait >= 30;
+  }
+
+  // --- rescue ------------------------------------------------------------------------------------------------------
+  /** Buries an ant standing under a cave-in; nestmates hear it and dig it out (Cataglyphis-style rescue). */
+  private buryAntsAt(gx: number, gy: number): void {
+    const wx = (gx + 0.5) * CELL_SIZE;
+    const wy = (gy + 0.5) * CELL_SIZE;
+    this.forAntsNear(wx, wy, 8, (a) => {
+      if (a.caste === AntCaste.QUEEN || a.buried !== undefined || a.carriedById != null || this.isAlate(a)) return;
+      this.releasePayload(a);
+      this.unlinkAnt(a);
+      a.buried = 45;
+      a.task = AntTask.BURIED;
+      this.stopMoving(a);
+      this.log('A worker is buried by the cave-in: nestmates rush to dig it out', 'danger');
+      return true;
+    });
+  }
+
+  /** Returns false if the ant suffocated (and was removed). */
+  private stepBuried(ant: Ant, index: number, dt: number): boolean {
+    ant.buried = (ant.buried ?? 0) - dt;
+    ant.task = AntTask.BURIED;
+    ant.vx = 0;
+    ant.vy = 0;
+    const g = this.grid.worldToGrid(ant.x, ant.y);
+    const free = this.grid.isNavigable(g.gx, g.gy);
+    if (free) {
+      ant.buried = undefined;
+      ant.task = AntTask.GROOMING;
+      ant.stateTimer = 3;
+      return true;
+    }
+    if (ant.buried <= 0) {
+      this.killAnt(index, 'buried');
+      return false;
+    }
+    // trapped ants emit a distress signal that draws nestmates
+    this.grid.depositPheromone(this.grid.alarmPheromone, ant.x, ant.y, 0.15 * dt * 10, 1);
+    let rescuers = 0;
+    this.forAntsNear(ant.x, ant.y, 70, (m) => {
+      if (rescuers >= 3) return true;
+      if (m.id === ant.id || m.caste === AntCaste.QUEEN || this.isAlate(m) || m.buried !== undefined || m.carriedById != null) return;
+      if (m.payload !== PayloadType.NONE || m.replete !== undefined) return;
+      if (BUSY_TASKS.has(m.task) && m.task !== AntTask.IDLE) return;
+      rescuers++;
+      if (m.task !== AntTask.RESCUING) {
+        m.task = AntTask.RESCUING;
+        m.targetId = ant.id;
+        m.stateTimer = 2.5 + Math.random();
+      }
+    });
+    return true;
+  }
+
+  /** Rescuers walk to the buried ant and dig away the soil pinning it. */
+  private stepRescuer(ant: Ant, dt: number): boolean {
+    if (ant.task !== AntTask.RESCUING) return false;
+    const victim = this.antById(ant.targetId);
+    if (!victim || victim.buried === undefined) {
+      ant.task = AntTask.FORAGING_SCOUT;
+      ant.targetId = null;
+      return false;
+    }
+    if (Math.hypot(victim.x - ant.x, victim.y - ant.y) > 11) {
+      const vg = this.grid.worldToGrid(victim.x, victim.y);
+      const open = this.grid.findNearestNavigable(vg.gx, vg.gy, 6);
+      if (!open) {
+        ant.task = AntTask.FORAGING_SCOUT;
+        ant.targetId = null;
+        return false;
+      }
+      const w = this.grid.gridToWorld(open.gx, open.gy);
+      if (!ant.targetPos || Math.abs(ant.targetPos.x - w.x) + Math.abs(ant.targetPos.y - w.y) > 4) this.goTo(ant, w.x, w.y);
+      this.moveAnt(ant, dt);
+      if (Math.hypot(w.x - ant.x, w.y - ant.y) > 4) return true;
+    }
+    // dig and pull
+    this.stopMoving(ant);
+    ant.angle = Math.atan2(victim.y - ant.y, victim.x - ant.x);
+    ant.stateTimer -= dt;
+    if (Math.random() < dt * 3) this.spawnCrumbs(victim.x, victim.y, '#4a3828', 1);
+    if (ant.stateTimer <= 0) {
+      const vg = this.grid.worldToGrid(victim.x, victim.y);
+      for (let k = 0; k < 9; k++) {
+        const cx = vg.gx + (k % 3) - 1;
+        const cy = vg.gy + Math.floor(k / 3) - 1;
+        if (!this.grid.inBounds(cx, cy)) continue;
+        const i = this.grid.idx(cx, cy);
+        if (this.canExcavate(i) && (k === 4 || this.digPlan[i] === 2)) {
+          this.grid.setTerrain(cx, cy, CellType.TUNNEL);
+          this.digPlan[i] = 0;
+        }
+      }
+      this.counters.rescues++;
+      this.log('Nestmates dug a buried worker out alive', 'good');
+      ant.task = AntTask.GROOMING;
+      ant.stateTimer = 1.5;
+      ant.targetId = null;
+    }
+    return true;
+  }
+
+  // --- social carrying of injured nestmates ------------------------------------------------------------------------
+  private tryCarryInjured(ant: Ant): boolean {
+    if (ant.payload !== PayloadType.NONE || ant.carryingAntId != null || this.intruders.length > 0) return false;
+    let hurt: Ant | null = null;
+    this.forAntsNear(ant.x, ant.y, 40, (m) => {
+      if (m.id === ant.id || m.caste === AntCaste.QUEEN || this.isAlate(m) || m.carriedById != null || m.buried !== undefined) return;
+      if ((m.hp ?? 24) < (m.maxHp ?? 24) * 0.4 && this.isOutside(m.x, m.y) && m.task !== AntTask.CARRYING_NESTMATE) {
+        hurt = m;
+        return true;
+      }
+    });
+    if (!hurt) return false;
+    const h = hurt as Ant;
+    ant.task = AntTask.CARRYING_NESTMATE;
+    if (Math.hypot(h.x - ant.x, h.y - ant.y) < 8) {
+      this.releasePayload(h);
+      this.unlinkAnt(h);
+      h.carriedById = ant.id;
+      h.task = AntTask.BEING_CARRIED;
+      ant.carryingAntId = h.id;
+      this.stopMoving(ant);
+    } else this.goTo(ant, h.x, h.y);
+    return true;
+  }
+
+  /** Returns true while the ant is busy carrying a nestmate. */
+  private stepCarryingNestmate(ant: Ant): boolean {
+    if (ant.carryingAntId == null) return false;
+    const h = this.antById(ant.carryingAntId);
+    if (!h) {
+      ant.carryingAntId = null;
+      return false;
+    }
+    ant.task = AntTask.CARRYING_NESTMATE;
+    const d = this.go(ant, 'granary');
+    if (d <= 0.5 || (!this.isOutside(ant.x, ant.y) && d < 6)) {
+      h.carriedById = null;
+      h.x = ant.x + Math.cos(ant.angle) * 5;
+      h.y = ant.y;
+      this.busy(h, AntTask.IDLE, 25);
+      ant.carryingAntId = null;
+      ant.task = AntTask.FORAGING_SCOUT;
+    }
+    return true;
+  }
+
+  private stepCarried(ant: Ant): void {
+    const c = this.antById(ant.carriedById);
+    if (!c || c.carryingAntId !== ant.id) {
+      ant.carriedById = null;
+      return;
+    }
+    // carried in the mandibles, in front of the carrier's head
+    ant.x = c.x + Math.cos(c.angle) * 5;
+    ant.y = c.y + Math.sin(c.angle) * 5 - 1;
+    ant.angle = c.angle + Math.PI * 0.5;
+    ant.vx = c.vx;
+    ant.vy = c.vy;
+    ant.task = AntTask.BEING_CARRIED;
+  }
+
+  // --- trail clearing ----------------------------------------------------------------------------------------------
+  private stepDebris(dt: number): void {
+    // gusts and downpours scatter grit and bits of leaf across the ground
+    const blow = clamp((this.climate.windKmh - 18) / 30, 0, 1) + this.rainIntensity() * 0.5;
+    if (blow > 0 && this.debris.length < 8 && Math.random() < dt * 0.05 * blow) {
+      const x = CASE_LEFT + 60 + Math.random() * (CASE_RIGHT - CASE_LEFT - 120);
+      this.debris.push({ id: this.allocId(), x, y: this.surfaceTarget(x).y - 1, carriedById: null, size: 0.7 + Math.random() * 0.8 });
+    }
+    for (const d of this.debris) {
+      if (d.carriedById != null) {
+        const a = this.antById(d.carriedById);
+        if (!a || a.payload !== PayloadType.DEBRIS) d.carriedById = null;
+        else {
+          d.x = a.x + Math.cos(a.angle) * 4;
+          d.y = a.y + Math.sin(a.angle) * 4 - 1.5;
+        }
+      } else {
+        d.y = this.surfaceTarget(d.x).y - 1;
+      }
+    }
+  }
+
+  private trailStrength(x: number, y: number): number {
+    const g = this.grid.worldToGrid(x, y);
+    return this.grid.foodPheromone[this.grid.idx(g.gx, g.gy)] + this.grid.foodPheromone[this.grid.idx(g.gx, Math.max(0, g.gy - 1))];
+  }
+
+  /** Workers on a busy trail pick up obstacles and carry them off to the side. */
+  private tryClearTrail(ant: Ant): boolean {
+    if (ant.payload === PayloadType.DEBRIS) {
+      ant.task = AntTask.CLEARING_TRAIL;
+      const d = this.debris.find((dd) => dd.id === ant.payloadId);
+      const tx = ant.targetPos?.x ?? ant.x;
+      if (!d || Math.abs(ant.x - tx) < 6) {
+        if (d) {
+          d.carriedById = null;
+          d.x = ant.x;
+        }
+        ant.payload = PayloadType.NONE;
+        ant.payloadId = null;
+        ant.task = AntTask.FORAGING_SCOUT;
+        this.stopMoving(ant);
+      }
+      return true;
+    }
+    const d = this.debris.find((dd) => dd.carriedById == null && Math.abs(dd.x - ant.x) < 50 && this.trailStrength(dd.x, dd.y) > 0.08);
+    if (!d) return false;
+    ant.task = AntTask.CLEARING_TRAIL;
+    if (Math.abs(d.x - ant.x) < 6) {
+      d.carriedById = ant.id;
+      ant.payload = PayloadType.DEBRIS;
+      ant.payloadId = d.id;
+      // haul it off the trail: whichever side has less scent
+      const off = this.trailStrength(d.x - 45, d.y) < this.trailStrength(d.x + 45, d.y) ? -45 : 45;
+      const t = this.surfaceTarget(clamp(d.x + off, CASE_LEFT + 30, CASE_RIGHT - 30));
+      this.goTo(ant, t.x, t.y);
+    } else {
+      const t = this.surfaceTarget(d.x);
+      this.goTo(ant, t.x, t.y);
+    }
+    return true;
+  }
+
+  // --- famine responses --------------------------------------------------------------------------------------------
+  /** Starving colonies recycle their own eggs: nurses eat them to stay alive (real colonies do this routinely). */
+  private tryCannibalizeEgg(ant: Ant): boolean {
+    if (this.storedFoodCache > 2 || ant.hunger < 85) return false;
+    const egg = this.brood.find((b) => b.stage === BroodStage.EGG && b.carriedByAntId === null && Math.hypot(b.x - ant.x, b.y - ant.y) < 40);
+    if (!egg) return false;
+    if (Math.hypot(egg.x - ant.x, egg.y - ant.y) < 9) {
+      this.brood.splice(this.brood.indexOf(egg), 1);
+      ant.hunger = Math.max(0, ant.hunger - 45);
+      this.busy(ant, AntTask.CANNIBALIZING, 2);
+      if (this.simTime - this.lastFamineLog > 60) {
+        this.lastFamineLog = this.simTime;
+        this.log('Famine: nurses are eating eggs to survive', 'danger');
+      }
+    } else {
+      ant.task = AntTask.CANNIBALIZING;
+      this.approachBrood(ant, egg);
+    }
+    return true;
+  }
+
+  /** Trophic eggs are fed straight to hungry larvae. Returns true if the nurse took one. */
+  private tryFeedTrophicEgg(ant: Ant): boolean {
+    const egg = this.brood.find((b) => b.trophic && b.carriedByAntId === null && !this.claimedBrood.has(b.id));
+    if (!egg) return false;
+    const larva = this.hungriestLarva(ant, 60);
+    if (!larva) return false;
+    this.claimedBrood.add(egg.id);
+    ant.task = AntTask.FEEDING_LARVA;
+    if (Math.hypot(egg.x - ant.x, egg.y - ant.y) < 9) {
+      this.brood.splice(this.brood.indexOf(egg), 1);
+      ant.payload = PayloadType.PROTEIN;
+      ant.payloadValue = 3;
+      ant.targetId = larva.id;
+      this.claimedBrood.add(larva.id);
+    } else this.approachBrood(ant, egg);
+    return true;
+  }
+
+  /** In a queenless colony some workers' ovaries develop and they lay unfertilised (male) eggs. */
+  private stepQueenless(dt: number): void {
+    if (this.getQueen()) return;
+    this.queenlessTimer -= dt;
+    if (this.queenlessTimer > 0) return;
+    this.queenlessTimer = 90 + Math.random() * 60;
+    const nursery = this.chambers.find((c) => c.type === ChamberType.NURSERY);
+    const layer = this.ants.find((a) => a.caste === AntCaste.NURSE && a.payload === PayloadType.NONE);
+    if (!nursery || !layer || this.brood.length >= MAX_BROOD || this.storedFoodCache < 20) return;
+    const egg = this.makeBrood(BroodStage.EGG, layer.x, layer.y, nursery.id, 0, 100);
+    egg.sexual = 'male';
+    this.brood.push(egg);
+    this.busy(layer, AntTask.LAYING_EGG, 1.6);
+    this.log('Queenless workers have begun laying male eggs');
+  }
+
+  // --- alates & the nuptial flight ---------------------------------------------------------------------------------
+  /** Should the next pupa-to-be be reared as a winged sexual? Only big, well-fed colonies in the warm season. */
+  private wantSexual(): 'gyne' | 'male' | null {
+    if (!this.getQueen()) return null;
+    if (this.season !== 'Summer' && this.season !== 'Spring') return null;
+    if (this.ants.length < 55 || this.storedFoodCache < 60) return null;
+    const alates = this.ants.filter((a) => this.isAlate(a)).length + this.brood.filter((b) => b.sexual).length;
+    if (alates >= 8) return null;
+    if (Math.random() > 0.3) return null;
+    return Math.random() < 0.4 ? 'gyne' : 'male';
+  }
+
+  private flightWeather(): boolean {
+    // the classic trigger: a warm, humid, calm day just after rain
+    return (
+      this.forageWeather() &&
+      this.wetness > 0.12 &&
+      this.surfaceTempC >= 18 &&
+      this.climate.windKmh < 20 &&
+      this.climate.humidity > 0.55 &&
+      this.daylight() > 0.35
+    );
+  }
+
+  private stepNuptialFlight(dt: number): void {
+    const alates = this.ants.filter((a) => this.isAlate(a) && !a.flying);
+    if (alates.length === 0) {
+      this.swarming = false;
+      return;
+    }
+    const waitedLong = alates.some((a) => a.age > 900) && this.forageWeather() && this.surfaceTempC >= 20 && this.daylight() > 0.4;
+    if (!this.swarming && alates.length >= 2 && (this.flightWeather() || waitedLong)) {
+      this.swarming = true;
+      this.log('Nuptial flight! Winged queens and males pour out of the nest', 'good');
+    }
+    if (this.swarming && !this.forageWeather()) this.swarming = false;
+  }
+
+  private stepAlate(ant: Ant, dt: number): void {
+    if (ant.hunger > 70 && this.storedFoodCache > 3) {
+      this.goEat(ant);
+      return;
+    }
+    if (!this.swarming) {
+      // wait in the upper chambers, fed by workers, until the weather is right
+      ant.task = AntTask.WAITING_TO_SWARM;
+      ant.stateTimer -= dt;
+      if (ant.stateTimer <= 0) this.seekRest(ant, 'granary', 10 + Math.random() * 20);
+      return;
+    }
+    ant.task = AntTask.NUPTIAL_FLIGHT;
+    if (!this.isOutside(ant.x, ant.y)) {
+      this.go(ant, 'surface');
+      return;
+    }
+    // climb to a high point (a grass blade or the mound top) and take off
+    if (ant.targetId == null) {
+      const s = this.sprouts.length ? this.sprouts[Math.floor(Math.random() * this.sprouts.length)] : null;
+      ant.targetId = -1;
+      const tx = s && Math.abs(s.x - ant.x) < 200 ? s.x : ant.x + (Math.random() - 0.5) * 60;
+      const t = this.surfaceTarget(tx);
+      this.goTo(ant, t.x, t.y);
+      ant.stateTimer = 8 + Math.random() * 8;
+    }
+    ant.stateTimer -= dt;
+    const arrived = !ant.targetPos || Math.hypot(ant.targetPos.x - ant.x, ant.targetPos.y - ant.y) < 6;
+    if (arrived || ant.stateTimer <= 0) {
+      ant.flying = true;
+      ant.vx = (Math.random() - 0.5) * 20;
+      ant.vy = -30 - Math.random() * 15;
+      this.stopMoving(ant);
+    }
+  }
+
+  /** Returns false when the alate has flown out of the case (and was removed). */
+  private stepFlying(ant: Ant, index: number, dt: number): boolean {
+    ant.task = AntTask.NUPTIAL_FLIGHT;
+    ant.vx += (this.windStrength * 30 - ant.vx) * dt * 0.8 + (Math.random() - 0.5) * 60 * dt;
+    ant.vy += (-36 - ant.vy) * dt * 1.5;
+    ant.x += ant.vx * dt;
+    ant.y += ant.vy * dt;
+    ant.angle = Math.atan2(ant.vy, ant.vx);
+    ant.gaitPhase += dt * 40;
+    if (ant.y < CASE_TOP + 6 || ant.x < CASE_LEFT + 4 || ant.x > CASE_RIGHT - 4) {
+      this.unlinkAnt(ant);
+      this.ants.splice(index, 1);
+      this.counters.flights++;
+      return false;
+    }
+    return true;
+  }
+
+  // --- overwintering & weather shelter -----------------------------------------------------------------------------
+  /** In the cold the whole colony packs together deep in the nest around the queen and barely moves. */
+  private tryCluster(ant: Ant): boolean {
+    if (this.nestTempC >= 8 && !(this.season === 'Winter' && this.surfaceTempC < 6)) return false;
+    if (ant.caste === AntCaste.SOLDIER && ant.id % 3 === 0) return false; // a few guards stay posted
+    if (ant.caste === AntCaste.NURSE) return false; // nurses stay with the (now dormant) brood
+    if (ant.payload !== PayloadType.NONE) return false;
+    ant.task = AntTask.CLUSTERING;
+    const d = this.go(ant, 'royal');
+    if (d <= 0.5 || d >= INF) this.busy(ant, AntTask.IDLE, 30 + Math.random() * 40);
+    return true;
+  }
+
+  /** Plug the entrances while it storms or snows, and dig them open again once it's fine. */
+  private stepEntranceSealing(dt: number): void {
+    const bad = this.rainIntensity() >= 0.55 || this.weather === 'Snow' || this.surfaceTempC < 3;
+    this.sealTimer += bad ? dt : -dt;
+    this.sealTimer = clamp(this.sealTimer, -60, 60);
+    if (!this.sealed && this.sealTimer > 40) {
+      // only once every forager is home
+      if (this.ants.some((a) => this.isOutside(a.x, a.y) && a.caste !== AntCaste.QUEEN && !a.flying)) return;
+      for (const ex of [this.entrancePos.x, SIDE_ENTRANCE_X]) {
+        for (let n = 0; n < 2; n++) {
+          const i = this.findEntrancePlugCell(ex);
+          if (i < 0) break;
+          this.grid.setTerrain(i % GRID_W, Math.floor(i / GRID_W), CellType.TOPSOIL);
+          this.sealedCells.push(i);
+        }
+      }
+      if (this.sealedCells.length) {
+        this.sealed = true;
+        this.log('Workers plug the entrances with soil against the weather');
+        const sealer = this.ants.find((a) => a.caste === AntCaste.EXCAVATOR);
+        if (sealer) this.busy(sealer, AntTask.SEALING_ENTRANCE, 3);
+      }
+    } else if (this.sealed && this.sealTimer < -20) {
+      this.sealed = false;
+      for (const i of this.sealedCells) if (this.canExcavate(i)) this.digPlan[i] = 2;
+      this.sealedCells = [];
+      this.fieldDirty.dig = true;
+      this.log('Fair weather: excavators reopen the entrances');
     }
   }
 
@@ -2580,13 +3761,23 @@ export class AntColonySimulation {
       this.carryRefuse(ant);
       return;
     }
+    if (ant.payload === PayloadType.CHAFF) {
+      this.carryChaff(ant);
+      return;
+    }
+    if (ant.payload === PayloadType.DEBRIS) {
+      this.tryClearTrail(ant);
+      return;
+    }
 
     if (isFoodPayload(ant.payload)) {
       ant.task = AntTask.RETURNING_WITH_FOOD;
       if (onSurface && ant.pheromoneDropTimer <= 0) {
         ant.pheromoneDropTimer = 0.12;
-        // successful foragers mark the way back so nestmates can follow it out
-        this.grid.depositPheromone(this.grid.foodPheromone, ant.x, ant.y, ant.recruitFoodPos ? 0.6 : 0.25, 1);
+        // successful foragers mark the way back so nestmates can follow it out; the richer the find
+        // (sugary honeydew > fresh protein > seeds), the stronger the trail and the faster it builds
+        const quality = ant.payload === PayloadType.HONEYDEW ? 1.3 : ant.payload === PayloadType.PROTEIN ? 1.1 : 0.8;
+        this.grid.depositPheromone(this.grid.foodPheromone, ant.x, ant.y, (ant.recruitFoodPos ? 0.6 : 0.25) * quality, 1);
       }
       const d = this.go(ant, 'granary');
       const g = this.nearestChamber(ChamberType.GRANARY, ant.x, ant.y);
@@ -2620,8 +3811,10 @@ export class AntColonySimulation {
         this.seekRest(ant, 'granary', 8 + Math.random() * 14);
         return;
       }
+      // harvester work: strip husks off stored seeds
+      if (ant.id % 4 === 1 && this.tryHuskSeed(ant)) return;
       // pick up any food lying inside the nest (e.g. a dead intruder) on the way
-      const loose = this.foods.find((f) => f.storedInChamberId === null && !f.falling && f.amount > 1 && Math.abs(f.x - ant.x) < 28 && Math.abs(f.y - ant.y) < 16);
+      const loose = this.foods.find((f) => f.storedInChamberId === null && !f.falling && !f.large && f.amount > 1 && Math.abs(f.x - ant.x) < 28 && Math.abs(f.y - ant.y) < 16);
       if (loose) {
         if (this.tryPickFood(ant, loose)) return;
         this.goTo(ant, loose.x, loose.y);
@@ -2652,6 +3845,13 @@ export class AntColonySimulation {
       return;
     }
 
+    // injured nestmates are carried home; big prey is dragged home by a team; trails are kept clear
+    if (this.tryCarryInjured(ant)) return;
+    if (this.tryGroupTransport(ant)) return;
+    if (ant.id % 5 === 0 && this.tryClearTrail(ant)) return;
+    // a share of the foragers are herders that milk the colony's aphids
+    if (ant.id % 3 === 1 && this.tryTendAphids(ant)) return;
+
     if (ant.hydration < 55) {
       const drop = this.droplets.find((dd) => dd.settled && Math.abs(dd.x - ant.x) < 60 && Math.abs(dd.y - ant.y) < 20);
       if (drop) {
@@ -2671,7 +3871,7 @@ export class AntColonySimulation {
     let food: FoodSource | null = null;
     let bestD = 140;
     for (const f of this.foods) {
-      if (f.storedInChamberId !== null || f.falling || f.amount <= 1) continue;
+      if (f.storedInChamberId !== null || f.falling || f.large || f.amount <= 1) continue;
       const d = Math.abs(f.x - ant.x) + Math.abs(f.y - ant.y) * 2;
       if (d < bestD) {
         bestD = d;
@@ -2787,6 +3987,8 @@ export class AntColonySimulation {
         return recruited >= 6;
       });
       this.busy(ant, AntTask.SIGNALING_FOOD, 1.6);
+      // ...and sometimes personally leads one of them out there in a tandem run
+      if (Math.random() < 0.35) this.startTandem(ant);
     } else {
       ant.task = AntTask.FORAGING_SCOUT;
       this.stopMoving(ant);
@@ -2971,7 +4173,9 @@ export class AntColonySimulation {
       } else ant.targetId = null;
     }
 
-    // 4. choose a new errand
+    // 4. choose a new errand (famine first: eat eggs to survive, hand out trophic eggs)
+    if (this.tryCannibalizeEgg(ant)) return;
+    if (this.storedFoodCache < 20 && this.tryFeedTrophicEgg(ant)) return;
     const stray = this.brood.find((b) => b.carriedByAntId === null && !this.claimedBrood.has(b.id) && !this.inNursery(b) && (b.stage !== BroodStage.EGG || b.progress > 4));
     if (stray && this.bestNursery(ant)) {
       ant.targetId = stray.id;
@@ -3064,26 +4268,72 @@ export class AntColonySimulation {
     }
   }
 
+  /** Temperature at a point, by depth below the ground (sun-warmed near the top, soil-buffered deep down). */
+  public tempAt(x: number, y: number): number {
+    const gx = clamp(Math.floor(x / CELL_SIZE), 0, GRID_W - 1);
+    const depth = y - this.grid.surfaceY[gx];
+    if (depth < 20) return this.surfaceTempC;
+    if (depth < 120) return this.surfaceTempC + (this.nestTempC - this.surfaceTempC) * ((depth - 20) / 100);
+    return this.nestTempC;
+  }
+
+  private chamberFlooded(c: Chamber): boolean {
+    return this.floodDepth > 0 && c.y + c.ry * 0.3 > this.floodLineY();
+  }
+
+  /**
+   * Brood thermoregulation: real nurses shuttle brood up to shallow, sun-warmed chambers on cool sunny days and
+   * back down when the top of the nest overheats or cools at night. Brood is also carried above rising floodwater.
+   * Returns how well a chamber suits brood right now (lower is better), or Infinity if it is unusable.
+   */
+  private broodChamberCost(c: Chamber): number {
+    if (this.chamberFlooded(c)) return Infinity;
+    if (c.type !== ChamberType.NURSERY) {
+      // only when every nursery is under water does the brood go into whatever dry chamber is highest
+      if (c.type === ChamberType.MIDDEN) return Infinity;
+      const dryNursery = this.chambers.some((n) => n.type === ChamberType.NURSERY && !this.chamberFlooded(n));
+      return dryNursery ? Infinity : 40 + c.y * 0.01;
+    }
+    return Math.abs(this.tempAt(c.x, c.y) - 28) * 2;
+  }
+
+  private bestBroodCost = 0;
+  private bestBroodCostTimer = 0;
+
   private inNursery(b: BroodItem): boolean {
     const c = this.chambers.find((ch) => ch.id === b.chamberId);
-    if (!c || c.type !== ChamberType.NURSERY) return false;
+    if (!c) return false;
+    const cost = this.broodChamberCost(c);
+    if (cost === Infinity) return false;
+    // hysteresis: only move brood when another chamber is clearly (several degrees) better
+    if (cost > this.bestBroodCost + 8) return false;
     return Math.abs(b.x - c.x) < c.rx + 6 && Math.abs(b.y - c.y) < c.ry + 10;
   }
 
   private bestNursery(ant: Ant): Chamber | undefined {
-    // prefer the nearest nursery that isn't crowded
+    // prefer the nearest well-tempered, dry nursery that isn't crowded
     let best: Chamber | undefined;
     let bestScore = Infinity;
     for (const c of this.chambers) {
-      if (c.type !== ChamberType.NURSERY) continue;
+      const cost = this.broodChamberCost(c);
+      if (cost === Infinity || cost > this.bestBroodCost + 8) continue;
       const load = this.brood.reduce((n, b) => n + (b.chamberId === c.id ? 1 : 0), 0);
-      const score = Math.hypot(c.x - ant.x, c.y - ant.y) + load * 12;
+      const score = Math.hypot(c.x - ant.x, c.y - ant.y) + load * 12 + cost * 10;
       if (score < bestScore) {
         bestScore = score;
         best = c;
       }
     }
     return best;
+  }
+
+  private updateBroodClimate(dt: number): void {
+    this.bestBroodCostTimer -= dt;
+    if (this.bestBroodCostTimer > 0) return;
+    this.bestBroodCostTimer = 8;
+    let best = Infinity;
+    for (const c of this.chambers) best = Math.min(best, this.broodChamberCost(c));
+    this.bestBroodCost = best === Infinity ? 0 : best;
   }
 
   /** Reach a brood item: by flow field to its chamber, then straight to it. */
@@ -3177,7 +4427,9 @@ export class AntColonySimulation {
     const px = (pick % GRID_W) + 0.5;
     const py = Math.floor(pick / GRID_W) + 0.5;
     ant.angle = Math.atan2(py * CELL_SIZE - ant.y, px * CELL_SIZE - ant.x);
-    ant.stateTimer = 1.1 + Math.random() * 1.0;
+    // damp soil is soft and holds together: real colonies dig far more after rain; dry crumbly soil is slow going
+    const moist = this.grid.moisture[pick];
+    ant.stateTimer = (1.1 + Math.random() * 1.0) * (1.25 - Math.min(0.6, moist * 0.7));
     this.stopMoving(ant);
     // keep the EXCAVATING label while chewing so the renderer animates the mandibles
     ant.task = AntTask.EXCAVATING;
@@ -3300,7 +4552,7 @@ export class AntColonySimulation {
       return;
     }
     const onSurface = this.isOutside(ant.x, ant.y);
-    const guard = ant.id % 3 !== 0 && !(night && ant.id % 2 === 0);
+    const guard = ant.id % 3 !== 0 && !(night && ant.id % 2 === 0) && this.forageWeather();
     ant.task = AntTask.PATROLLING;
     ant.stateTimer -= dt;
     if (guard) {
@@ -3673,6 +4925,11 @@ export class AntColonySimulation {
         p.x += p.vx * dt;
         p.y += p.vy * dt;
         if (p.kind === 'crumb') p.vy += 80 * dt;
+        if (p.kind === 'snow') {
+          p.vx = this.windStrength * 12 + Math.sin(this.simTime * 1.7 + i) * 6;
+          const gx = clamp(Math.floor(p.x / CELL_SIZE), 0, GRID_W - 1);
+          if (p.y >= this.grid.surfaceY[gx] - 1 || p.x < CASE_LEFT + 6 || p.x > CASE_RIGHT - 6) p.life = p.maxLife;
+        }
         if (p.life >= p.maxLife) {
           this.particles.splice(i, 1);
         }
@@ -3772,6 +5029,21 @@ export class AntColonySimulation {
         dayCount: this.dayCount,
         weather: this.weather,
         weatherTimer: this.weatherTimer,
+        climate: this.climate,
+        liveWeather: this.liveWeather,
+        sunriseMin: this.sunriseMin,
+        sunsetMin: this.sunsetMin,
+        latitude: this.latitude,
+        nestTempC: this.nestTempC,
+        snowCover: this.snowCover,
+        floodDepth: this.floodDepth,
+        wetness: this.wetness,
+        foundedAt: this.foundedAt,
+        aphids: this.aphids,
+        debris: this.debris,
+        sealed: this.sealed,
+        sealedCells: this.sealedCells,
+        swarming: this.swarming,
         tunnelsDugCells: this.tunnelsDugCells,
         soilDeposited: this.soilDeposited,
         nextId: this.nextId,
@@ -3813,8 +5085,29 @@ export class AntColonySimulation {
       this.simTime = Number(data.simTime) || 0;
       this.timeOfDay = Number.isFinite(data.timeOfDay) ? data.timeOfDay : 0.3;
       this.dayCount = Number(data.dayCount) || 1;
-      this.weather = data.weather || 'Clear';
+      const known: WeatherCondition[] = ['Clear', 'Cloudy', 'Fog', 'Drizzle', 'Rain', 'Heavy Rain', 'Thunderstorm', 'Snow'];
+      this.weather = known.includes(data.weather) ? data.weather : 'Clear';
       this.weatherTimer = Number(data.weatherTimer) || 35;
+      if (data.climate && Number.isFinite(data.climate.tempC)) {
+        this.climate = { ...this.climate, ...data.climate };
+        this.climateGoal = { ...this.climate };
+      }
+      this.liveWeather = false; // re-confirmed by the next live reading (cached reading arrives on start)
+      if (Number.isFinite(data.sunriseMin) && Number.isFinite(data.sunsetMin)) {
+        this.sunriseMin = data.sunriseMin;
+        this.sunsetMin = data.sunsetMin;
+      }
+      if (Number.isFinite(data.latitude)) this.latitude = data.latitude;
+      if (Number.isFinite(data.nestTempC)) this.nestTempC = data.nestTempC;
+      this.snowCover = Number(data.snowCover) || 0;
+      this.floodDepth = Number(data.floodDepth) || 0;
+      this.wetness = Number(data.wetness) || 0;
+      if (Number.isFinite(data.foundedAt)) this.foundedAt = data.foundedAt;
+      if (Array.isArray(data.aphids)) this.aphids = data.aphids;
+      if (Array.isArray(data.debris)) this.debris = data.debris.map((d: Debris) => ({ ...d, carriedById: null }));
+      this.sealed = !!data.sealed;
+      this.sealedCells = Array.isArray(data.sealedCells) ? data.sealedCells : [];
+      this.swarming = !!data.swarming;
       this.tunnelsDugCells = Number(data.tunnelsDugCells) || 0;
       this.soilDeposited = Number(data.soilDeposited) || 0;
       this.nextId = Number(data.nextId) || 100000;

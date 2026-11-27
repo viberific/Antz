@@ -652,9 +652,15 @@ export class ColonyGrid {
     }
   }
 
-  public stepPheromonesAndMoisture(dt: number, weather: 'Clear' | 'Misty' | 'Light Rain'): void {
-    const foodDecay = Math.exp(-0.042 * dt);
-    const homeDecay = Math.exp(-0.024 * dt);
+  /**
+   * @param rain 0 (dry) .. ~1.2 (thunderstorm) rain intensity
+   * @param dryness 0..1: how fast trails evaporate (hot, dry, windy air) — 0 humid & still, 1 hot, dry, gusty
+   */
+  public stepPheromonesAndMoisture(dt: number, rain: number, fog: boolean, dryness: number): void {
+    // Rain washes scent trails away; dry, hot, windy air evaporates them faster; humid still air keeps them.
+    const trailK = 1 + dryness * 0.9 + rain * 2.2;
+    const foodDecay = Math.exp(-0.042 * trailK * dt);
+    const homeDecay = Math.exp(-0.024 * trailK * dt);
     const alarmDecay = Math.exp(-0.22 * dt);
     const digDecay = Math.exp(-0.012 * dt);
 
@@ -688,8 +694,8 @@ export class ColonyGrid {
     }
 
     // Subterranean moisture percolation & evaporation (subsampled per frame for speed)
-    const rainBonus = weather === 'Light Rain' ? 0.08 * dt : weather === 'Misty' ? 0.025 * dt : 0;
-    const evap = weather === 'Clear' ? 0.006 * dt : 0.0015 * dt;
+    const rainBonus = rain > 0 ? 0.1 * rain * dt : fog ? 0.025 * dt : 0;
+    const evap = rain > 0 || fog ? 0.0015 * dt : (0.003 + dryness * 0.008) * dt;
 
     for (let gx = 8; gx < GRID_W - 8; gx++) {
       const surfGy = Math.floor(this.surfaceY[gx] / CELL_SIZE);
