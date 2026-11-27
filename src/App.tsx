@@ -3,7 +3,7 @@ import { AntColonySimulation } from './sim/colony';
 import { RealWorld } from './sim/realworld';
 import { Formicarium3DRenderer } from './sim/renderer3d';
 import type { CameraMode } from './sim/camera2d';
-import { ArrowUpDown, BookOpen, Compass, Crosshair, Maximize2 } from 'lucide-react';
+import { ArrowUpDown, BookOpen, Compass, Footprints, Maximize2, X } from 'lucide-react';
 
 const CAPTIONS_KEY = 'formicarium_captions';
 
@@ -63,6 +63,22 @@ export default function App() {
       window.removeEventListener('pointerdown', wake);
       window.removeEventListener('pointermove', wake);
     };
+  }, []);
+
+  // desktop shortcuts: 1 / 2 / 3 camera modes, N notes, Esc stop following
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      const cam = renderer3dRef.current?.camCtl;
+      if (!cam) return;
+      if (e.key === '1') cam.setMode('overview');
+      else if (e.key === '2') cam.setMode('scan');
+      else if (e.key === '3') cam.setMode('drift');
+      else if (e.key === 'n' || e.key === 'N') setCaptions((c) => !c);
+      else if (e.key === 'Escape' && cam.mode === 'follow') cam.resume();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
   }, []);
 
   useEffect(() => {
@@ -201,36 +217,36 @@ export default function App() {
     <main className="fixed inset-0 overflow-hidden bg-black">
       <div
         data-rotated={portrait ? '1' : '0'}
-        className="absolute left-0 top-0"
+        className="stage absolute left-0 top-0"
         style={
           portrait
             ? { width: vp.h, height: vp.w, transform: 'rotate(90deg) translateY(-100%)', transformOrigin: 'top left' }
             : { width: vp.w, height: vp.h }
         }
       >
-        <div ref={mountRef} className="w-full h-full touch-none" aria-label="Ant colony in a glass formicarium" />
+        <div ref={mountRef} className="w-full h-full touch-none cursor-grab active:cursor-grabbing" aria-label="Ant colony in a glass formicarium" />
         <div className="hud" data-idle={hudIdle ? '1' : '0'}>
           {mode === 'follow' && (
             <div className="hud-group">
-              <button className="hud-btn" aria-pressed="true" onClick={() => renderer3dRef.current?.camCtl.resume()} title="Stop following this ant">
-                <Crosshair /> Following · release
+              <button className="hud-btn" aria-pressed="true" onClick={() => renderer3dRef.current?.camCtl.resume()} title="Stop following (Esc)">
+                <Footprints /> <span className="hud-label">Following</span> <X />
               </button>
             </div>
           )}
           <div className="hud-group" role="group" aria-label="Camera">
-            <button className="hud-btn" aria-pressed={mode === 'overview'} onClick={() => renderer3dRef.current?.camCtl.setMode('overview')} title="Whole farm">
-              <Maximize2 /> Whole
+            <button className="hud-btn" aria-pressed={mode === 'overview'} onClick={() => renderer3dRef.current?.camCtl.setMode('overview')} title="Whole farm (1)">
+              <Maximize2 /> <span className="hud-label">Whole</span>
             </button>
-            <button className="hud-btn" aria-pressed={mode === 'scan'} onClick={() => renderer3dRef.current?.camCtl.setMode('scan')} title="Full width, sweeping down the nest. Drag up or down to look yourself.">
-              <ArrowUpDown /> Scan
+            <button className="hud-btn" aria-pressed={mode === 'scan'} onClick={() => renderer3dRef.current?.camCtl.setMode('scan')} title="Scan: full width, sweeping down the nest. Drag up or down to look yourself (2)">
+              <ArrowUpDown /> <span className="hud-label">Scan</span>
             </button>
-            <button className="hud-btn" aria-pressed={mode === 'drift'} onClick={() => renderer3dRef.current?.camCtl.setMode('drift')} title="Glide to wherever the colony is busiest">
-              <Compass /> Drift
+            <button className="hud-btn" aria-pressed={mode === 'drift'} onClick={() => renderer3dRef.current?.camCtl.setMode('drift')} title="Drift: glide to wherever the colony is busiest (3)">
+              <Compass /> <span className="hud-label">Drift</span>
             </button>
           </div>
           <div className="hud-group">
-            <button className="hud-btn" aria-pressed={captions} onClick={() => setCaptions((c) => !c)} title="Field-note captions">
-              <BookOpen /> Notes
+            <button className="hud-btn" aria-pressed={captions} onClick={() => setCaptions((c) => !c)} title="Field notes (N)">
+              <BookOpen /> <span className="hud-label">Notes</span>
             </button>
           </div>
         </div>

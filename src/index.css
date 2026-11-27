@@ -60,15 +60,11 @@
   --accent: #e9c46a;
 }
 .an-svg .an-leader,
-.an-svg .an-ring circle:first-child,
-.an-svg .an-ring line {
+.an-svg .an-ring circle {
   stroke: var(--accent);
   filter: drop-shadow(0 0 2px rgba(0, 0, 0, 0.9));
 }
-.an-svg .an-ring-dot {
-  fill: var(--accent);
-}
-.an-svg .an-ring circle:first-child {
+.an-svg .an-ring circle {
   animation: an-pulse 2.4s ease-in-out infinite;
 }
 @keyframes an-pulse {
@@ -218,4 +214,17 @@
 .hud-btn svg {
   width: 14px;
   height: 14px;
+}
+
+/* the stage is rotated on portrait phones, so size the controls by the stage, not the viewport */
+.stage {
+  container-type: size;
+}
+@container (max-width: 680px) {
+  .hud-label {
+    display: none;
+  }
+  .hud-btn {
+    padding: 0 9px;
+  }
 }

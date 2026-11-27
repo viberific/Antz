@@ -81,6 +81,8 @@ const _tfOut = {
 const _dummy = new THREE.Object3D();
 const _pick = new THREE.Vector3();
 const _loc = new THREE.Vector3();
+const FIREFLY_MAX = 40;
+const LEAF_MAX = 26;
 // Keep bodies (and the head/tail probes) clear of the cut side faces of the soil block
 const EDGE_L = CASE_LEFT + 28;
 const EDGE_R = CASE_RIGHT - 28;
@@ -178,8 +180,11 @@ export class Formicarium3DRenderer {
   private moonCanvas!: HTMLCanvasElement;
   private moonTex!: THREE.CanvasTexture;
   private moonKey = -1;
-  private fireflies!: THREE.InstancedMesh;
+  private fireflies!: THREE.Points;
+  private flyTex!: THREE.CanvasTexture;
   private fireflyLevel = 0;
+  /** 0 at night .. 1 at noon (from the lighting pass) */
+  private daylight = 1;
   private autumnLeaves!: THREE.InstancedMesh;
   private leafLevel = 0;
 
@@ -405,21 +410,51 @@ export class Formicarium3DRenderer {
     this.scene.add(this.moon);
     this.instancedGeos.push(moonGeo);
 
-    const flyGeo = new THREE.IcosahedronGeometry(0.03, 1);
-    const flyMat = new THREE.MeshBasicMaterial({ color: 0xd9ff6e, transparent: true, opacity: 0.95, blending: THREE.AdditiveBlending, depthWrite: false });
-    this.fireflies = new THREE.InstancedMesh(flyGeo, flyMat, 48);
+    // fireflies: soft points of light that flash briefly and go dark, like the real thing
+    const glow = document.createElement('canvas');
+    glow.width = glow.height = 64;
+    const g = glow.getContext('2d')!;
+    const grad = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+    grad.addColorStop(0, 'rgba(255,255,235,1)');
+    grad.addColorStop(0.12, 'rgba(225,255,150,0.85)');
+    grad.addColorStop(0.35, 'rgba(170,230,80,0.22)');
+    grad.addColorStop(1, 'rgba(120,200,40,0)');
+    g.fillStyle = grad;
+    g.fillRect(0, 0, 64, 64);
+    this.flyTex = new THREE.CanvasTexture(glow);
+    const flyGeo = new THREE.BufferGeometry();
+    flyGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(FIREFLY_MAX * 3), 3));
+    flyGeo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(FIREFLY_MAX * 3), 3));
+    const flyMat = new THREE.PointsMaterial({
+      size: 0.34,
+      map: this.flyTex,
+      vertexColors: true,
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      fog: false,
+    });
+    this.fireflies = new THREE.Points(flyGeo, flyMat);
     this.fireflies.frustumCulled = false;
-    this.fireflies.count = 0;
+    flyGeo.setDrawRange(0, 0);
     this.scene.add(this.fireflies);
 
-    const leafGeo = new THREE.PlaneGeometry(0.09, 0.06);
-    const leafMat = new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide });
-    this.autumnLeaves = new THREE.InstancedMesh(leafGeo, leafMat, 60);
+    // falling leaves: a pointed leaf outline with a midrib fold, lit by the scene so they darken at night
+    const shape = new THREE.Shape();
+    shape.moveTo(0, -0.045);
+    shape.quadraticCurveTo(0.034, -0.012, 0, 0.045);
+    shape.quadraticCurveTo(-0.034, -0.012, 0, -0.045);
+    const leafGeo = new THREE.ShapeGeometry(shape, 6);
+    const lp = leafGeo.attributes.position;
+    for (let i = 0; i < lp.count; i++) lp.setZ(i, Math.abs(lp.getX(i)) * 0.35); // slight fold along the midrib
+    leafGeo.computeVertexNormals();
+    const leafMat = new THREE.MeshLambertMaterial({ color: 0xffffff, side: THREE.DoubleSide });
+    this.autumnLeaves = new THREE.InstancedMesh(leafGeo, leafMat, LEAF_MAX);
     this.autumnLeaves.frustumCulled = false;
     this.autumnLeaves.count = 0;
     const c = new THREE.Color();
-    const tones = [0xd9531e, 0xe38a1d, 0xc2352a, 0xe8c040, 0x9a5a22];
-    for (let i = 0; i < 60; i++) this.autumnLeaves.setColorAt(i, c.set(tones[i % tones.length]));
+    const tones = [0x9c4a1e, 0xb0662a, 0x7e3a1c, 0xa8822f, 0x6f4a26, 0x8f5a24];
+    for (let i = 0; i < LEAF_MAX; i++) this.autumnLeaves.setColorAt(i, c.set(tones[i % tones.length]).multiplyScalar(0.85 + ((i * 37) % 10) * 0.03));
     this.scene.add(this.autumnLeaves);
     this.instancedGeos.push(flyGeo, leafGeo);
     this.extraMats.push(flyMat, leafMat);
@@ -476,37 +511,45 @@ export class Formicarium3DRenderer {
     const calm = sim.rainIntensity() < 0.2 && sim.surfaceTempC > 11 && sim.windStrength < 1.2;
     const wantFly = sim.isNight() && calm ? warm : 0;
     this.fireflyLevel += (wantFly - this.fireflyLevel) * 0.02;
-    const nFly = Math.round(this.fireflyLevel * 48);
-    this.fireflies.count = nFly;
+    const nFly = Math.round(this.fireflyLevel * FIREFLY_MAX);
+    const fp = this.fireflies.geometry.attributes.position as THREE.BufferAttribute;
+    const fc = this.fireflies.geometry.attributes.color as THREE.BufferAttribute;
     for (let i = 0; i < nFly; i++) {
+      // each one wanders slowly, low over the plants
       const bx = ctr + (((i * 37) % 100) / 100 - 0.5) * 22;
-      const x = bx + Math.sin(t * 0.21 + i) * 0.9;
+      const x = bx + Math.sin(t * 0.13 + i) * 0.8 + Math.sin(t * 0.37 + i * 2.1) * 0.25;
       const gx = clamp(Math.floor((x / WORLD_SCALE + WORLD_W * 0.5) / CELL_SIZE), 0, GRID_W - 1);
       const ground = simToWorldY(sim.grid.surfaceY[gx]);
-      const y = ground + 0.3 + (Math.sin(t * 0.3 + i * 1.7) * 0.5 + 0.5) * 1.3;
-      const blink = Math.pow(Math.max(0, Math.sin(t * 1.5 + i * 2.3)), 3);
-      _dummy.position.set(x, y, 0.1 + (((i * 53) % 100) / 100) * 0.5);
-      _dummy.rotation.set(0, 0, 0);
-      _dummy.scale.setScalar(0.05 + blink * 1.3);
-      _dummy.updateMatrix();
-      this.fireflies.setMatrixAt(i, _dummy.matrix);
+      const y = ground + 0.18 + (Math.sin(t * 0.19 + i * 1.7) * 0.5 + 0.5) * 0.9;
+      fp.setXYZ(i, x, y, 0.15 + (((i * 53) % 100) / 100) * 0.45);
+      // a short glow every few seconds, then dark
+      const period = 4.5 + ((i * 29) % 10) * 0.35;
+      const f = (((t + i * 1.37) / period) % 1 + 1) % 1;
+      const b = f < 0.14 ? Math.pow(Math.sin((f / 0.14) * Math.PI), 1.5) : 0;
+      fc.setXYZ(i, 0.8 * b, 1.0 * b, 0.45 * b);
     }
-    this.fireflies.instanceMatrix.needsUpdate = true;
+    fp.needsUpdate = true;
+    fc.needsUpdate = true;
+    this.fireflies.geometry.setDrawRange(0, nFly);
 
-    // autumn leaves
+    // autumn leaves: a few at a time, swinging side to side as they fall like real leaves do
     const wantLeaves = sim.season === 'Autumn' && sim.rainIntensity() < 0.6 && sim.weather !== 'Snow' ? 1 : 0;
     this.leafLevel += (wantLeaves - this.leafLevel) * 0.01;
-    const nLeaf = Math.round(this.leafLevel * 60);
+    // leaves are hard to see after dark: fewer of them, and only as dim shapes
+    const nLeaf = Math.round(this.leafLevel * LEAF_MAX * (0.35 + 0.65 * this.daylight));
+    (this.autumnLeaves.material as THREE.MeshLambertMaterial).color.setScalar(0.3 + 0.7 * this.daylight);
     this.autumnLeaves.count = nLeaf;
     const topW = groundW + 3.2;
     for (let i = 0; i < nLeaf; i++) {
-      const cycle = (t * (0.035 + (i % 5) * 0.006) + i * 0.173) % 1;
+      const cycle = (t * (0.028 + (i % 5) * 0.004) + i * 0.173) % 1;
       const bx = ctr + (((i * 61) % 100) / 100 - 0.5) * 22;
-      const x = bx + Math.sin(t * 0.7 + i) * 0.45 + sim.windStrength * cycle * 1.2;
-      const y = topW - cycle * 3.1;
+      const swing = Math.sin(t * (1.1 + (i % 3) * 0.2) + i * 1.9);
+      const x = bx + swing * 0.28 + sim.windStrength * cycle * 1.0;
+      // a leaf drops fastest at the bottom of each swing and floats at the ends
+      const y = topW - cycle * 3.1 + Math.abs(swing) * 0.05;
       _dummy.position.set(x, y, 0.15 + (((i * 29) % 100) / 100) * 0.5);
-      _dummy.rotation.set(t * 1.3 + i, t * 0.9 + i * 2, Math.sin(t + i) * 1.2);
-      _dummy.scale.setScalar(1);
+      _dummy.rotation.set(0.9 + Math.sin(t * 0.5 + i) * 0.4, Math.sin(t * 0.3 + i * 2) * 1.2, swing * 0.75);
+      _dummy.scale.setScalar(0.9 + ((i * 17) % 10) * 0.04);
       _dummy.updateMatrix();
       this.autumnLeaves.setMatrixAt(i, _dummy.matrix);
     }
@@ -677,6 +720,7 @@ export class Formicarium3DRenderer {
     const tod = sim.timeOfDay;
     const sunElev = Math.sin((tod - 0.2) * Math.PI * 2); // +1 noon, -1 midnight
     const dayFactor = clamp(sunElev * 0.85 + 0.35, 0, 1);
+    this.daylight = dayFactor;
     const duskFactor = Math.exp(-Math.pow((tod - 0.72) * 8.5, 2)) + Math.exp(-Math.pow((tod - 0.22) * 8.5, 2));
 
     const sunAngle = (tod - 0.5) * Math.PI * 1.4;
@@ -1403,6 +1447,7 @@ export class Formicarium3DRenderer {
     this.disposed = true;
     this.camCtl.dispose();
     this.overlay?.dispose();
+    this.flyTex.dispose();
     this.snowCapMesh.geometry.dispose();
     this.batcher.dispose();
     for (const rig of this.creatureRigs.values()) disposeCreatureRig(rig);

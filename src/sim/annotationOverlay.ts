@@ -48,11 +48,6 @@ export class AnnotationOverlay {
     this.leader = svg('path', { class: 'an-leader', fill: 'none', 'stroke-width': '1.25' }, this.svgRoot);
     this.ring = svg('g', { class: 'an-ring' }, this.svgRoot);
     this.ringCircle = svg('circle', { r: String(RING_R), fill: 'none', 'stroke-width': '1.6' }, this.ring);
-    svg('circle', { r: '2.2', class: 'an-ring-dot' }, this.ring);
-    // four short ticks, like a viewfinder
-    for (const a of [0, 90, 180, 270]) {
-      svg('line', { x1: String(RING_R + 3), y1: '0', x2: String(RING_R + 8), y2: '0', transform: `rotate(${a})`, 'stroke-width': '1.4' }, this.ring);
-    }
     this.layer.appendChild(this.svgRoot);
     this.card = el('div', 'an-card', this.layer);
     this.banner = el('div', 'an-banner', this.layer);
