@@ -493,7 +493,7 @@ export class Formicarium3DRenderer {
         continue;
       }
       let wy = simToWorldY(c.y);
-      const z = c.kind === 'bird' ? 0.5 : c.kind === 'anteater' ? 0.42 : c.kind === 'spider' ? 0.3 : c.kind === 'ladybug' ? 0.34 : SOIL_FRONT_Z + 0.03;
+      const z = c.kind === 'bird' ? 0.5 : c.kind === 'anteater' ? 0.42 : c.kind === 'spider' ? 0.3 : c.kind === 'ladybug' ? 0.56 : SOIL_FRONT_Z + 0.03;
       if (c.kind === 'bird') {
         // a flying bird's body is centred on c.y; once it touches down its feet are on the ground
         const gW = simToWorldY(sim.grid.surfaceY[clamp(Math.floor(c.x / CELL_SIZE), 0, GRID_W - 1)]);
@@ -513,6 +513,9 @@ export class Formicarium3DRenderer {
           const want = Math.atan2(dy * c.dir, Math.max(dx * c.dir, 0) + Math.abs(dy) * 0.0);
           ang += (clamp(want, -1.45, 1.45) - ang) * 0.12;
         } else if (c.state === 'flying' || c.state === 'leaving') ang *= 0.9;
+        const stepped = Math.hypot(c.x - (ud.px ?? c.x), c.y - (ud.py ?? c.y));
+        rig.walk += (stepped / (c.kind === 'ladybug' ? 7 : 22)) * Math.PI * 2;
+        rig.moveAmp += ((stepped > 0.004 ? 1 : 0) - rig.moveAmp) * 0.2;
         ud.px = c.x;
         ud.py = c.y;
         ud.ang = ang;

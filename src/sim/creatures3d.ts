@@ -13,6 +13,9 @@ export interface CreatureRig {
   disposables: (THREE.BufferGeometry | THREE.Material)[];
   /** worm body segments */
   segs?: THREE.Mesh[];
+  /** gait phase (advances with distance walked) and how much it is moving right now (0..1) */
+  walk: number;
+  moveAmp: number;
 }
 
 const flat = (color: number, rough = 0.85): THREE.MeshStandardMaterial =>
@@ -214,8 +217,29 @@ export function createCreatureRig(kind: CreatureKind): CreatureRig {
     body.add(head);
     body.add(mesh(sphere, white, 0.012, 0.014, 0.014, 0.165, 0.0, 0.035));
     body.add(mesh(sphere, white, 0.012, 0.014, 0.014, 0.165, 0.0, -0.035));
+    // six jointed legs (hip -> femur -> knee -> tibia); a tripod gait swings them in animateCreatureRig
     const legs = new THREE.Group();
-    for (const z of [0.07, 0, -0.07]) for (const s of [1, -1]) legs.add(mesh(cyl, black, 0.008, 0.045, 0.008, (z - 0.01) * 0.9, -0.085, s * 0.07));
+    let li = 0;
+    for (const hx of [0.07, 0.0, -0.07]) {
+      for (const side of [1, -1]) {
+        const swing = new THREE.Group();
+        swing.position.set(hx, -0.055, side * 0.055);
+        const splay = new THREE.Group();
+        splay.rotation.x = side * 0.75; // legs reach out sideways, then down
+        swing.add(splay);
+        splay.add(mesh(cyl, black, 0.008, 0.05, 0.008, 0, -0.025, 0));
+        const knee = new THREE.Group();
+        knee.position.y = -0.05;
+        knee.rotation.x = -side * 0.8;
+        splay.add(knee);
+        knee.add(mesh(cyl, black, 0.007, 0.055, 0.007, 0, -0.027, 0));
+        knee.add(mesh(sphere, black, 0.011, 0.011, 0.011, 0, -0.055, 0));
+        legs.add(swing);
+        parts[`sw${li}`] = swing;
+        parts[`kn${li}`] = knee;
+        li++;
+      }
+    }
     body.add(legs);
     const wingM = flat(0xdcd8cf, 0.3);
     disposables.push(wingM);
@@ -239,9 +263,9 @@ export function createCreatureRig(kind: CreatureKind): CreatureRig {
       segs.push(m);
       root.add(m);
     }
-    return { kind, root, parts, disposables, segs };
+    return { kind, root, parts, disposables, segs, walk: 0, moveAmp: 0 };
   }
-  return { kind, root, parts, disposables };
+  return { kind, root, parts, disposables, walk: 0, moveAmp: 0 };
 }
 
 const wob = (t: number, f: number) => Math.sin(t * f);
@@ -286,8 +310,20 @@ export function animateCreatureRig(rig: CreatureRig, c: Creature, time: number):
     p.wing.rotation.x = flying ? wob(time, 60) * 0.6 : 0;
     p.dome.rotation.z = flying ? 0.35 : 0;
     p.body.rotation.z = flying ? (c.state === 'leaving' ? 0.4 : -0.3) : 0;
-    p.body.position.y = 0.12 + (flying ? 0 : Math.abs(wob(time, c.state === 'roaming' ? 7 : 1)) * 0.008);
-    p.legs.rotation.z = c.state === 'roaming' ? wob(time, 14) * 0.18 : 0;
+    // tripod gait: front-left, mid-right, rear-left step together, the other three in antiphase
+    const amp = rig.moveAmp;
+    for (let i = 0; i < 6; i++) {
+      const side = i % 2 === 0 ? 1 : -1;
+      const row = Math.floor(i / 2);
+      const grp = (row % 2 === 0 ? 1 : 0) ^ (side > 0 ? 0 : 1);
+      const ph = rig.walk + grp * Math.PI;
+      const swingA = Math.sin(ph) * 0.5 * amp;
+      const lift = Math.max(0, Math.cos(ph)) * 0.55 * amp; // foot comes up while it swings forward
+      p[`sw${i}`].rotation.z = swingA + (row - 1) * 0.12;
+      (p[`kn${i}`] as THREE.Object3D).rotation.z = -lift * 0.6;
+      p[`sw${i}`].position.y = -0.055 + lift * 0.012;
+    }
+    p.body.position.y = 0.12 + Math.abs(Math.sin(rig.walk)) * 0.006 * amp;
     p.legs.visible = !flying;
   } else if (rig.kind === 'antlion') {
     p.jaws.position.y = c.state === 'flinging' ? wob(time, 25) * 0.04 : 0;
