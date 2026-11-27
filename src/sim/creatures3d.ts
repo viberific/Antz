@@ -201,39 +201,89 @@ export function createCreatureRig(kind: CreatureKind): CreatureRig {
     root.add(jaws);
     parts.jaws = jaws;
   } else if (kind === 'ladybug') {
-    const red = flat(0xd8281f, 0.4);
-    const black = flat(0x15110f, 0.5);
-    const white = flat(0xf4f1e8, 0.5);
-    disposables.push(red, black, white);
+    // Seven-spot ladybird: a low glossy red half-dome (the wing cases), a black pronotum with white
+    // shoulder patches, a small black head tucked under it, and six short legs mostly hidden beneath.
+    const red = new THREE.MeshStandardMaterial({ color: 0xd3201b, roughness: 0.22, metalness: 0.05 });
+    const black = new THREE.MeshStandardMaterial({ color: 0x111014, roughness: 0.35, metalness: 0.05 });
+    const white = new THREE.MeshStandardMaterial({ color: 0xf2efe6, roughness: 0.4 });
+    const wingM = new THREE.MeshStandardMaterial({ color: 0xc9c4b8, roughness: 0.3, transparent: true, opacity: 0.6, side: THREE.DoubleSide });
+    const hemi = new THREE.SphereGeometry(1, 28, 14, 0, Math.PI * 2, 0, Math.PI / 2);
+    const smooth = new THREE.SphereGeometry(1, 18, 12);
+    const disc = new THREE.CircleGeometry(1, 24);
+    disposables.push(red, black, white, wingM, hemi, smooth, disc);
+    const sm = (g: THREE.BufferGeometry, m: THREE.Material, sx: number, sy: number, sz: number, x = 0, y = 0, z = 0) => {
+      const o = new THREE.Mesh(g, m);
+      o.scale.set(sx, sy, sz);
+      o.position.set(x, y, z);
+      o.castShadow = true;
+      return o;
+    };
+
     const body = new THREE.Group();
-    const dome = mesh(sphere, red, 0.13, 0.095, 0.11);
+    // wing cases (elytra): rounded dome, slightly longer than wide
+    const RX = 0.13;
+    const RY = 0.095;
+    const RZ = 0.115;
+    const dome = new THREE.Group();
+    dome.add(sm(hemi, red, RX, RY, RZ));
+    // belly
+    const belly = sm(disc, black, RX * 0.96, RZ * 0.96, 1, 0, 0.002, 0);
+    belly.rotation.x = Math.PI / 2;
+    dome.add(belly);
+    // seven spots, set onto the dome surface: one straddling the seam at the front, three a side
+    const spot = (theta: number, phi: number, r: number) => {
+      const n = new THREE.Vector3(Math.sin(phi) * Math.cos(theta), Math.cos(phi), Math.sin(phi) * Math.sin(theta));
+      const pos = new THREE.Vector3(n.x * RX, n.y * RY, n.z * RZ);
+      // the dome's surface normal (ellipsoid), used to lay the spot flat on the shell
+      const nrm = new THREE.Vector3(pos.x / (RX * RX), pos.y / (RY * RY), pos.z / (RZ * RZ)).normalize();
+      const m = new THREE.Mesh(smooth, black);
+      m.scale.set(r, 0.006, r);
+      m.position.copy(pos).addScaledVector(nrm, 0.0015);
+      m.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), nrm);
+      dome.add(m);
+    };
+    spot(0, 0.32, 0.028); // scutellar spot at the front of the seam
+    for (const sd of [1, -1]) {
+      spot(sd * 0.55, 0.62, 0.026);
+      spot(sd * 1.55, 0.95, 0.03);
+      spot(Math.PI - sd * 0.65, 0.72, 0.026);
+    }
+    dome.position.y = 0.035;
     body.add(dome);
-    body.add(mesh(box, black, 0.003, 0.09, 0.1, 0, 0.0, 0));
-    // spots sit on the flank facing the viewer (z>0) and mirrored on the far side
-    for (const sz of [1, -1])
-      for (const [x, y] of [[0.06, 0.02], [-0.04, 0.045], [-0.07, -0.01], [0.02, -0.025]] as const)
-        body.add(mesh(sphere, black, 0.03, 0.026, 0.014, x, y, sz * 0.098));
-    const head = mesh(sphere, black, 0.045, 0.045, 0.06, 0.13, -0.015, 0);
+
+    // pronotum: black shield in front of the wing cases, white patches at its front corners
+    const pron = sm(hemi, black, 0.045, 0.055, 0.082, RX * 0.86, 0.035, 0);
+    body.add(pron);
+    for (const sd of [1, -1]) body.add(sm(smooth, white, 0.022, 0.018, 0.02, RX * 0.86 + 0.022, 0.06, sd * 0.055));
+    // head: small, black, tucked low under the pronotum, with two pale eye marks and short antennae
+    const head = new THREE.Group();
+    head.position.set(RX + 0.035, 0.04, 0);
+    head.add(sm(smooth, black, 0.028, 0.024, 0.038));
+    for (const sd of [1, -1]) {
+      head.add(sm(smooth, white, 0.007, 0.007, 0.007, 0.018, 0.01, sd * 0.022));
+      const ant = sm(cyl, black, 0.0025, 0.035, 0.0025, 0.02, 0.022, sd * 0.016);
+      ant.rotation.set(sd * 0.5, 0, -0.9);
+      head.add(ant);
+    }
     body.add(head);
-    body.add(mesh(sphere, white, 0.012, 0.014, 0.014, 0.165, 0.0, 0.035));
-    body.add(mesh(sphere, white, 0.012, 0.014, 0.014, 0.165, 0.0, -0.035));
-    // six jointed legs (hip -> femur -> knee -> tibia); a tripod gait swings them in animateCreatureRig
+
+    // six short legs, emerging from under the shell: hip -> femur -> knee -> tibia -> foot
     const legs = new THREE.Group();
     let li = 0;
-    for (const hx of [0.07, 0.0, -0.07]) {
+    for (const hx of [0.075, 0.01, -0.055]) {
       for (const side of [1, -1]) {
         const swing = new THREE.Group();
-        swing.position.set(hx, -0.055, side * 0.055);
+        swing.position.set(hx, 0.035, side * 0.045);
         const splay = new THREE.Group();
-        splay.rotation.x = side * 0.75; // legs reach out sideways, then down
+        splay.rotation.x = side * 1.15; // femur reaches out sideways, nearly flat
         swing.add(splay);
-        splay.add(mesh(cyl, black, 0.008, 0.05, 0.008, 0, -0.025, 0));
+        splay.add(sm(cyl, black, 0.0075, 0.045, 0.0075, 0, -0.0225, 0));
         const knee = new THREE.Group();
-        knee.position.y = -0.05;
-        knee.rotation.x = -side * 0.8;
+        knee.position.y = -0.045;
+        knee.rotation.x = -side * 1.25; // tibia turns back down to the ground
         splay.add(knee);
-        knee.add(mesh(cyl, black, 0.007, 0.055, 0.007, 0, -0.027, 0));
-        knee.add(mesh(sphere, black, 0.011, 0.011, 0.011, 0, -0.055, 0));
+        knee.add(sm(cyl, black, 0.0065, 0.04, 0.0065, 0, -0.02, 0));
+        knee.add(sm(smooth, black, 0.008, 0.005, 0.01, 0.004, -0.041, 0));
         legs.add(swing);
         parts[`sw${li}`] = swing;
         parts[`kn${li}`] = knee;
@@ -241,12 +291,12 @@ export function createCreatureRig(kind: CreatureKind): CreatureRig {
       }
     }
     body.add(legs);
-    const wingM = flat(0xdcd8cf, 0.3);
-    disposables.push(wingM);
-    const wing = mesh(sphere, wingM, 0.13, 0.008, 0.045, -0.03, 0.1, 0.09);
+
+    // flight: the wing cases lift and the membranous hind wings unfold from beneath
+    const wing = new THREE.Group();
+    for (const sd of [1, -1]) wing.add(sm(smooth, wingM, 0.16, 0.004, 0.06, -0.05, 0.09, sd * 0.09));
     wing.visible = false;
     body.add(wing);
-    body.position.y = 0.12;
     root.add(body);
     parts.body = body;
     parts.legs = legs;
@@ -307,24 +357,28 @@ export function animateCreatureRig(rig: CreatureRig, c: Creature, time: number):
   } else if (rig.kind === 'ladybug') {
     const flying = c.state === 'flying' || c.state === 'leaving';
     p.wing.visible = flying;
-    p.wing.rotation.x = flying ? wob(time, 60) * 0.6 : 0;
-    p.dome.rotation.z = flying ? 0.35 : 0;
-    p.body.rotation.z = flying ? (c.state === 'leaving' ? 0.4 : -0.3) : 0;
-    // tripod gait: front-left, mid-right, rear-left step together, the other three in antiphase
-    const amp = rig.moveAmp;
+    p.wing.rotation.x = flying ? wob(time, 70) * 0.5 : 0;
+    p.dome.rotation.z = flying ? 0.45 : 0; // wing cases tip up to free the hind wings
+    p.body.rotation.z = flying ? (c.state === 'leaving' ? 0.35 : -0.25) : 0;
+    p.legs.visible = true;
+    // alternating tripod, exactly like an ant: front & rear legs on one side step with the middle leg on the other.
+    // Planted feet sweep backward as the body moves on; lifted feet swing forward.
+    const amp = flying ? 0 : rig.moveAmp;
     for (let i = 0; i < 6; i++) {
       const side = i % 2 === 0 ? 1 : -1;
       const row = Math.floor(i / 2);
       const grp = (row % 2 === 0 ? 1 : 0) ^ (side > 0 ? 0 : 1);
       const ph = rig.walk + grp * Math.PI;
-      const swingA = Math.sin(ph) * 0.5 * amp;
-      const lift = Math.max(0, Math.cos(ph)) * 0.55 * amp; // foot comes up while it swings forward
-      p[`sw${i}`].rotation.z = swingA + (row - 1) * 0.12;
-      (p[`kn${i}`] as THREE.Object3D).rotation.z = -lift * 0.6;
-      p[`sw${i}`].position.y = -0.055 + lift * 0.012;
+      const swingA = -Math.cos(ph) * 0.45 * amp; // forward while lifted, back while planted
+      const lift = Math.max(0, Math.sin(ph)) * amp;
+      // legs fan out: fore legs reach forward, hind legs back
+      p[`sw${i}`].rotation.z = swingA + (1 - row) * 0.35;
+      (p[`kn${i}`] as THREE.Object3D).rotation.z = -lift * 0.5;
+      p[`sw${i}`].position.y = 0.035 + lift * 0.01;
     }
-    p.body.position.y = 0.12 + Math.abs(Math.sin(rig.walk)) * 0.006 * amp;
-    p.legs.visible = !flying;
+    // tuck the legs up in flight
+    if (flying) for (let i = 0; i < 6; i++) (p[`kn${i}`] as THREE.Object3D).rotation.z = 0.9;
+    p.body.position.y = Math.abs(Math.sin(rig.walk)) * 0.003 * amp;
   } else if (rig.kind === 'antlion') {
     p.jaws.position.y = c.state === 'flinging' ? wob(time, 25) * 0.04 : 0;
     p.jaws.scale.setScalar(c.state === 'flinging' ? 1.3 : 1);
