@@ -303,6 +303,11 @@ export interface Intruder {
   path?: Vec2[];
   pathIndex?: number;
   lastPathTime?: number;
+  /** watchdog: where it was and for how long it has barely moved while it should be going somewhere */
+  stuckX?: number;
+  stuckY?: number;
+  stuckFor?: number;
+  stuckStrikes?: number;
   age?: number;
   /** has left the home crevice at least once (so it can't 'escape' the moment it spawns) */
   roamed?: boolean;
