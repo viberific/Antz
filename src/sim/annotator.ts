@@ -74,8 +74,11 @@ const CARRYING_TASKS = new Set<AntTask>([
 
 const FADE_IN = 0.7;
 const FADE_OUT = 0.5;
-/** quiet time between two annotations, so the screen is never crowded */
-const GAP = 1.0;
+/** quiet time between two annotations (seconds, random in this range), so the screen is never crowded */
+const GAP_MIN = 6;
+const GAP_MAX = 12;
+/** how many of the latest subjects are held back so that something different is shown first */
+const RECENT_KEEP = 8;
 /** every annotation stays up for at least this long (seconds, not counting the fades) */
 export const HOLD_MIN = 10;
 /** ...and for this long when the text is long */
@@ -108,6 +111,8 @@ export class Annotator {
   /** when the last banner finished: ants get the screen for a while before the next one */
   private bannerEnd = -1e9;
   private readonly shown = new Map<string, number>();
+  /** cooldown keys of the latest annotations, newest last */
+  private readonly recent: string[] = [];
   private readonly seenEvents = new Set<string>();
   private readonly taskSince = new Map<number, { task: AntTask; since: number }>();
   private trackClock = 0;
@@ -130,7 +135,7 @@ export class Annotator {
           this.alpha = 0;
           this.active = null;
           this.ending = false;
-          this.gap = host.mode() === 'follow' ? 0.35 : GAP;
+          this.gap = host.mode() === 'follow' ? 2 : GAP_MIN + Math.random() * (GAP_MAX - GAP_MIN);
         }
       }
     } else {
@@ -242,7 +247,10 @@ export class Annotator {
     if (!pick) return;
     const built = this.build(sim, pick, host.mode() === 'follow');
     if (!built) return;
-    this.shown.set(this.cooldownKey(pick, sim), now);
+    const ck = this.cooldownKey(pick, sim);
+    this.shown.set(ck, now);
+    this.recent.push(ck);
+    if (this.recent.length > RECENT_KEEP) this.recent.shift();
     if (pick.kind === 'ant') {
       const ant = sim.ants.find((q) => q.id === pick.id)!;
       this.shown.set('ant:' + pick.id, now);
@@ -253,7 +261,7 @@ export class Annotator {
   }
 
   private bannerWaiting(now: number, host: AnnotatorHost): boolean {
-    return this.pending.length > 0 && host.mode() !== 'follow' && now - this.bannerEnd >= 9;
+    return this.pending.length > 0 && host.mode() !== 'follow' && now - this.bannerEnd >= 15;
   }
 
   private begin(view: Omit<AnnotationView, 'alpha'>, subject: Subject | undefined, task: AntTask | undefined, now: number, duration: number): void {
@@ -300,6 +308,9 @@ export class Annotator {
       if (!p || p.x < w * 0.12 || p.x > w * 0.88 || p.y < h * 0.16 || p.y > h * 0.84) return;
       let f = 1;
       for (const [k, span, floor] of keys) f *= this.fresh(k, now, span, floor);
+      // show something different before anything comes round again: the newer it is in the history, the harder it is held back
+      const at = this.recent.lastIndexOf(keys[0][0]);
+      if (at >= 0) f *= 0.03 + 0.12 * (1 - (at + 1) / this.recent.length);
       const central = 1 - 0.45 * (Math.hypot(p.x - cx, p.y - cy) / half);
       const score = interest * f * central + Math.random() * 0.25;
       if (score > bestScore) {
@@ -316,16 +327,16 @@ export class Annotator {
       let interest = note.interest;
       if (a.caste === AntCaste.QUEEN || a.caste === AntCaste.GYNE || a.caste === AntCaste.MALE) interest += 1.2;
       consider({ kind: 'ant', id: a.id }, interest, [
-        ['task:' + a.task, 30, 0.2],
-        ['ant:' + a.id, 80, 0.15],
-        ['caste:' + a.caste, 20, 0.6],
+        ['task:' + a.task, 150, 0.05],
+        ['ant:' + a.id, 240, 0.05],
+        ['caste:' + a.caste, 60, 0.5],
       ]);
     }
     for (const c of sim.creatures) {
-      consider({ kind: 'creature', id: c.id }, CREATURE_NOTES[c.kind].interest, [['creature:' + c.kind, 100, 0.1]]);
+      consider({ kind: 'creature', id: c.id }, CREATURE_NOTES[c.kind].interest, [['creature:' + c.kind, 240, 0.03]]);
     }
     for (const m of sim.intruders) {
-      consider({ kind: 'intruder', id: m.id }, INTRUDER_NOTES[m.species].interest, [['intruder:' + m.species, 90, 0.15]]);
+      consider({ kind: 'intruder', id: m.id }, INTRUDER_NOTES[m.species].interest, [['intruder:' + m.species, 200, 0.03]]);
     }
     return best;
   }

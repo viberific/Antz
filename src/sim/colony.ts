@@ -3163,8 +3163,16 @@ export class AntColonySimulation {
         const wp = m.path && (m.pathIndex ?? 0) < m.path.length ? m.path[m.pathIndex ?? 0] : directTarget;
         if (wp) this.moveIntruderToward(m, wp.x, wp.y, speed, dt);
       } else if (directTarget) {
-        m.path = [];
-        this.moveIntruderToward(m, directTarget.x, directTarget.y, speed, dt);
+        // a straight line jams on boulders and tunnel corners, so follow a real route and re-plan as the prey moves
+        if ((!m.path || (m.pathIndex ?? 0) >= m.path.length) && this.pathBudget > 0 && this.simTime - (m.lastPathTime ?? -10) > 0.5) {
+          this.pathBudget--;
+          m.lastPathTime = this.simTime;
+          const route = this.grid.findPath({ x: m.x, y: m.y }, directTarget, { maxIterations: 2500 });
+          m.path = route.length > 10 ? route.slice(0, 10) : route;
+          m.pathIndex = 0;
+        }
+        const wp = m.path && (m.pathIndex ?? 0) < m.path.length ? m.path[m.pathIndex ?? 0] : directTarget;
+        this.moveIntruderToward(m, wp.x, wp.y, speed, dt);
       } else {
         m.path = [];
         const dir = goalX >= m.x ? 1 : -1;
@@ -3176,6 +3184,8 @@ export class AntColonySimulation {
           m.angle = dir > 0 ? 0 : Math.PI;
         }
       }
+
+      this.unstickIntruder(m, dt, goalX, directTarget !== null || fieldKey !== null);
 
       const cg = this.grid.worldToGrid(m.x, m.y);
       if (this.grid.isSolid(cg.gx, cg.gy) || !this.grid.isNavigable(cg.gx, cg.gy)) {
@@ -3242,6 +3252,41 @@ export class AntColonySimulation {
       n++;
     });
     return n;
+  }
+
+  /**
+   * Watchdog for invaders that have a destination but are going nowhere (wedged behind a stone, a lip of soil or each
+   * other). After a few seconds it forgets its route and hops to the nearest open ground toward the goal; if that
+   * does not help either, it gives up and heads home.
+   */
+  private unstickIntruder(m: Intruder, dt: number, goalX: number, underground: boolean): void {
+    const idle = m.warrior && m.holdPost !== undefined && !m.roamed;
+    const fighting = m.attackCooldown > 0 || this.countAntsNear(m.x, m.y, 16) > 0;
+    const sx = m.stuckX ?? m.x;
+    const sy = m.stuckY ?? m.y;
+    if (idle || fighting || Math.hypot(m.x - sx, m.y - sy) > 4 || (!underground && Math.abs(goalX - m.x) <= 6)) {
+      m.stuckX = m.x;
+      m.stuckY = m.y;
+      m.stuckFor = 0;
+      return;
+    }
+    m.stuckFor = (m.stuckFor ?? 0) + dt;
+    if (m.stuckFor < 3) return;
+    m.path = [];
+    m.pathIndex = 0;
+    m.lastPathTime = -10;
+    const g = this.grid.worldToGrid(m.x + (goalX >= m.x ? 12 : -12), m.y - 6);
+    const hop = this.grid.findNearestNavigable(g.gx, g.gy, 6);
+    if (hop) {
+      const w = this.grid.gridToWorld(hop.gx, hop.gy);
+      m.x = w.x;
+      m.y = w.y;
+    }
+    m.stuckX = m.x;
+    m.stuckY = m.y;
+    m.stuckFor = (m.stuckFor ?? 0) > 9 ? 0 : 1.5;
+    m.stuckStrikes = (m.stuckStrikes ?? 0) + 1;
+    if (m.stuckStrikes >= 3 && !m.warrior) m.behavior = 'retreating';
   }
 
   private moveIntruderToward(m: Intruder, tx: number, ty: number, speed: number, dt: number): void {
