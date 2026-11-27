@@ -38,6 +38,7 @@ import {
   GRID_H,
   GRID_W,
   PayloadType,
+  SURFACE_BASE_Y,
   WORLD_H,
   WORLD_W,
 } from './types';
@@ -329,6 +330,54 @@ export class Formicarium3DRenderer {
     if (!this.isSoftwareGl) {
       this.renderer.compile(this.scene, this.camera);
     }
+  }
+
+  private focusKey = -1;
+
+  /**
+   * The zoomed-out view frames the sky above the ground, the surface and every chamber/tunnel (plus a margin), so
+   * a big block of untouched soil never fills the screen. Recomputed only when the nest changes.
+   */
+  private updateCameraFocus(sim: AntColonySimulation): void {
+    const ver = sim.grid.terrainVersion;
+    if (ver === this.focusKey) return;
+    this.focusKey = ver;
+    let minGx = GRID_W;
+    let maxGx = -1;
+    let maxGy = -1;
+    const t = sim.grid.terrain;
+    for (let gy = 0; gy < GRID_H; gy++) {
+      for (let gx = 0; gx < GRID_W; gx++) {
+        if (t[gy * GRID_W + gx] !== CellType.TUNNEL) continue;
+        if (gx < minGx) minGx = gx;
+        if (gx > maxGx) maxGx = gx;
+        if (gy > maxGy) maxGy = gy;
+      }
+    }
+    const MARGIN = 70;
+    const MIN_W = 520;
+    let left = minGx * CELL_SIZE - MARGIN;
+    let right = (maxGx + 1) * CELL_SIZE + MARGIN;
+    let bottom = (maxGy + 1) * CELL_SIZE + MARGIN;
+    if (maxGx < 0) {
+      left = (CASE_LEFT + CASE_RIGHT) / 2 - MIN_W / 2;
+      right = left + MIN_W;
+      bottom = SURFACE_BASE_Y + 300;
+    }
+    if (right - left < MIN_W) {
+      const c = (left + right) / 2;
+      left = c - MIN_W / 2;
+      right = c + MIN_W / 2;
+    }
+    let minSurf = SURFACE_BASE_Y;
+    for (let gx = 0; gx < GRID_W; gx++) minSurf = Math.min(minSurf, sim.grid.surfaceY[gx]);
+    const top = minSurf - 150; // a band of sky above the highest ground
+    this.camCtl.setFocus({
+      left: simToWorldX(left),
+      right: simToWorldX(right),
+      top: simToWorldY(top),
+      bottom: simToWorldY(bottom),
+    });
   }
 
   public resetCamera(): void {
@@ -1063,6 +1112,7 @@ export class Formicarium3DRenderer {
     }
 
     this.env3d.update(sim, sim.simTime);
+    this.updateCameraFocus(sim);
     this.updateLightingAndWeather(sim);
     this.batcher.begin();
     this.syncAnts(sim, dt);
