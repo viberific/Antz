@@ -27,6 +27,10 @@ export enum AntCaste {
   NURSE = 'Nurse',
   EXCAVATOR = 'Excavator',
   SOLDIER = 'Soldier',
+  /** winged virgin queen, reared for the nuptial flight */
+  GYNE = 'Gyne',
+  /** winged male: lives only to mate on the nuptial flight */
+  MALE = 'Male',
 }
 
 export enum AntTask {
@@ -54,6 +58,26 @@ export enum AntTask {
   SEEKING_REST = 'Heading Home to Rest',
   EATING = 'Eating from Stores',
   REPAIRING = 'Repairing Storm Damage',
+  TANDEM_LEADING = 'Leading Tandem Run',
+  TANDEM_FOLLOWING = 'Following Tandem Run',
+  TENDING_APHIDS = 'Milking Aphids',
+  HUSKING_SEED = 'Husking Seeds',
+  CARRYING_CHAFF = 'Carrying Chaff to Midden',
+  REPLETE = 'Living Honeypot (Replete)',
+  ALLOGROOMING = 'Grooming Nestmate',
+  HELPING_ECLOSION = 'Helping Callow Emerge',
+  RESCUING = 'Digging Out Buried Nestmate',
+  BURIED = 'Buried (Calling for Help)',
+  CARRYING_NESTMATE = 'Carrying Injured Nestmate',
+  BEING_CARRIED = 'Being Carried',
+  GROUP_TRANSPORT = 'Group-Carrying Prey',
+  CLEARING_TRAIL = 'Clearing Trail Debris',
+  CANNIBALIZING = 'Eating Eggs (Famine)',
+  NUPTIAL_FLIGHT = 'Nuptial Flight',
+  WAITING_TO_SWARM = 'Waiting for Flight Weather',
+  CLUSTERING = 'Overwintering Cluster',
+  SEALING_ENTRANCE = 'Sealing Entrance',
+  BACKFILLING = 'Backfilling Old Gallery',
 }
 
 export enum PayloadType {
@@ -67,6 +91,10 @@ export enum PayloadType {
   PUPA = 7,
   FUNGUS = 8,
   REFUSE = 9,
+  /** seed husks stripped off in the granary */
+  CHAFF = 10,
+  /** a twig or grit cleared off a busy trail */
+  DEBRIS = 11,
 }
 
 export enum BroodStage {
@@ -150,6 +178,21 @@ export interface Ant {
   navKey?: string;
   attackCd?: number;
   lastHitTime?: number;
+  /** honeypot replete: 0..1 how swollen with stored liquid food (undefined = not a replete) */
+  replete?: number;
+  /** tandem running partners */
+  tandemLeaderId?: number | null;
+  tandemFollowerId?: number | null;
+  tandemTimer?: number;
+  /** seconds of air left while buried by a cave-in (undefined = not buried) */
+  buried?: number;
+  /** social carrying: who is carrying this ant / whom this ant carries */
+  carriedById?: number | null;
+  carryingAntId?: number | null;
+  /** alates: airborne on the nuptial flight */
+  flying?: boolean;
+  /** excavators: grid cell of the disused gallery this soil load is going into (-1 = to the mound) */
+  backfill?: number;
 }
 
 export interface BroodItem {
@@ -164,6 +207,12 @@ export interface BroodItem {
   wigglePhase: number;
   /** seconds a larva has gone without food */
   starve?: number;
+  /** non-viable egg laid as food for larvae when the colony is short */
+  trophic?: boolean;
+  /** reared as a winged sexual (gyne or male) */
+  sexual?: 'gyne' | 'male';
+  /** a finished pupa waiting for a nurse to help it out of its cocoon */
+  ecloseWait?: number;
 }
 
 export interface FoodSource {
@@ -177,6 +226,29 @@ export interface FoodSource {
   storedInChamberId: number | null;
   vy?: number;
   falling?: boolean;
+  /** a big insect carcass that takes several ants to drag home */
+  large?: boolean;
+  /** seeds: husk already stripped off */
+  husked?: boolean;
+}
+
+export interface Aphid {
+  id: number;
+  x: number;
+  y: number;
+  /** honeydew accumulated, ready to be milked */
+  honeydew: number;
+  /** ant currently stroking it */
+  tenderId: number | null;
+  phase: number;
+}
+
+export interface Debris {
+  id: number;
+  x: number;
+  y: number;
+  carriedById: number | null;
+  size: number;
 }
 
 export interface WaterDroplet {
@@ -242,7 +314,7 @@ export interface Particle {
   alpha: number;
   life: number;
   maxLife: number;
-  kind: 'dust' | 'mist' | 'crumb' | 'spark' | 'rain' | 'fog';
+  kind: 'dust' | 'mist' | 'crumb' | 'spark' | 'rain' | 'fog' | 'snow';
   color: string;
 }
 

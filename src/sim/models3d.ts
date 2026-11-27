@@ -155,7 +155,9 @@ export function createFallenAntGeometry(): THREE.BufferGeometry {
     leg.rotateZ(0.8);
     leg.rotateX(side * 0.75);
     leg.translate(0.005, -0.004, side * 0.028);
-    parts.push(leg);
+    // icosahedra are non-indexed; the cylinder must match or the merge fails
+    parts.push(leg.toNonIndexed());
+    leg.dispose();
   }
 
   const merged = mergeGeometries(parts, false);
@@ -215,6 +217,8 @@ export interface AntRig {
   payloadMeshes: Record<number, THREE.Object3D>;
   caste: AntCaste;
   isCallow: boolean;
+  /** alates only: [left fore, right fore, left hind, right hind] wing pivots */
+  wings: THREE.Group[];
   tintables: THREE.Mesh[];
   baseMat: THREE.Material;
   abdomenMat: THREE.Material;
@@ -248,7 +252,9 @@ export function createAntRig(
 
   const isQueen = caste === AntCaste.QUEEN;
   const isSoldier = caste === AntCaste.SOLDIER;
-  const scale = isQueen ? 1.55 : isSoldier ? 1.24 : caste === AntCaste.EXCAVATOR ? 1.04 : 0.94;
+  const isGyne = caste === AntCaste.GYNE;
+  const isMale = caste === AntCaste.MALE;
+  const scale = isQueen ? 1.55 : isGyne ? 1.42 : isMale ? 0.98 : isSoldier ? 1.24 : caste === AntCaste.EXCAVATOR ? 1.04 : 0.94;
   bodyGroup.scale.setScalar(scale);
 
   const baseBodyY = 0.038 * scale;
@@ -257,7 +263,9 @@ export function createAntRig(
 
   const baseMat = isCallow
     ? bank.callowBody
-    : isQueen
+    : isMale
+    ? bank.maleBody
+    : isQueen || isGyne
     ? bank.queenBody
     : isSoldier
     ? bank.soldierBody
@@ -270,7 +278,9 @@ export function createAntRig(
   const headMat = isCallow ? bank.callowBody : isSoldier ? bank.soldierHead : baseMat;
   const abdomenMat = isCallow
     ? bank.callowBody
-    : isQueen
+    : isMale
+    ? bank.maleBody
+    : isQueen || isGyne
     ? bank.queenAbdomen
     : bank.workerAbdomen;
 
@@ -315,6 +325,28 @@ export function createAntRig(
   thorax.castShadow = true;
   bodyGroup.add(thorax);
   tintables.push(thorax);
+
+  // Wings (alates): two pairs of membranous wings hinged on the thorax, folded back along the gaster at rest
+  const wings: THREE.Group[] = [];
+  if (isGyne || isMale) {
+    for (const [len, x, side] of [
+      [0.15, 0.02, 1],
+      [0.15, 0.02, -1],
+      [0.11, 0.0, 1],
+      [0.11, 0.0, -1],
+    ] as const) {
+      const pivot = new THREE.Group();
+      pivot.position.set(x, 0.04, 0.012 * side);
+      const w = new THREE.Mesh(geo.icosa0, bank.wingMat);
+      w.scale.set(len, 0.004, len * 0.3);
+      w.position.set(-len * 0.5, 0, 0);
+      w.castShadow = false;
+      pivot.add(w);
+      pivot.userData.side = side;
+      bodyGroup.add(pivot);
+      wings.push(pivot);
+    }
+  }
 
   const pronotum = new THREE.Mesh(geo.icosa0, baseMat);
   pronotum.scale.set(0.04, 0.032, 0.034);
@@ -471,7 +503,17 @@ export function createAntRig(
 
   payloadGroup.add(seedMesh, honeyMesh, proteinMesh, soilMesh, eggMesh, larvaMesh, pupaMesh, refuseMesh);
 
+  const chaffMesh = new THREE.Mesh(geo.icosa0, bank.chaffMat);
+  chaffMesh.scale.set(0.05, 0.012, 0.035);
+  chaffMesh.visible = false;
+  const debrisMesh = new THREE.Mesh(geo.icosa0, bank.debrisMat);
+  debrisMesh.scale.set(0.06, 0.025, 0.03);
+  debrisMesh.visible = false;
+  payloadGroup.add(chaffMesh, debrisMesh);
+
   const payloadMeshes: Record<number, THREE.Object3D> = {
+    [PayloadType.CHAFF]: chaffMesh,
+    [PayloadType.DEBRIS]: debrisMesh,
     [PayloadType.SEED]: seedMesh,
     [PayloadType.HONEYDEW]: honeyMesh,
     [PayloadType.PROTEIN]: proteinMesh,
@@ -502,6 +544,7 @@ export function createAntRig(
     payloadMeshes,
     caste,
     isCallow,
+    wings,
     tintables,
     baseMat,
     abdomenMat,
@@ -542,6 +585,28 @@ export function animateAntRig(
       for (const m of rig.tintables) m.material = bank.callowBody;
       rig.gaster.material = bank.callowBody;
       rig.gasterTip.material = bank.callowBody;
+    }
+  }
+
+  // Repletes: the gaster balloons as the crop fills with stored liquid food
+  const swell = ant.replete !== undefined ? 1 + ant.replete * 2.2 : 1;
+  rig.gasterPivot.scale.setScalar(swell);
+
+  // Alate wings: folded flat over the back at rest, a blur of beats in flight, fanned while waiting to swarm
+  if (rig.wings.length) {
+    const flapping = !!ant.flying;
+    const fanning = !flapping && ant.task === AntTask.NUPTIAL_FLIGHT;
+    for (let k = 0; k < rig.wings.length; k++) {
+      const w = rig.wings[k];
+      const side = w.userData.side as number;
+      if (flapping) {
+        const beat = Math.sin(time * 70 + (k < 2 ? 0 : 0.6));
+        w.rotation.set(side * (0.3 + beat * 1.1), side * 1.15, 0);
+      } else if (fanning) {
+        w.rotation.set(side * 0.25, side * (0.35 + Math.sin(time * 9 + k) * 0.15), 0.25);
+      } else {
+        w.rotation.set(0, side * 0.12, 0.08);
+      }
     }
   }
 

@@ -343,6 +343,32 @@ export class FormicariumEnvironment3D {
     return cavityDepthToZ(d);
   }
 
+  /** bumps whenever the smoothed soil contour is rebuilt */
+  public fieldVersion = 0;
+
+  /**
+   * Sim-space y of the visible (smoothed) ground surface at sim x, scanning down from the sky. Returns NaN where
+   * there is no ground within `maxY` (e.g. straight down an entrance shaft).
+   */
+  public groundYAt(sx: number, maxY: number): number {
+    const fx = sx / CELL_SIZE - 0.5;
+    const step = 0.2;
+    let fy = Math.floor(CASE_TOP / CELL_SIZE) + 1;
+    const end = maxY / CELL_SIZE - 0.5;
+    let prev = this.sampleField(this.smoothSoilField, fx, fy);
+    while (fy < end) {
+      const nfy = fy + step;
+      const v = this.sampleField(this.smoothSoilField, fx, nfy);
+      if (v >= ISO_LEVEL) {
+        const t = clamp((ISO_LEVEL - prev) / Math.max(1e-6, v - prev), 0, 1);
+        return (fy + t * step + 0.5) * CELL_SIZE;
+      }
+      prev = v;
+      fy = nfy;
+    }
+    return NaN;
+  }
+
   private sampleField(f: Float32Array, fx: number, fy: number): number {
     const leftGx = Math.floor(CASE_LEFT / CELL_SIZE);
     const rightGx = Math.floor(CASE_RIGHT / CELL_SIZE);
@@ -617,6 +643,7 @@ export class FormicariumEnvironment3D {
     mirrorBoundary(airA, 1.0);
     this.smoothSoilField = fieldA;
     this.smoothAirField = airA;
+    this.fieldVersion++;
 
     const sampleSimX = (gx: number) =>
       gx <= leftGx ? CASE_LEFT : gx >= rightGx ? CASE_RIGHT : (gx + 0.5) * CELL_SIZE;
