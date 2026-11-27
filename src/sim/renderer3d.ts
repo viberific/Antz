@@ -23,7 +23,10 @@ import {
   createSurfacePropMesh,
 } from './models3d';
 import { FormicariumEnvironment3D } from './terrain3d';
-import { FlatCameraController } from './camera2d';
+import { FlatCameraController, type CameraMode } from './camera2d';
+import { ActivityDirector } from './activity';
+import { Annotator, type Subject } from './annotator';
+import { AnnotationOverlay } from './annotationOverlay';
 import { animateCreatureRig, createCreatureRig, disposeCreatureRig, type CreatureRig } from './creatures3d';
 import { resetLegs } from './legs';
 import { MeshBatcher, collectMeshes } from './batcher';
@@ -77,6 +80,7 @@ const _tfOut = {
 };
 const _dummy = new THREE.Object3D();
 const _pick = new THREE.Vector3();
+const _loc = new THREE.Vector3();
 // Keep bodies (and the head/tail probes) clear of the cut side faces of the soil block
 const EDGE_L = CASE_LEFT + 28;
 const EDGE_R = CASE_RIGHT - 28;
@@ -106,6 +110,11 @@ export class Formicarium3DRenderer {
   public readonly scene: THREE.Scene;
   public readonly camera: THREE.PerspectiveCamera;
   public readonly camCtl: FlatCameraController;
+  /** told whenever the camera mode changes (for the on-screen controls) */
+  public onCameraMode: ((m: CameraMode) => void) | null = null;
+  private readonly activity = new ActivityDirector();
+  private readonly annotator = new Annotator();
+  private overlay: AnnotationOverlay | null = null;
 
   private readonly container: HTMLElement;
   private readonly bank: MaterialBank;
@@ -343,9 +352,44 @@ export class Formicarium3DRenderer {
       (lx, ly) => this.pickAnt(lx, ly) || (this.dropFoodAt(lx, ly), false)
     );
 
+    this.camCtl.onModeChange = (m) => {
+      if (m === 'drift') this.activity.reset();
+      this.onCameraMode?.(m);
+    };
+    this.overlay = new AnnotationOverlay(this.container);
+
     if (!this.isSoftwareGl) {
       this.renderer.compile(this.scene, this.camera);
     }
+  }
+
+  public get annotationsOn(): boolean {
+    return this.annotator.enabled;
+  }
+
+  /** Field-note captions: which animal is doing what, and the biology behind it. */
+  public setAnnotations(on: boolean): void {
+    this.annotator.enabled = on;
+    if (!on) this.annotator.clear();
+  }
+
+  /** Canvas pixel position of something being annotated, or null if it is not on screen. */
+  private locate(sim: AntColonySimulation, s: Subject): { x: number; y: number } | null {
+    const w = this.renderer.domElement.clientWidth || 1;
+    const h = this.renderer.domElement.clientHeight || 1;
+    let pos: THREE.Vector3 | null = null;
+    if (s.kind === 'ant') {
+      pos = this.antRigs.get(s.id)?.root.position ?? null;
+    } else if (s.kind === 'creature') {
+      const rig = this.creatureRigs.get(s.id);
+      pos = rig ? (rig.segs?.[0]?.position ?? rig.root.position) : null;
+    } else {
+      pos = this.intruderRigs.get(s.id)?.root.position ?? null;
+    }
+    if (!pos) return null;
+    _loc.copy(pos).project(this.camera);
+    if (_loc.z > 1) return null;
+    return { x: (_loc.x * 0.5 + 0.5) * w, y: (-_loc.y * 0.5 + 0.5) * h };
   }
 
   private buildSkyExtras(): void {
@@ -1301,6 +1345,12 @@ export class Formicarium3DRenderer {
         followPos = rig && rig.hasInitPos ? rig.root.position : _pick.set(simToWorldX(ant.x), simToWorldY(ant.y), 0.2);
       }
     }
+    // drift mode glides toward wherever the colony is busiest
+    if (this.camCtl.mode === 'drift') {
+      const hs = this.activity.update(sim, dt);
+      if (hs) this.camCtl.setDriftTarget(simToWorldX(hs.x), simToWorldY(hs.y));
+      else this.camCtl.setDriftTarget(null);
+    }
     this.camCtl.update(dt, followPos);
     // the ground trembles when tunnels cave in or something heavy walks overhead
     if (sim.shake > 0.01) {
@@ -1336,12 +1386,23 @@ export class Formicarium3DRenderer {
     this.syncCreatures(sim);
     this.syncSky(sim);
 
+    this.camera.updateMatrixWorld();
+    const size = { w: this.renderer.domElement.clientWidth || 1, h: this.renderer.domElement.clientHeight || 1 };
+    const note = this.annotator.update(sim, dt, {
+      mode: () => this.camCtl.mode,
+      followId: () => this.camCtl.followId,
+      locate: (sub) => this.locate(sim, sub),
+      size: () => size,
+    });
+    this.overlay?.update(note, note?.subject ? this.locate(sim, note.subject) : null, dt, size);
+
     this.renderer.render(this.scene, this.camera);
   }
 
   public dispose(): void {
     this.disposed = true;
     this.camCtl.dispose();
+    this.overlay?.dispose();
     this.snowCapMesh.geometry.dispose();
     this.batcher.dispose();
     for (const rig of this.creatureRigs.values()) disposeCreatureRig(rig);

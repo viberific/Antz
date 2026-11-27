@@ -2,6 +2,18 @@ import { useEffect, useRef, useState } from 'react';
 import { AntColonySimulation } from './sim/colony';
 import { RealWorld } from './sim/realworld';
 import { Formicarium3DRenderer } from './sim/renderer3d';
+import type { CameraMode } from './sim/camera2d';
+import { ArrowUpDown, BookOpen, Compass, Crosshair, Maximize2 } from 'lucide-react';
+
+const CAPTIONS_KEY = 'formicarium_captions';
+
+function loadCaptions(): boolean {
+  try {
+    return localStorage.getItem(CAPTIONS_KEY) !== '0';
+  } catch {
+    return true;
+  }
+}
 
 /** Fixed simulation step: behaviour no longer depends on the device's frame rate. */
 const SIM_STEP = 1 / 30;
@@ -31,6 +43,36 @@ export default function App() {
   const renderer3dRef = useRef<Formicarium3DRenderer | null>(null);
   const [vp, setVp] = useState(viewport);
   const portrait = vp.h > vp.w;
+  const [mode, setMode] = useState<CameraMode>('overview');
+  const [captions, setCaptions] = useState(loadCaptions);
+  const [hudIdle, setHudIdle] = useState(false);
+
+  // controls fade back a few seconds after the last touch, so they never sit in the picture
+  useEffect(() => {
+    let timer = 0;
+    const wake = () => {
+      setHudIdle(false);
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => setHudIdle(true), 4500);
+    };
+    wake();
+    window.addEventListener('pointerdown', wake);
+    window.addEventListener('pointermove', wake);
+    return () => {
+      window.clearTimeout(timer);
+      window.removeEventListener('pointerdown', wake);
+      window.removeEventListener('pointermove', wake);
+    };
+  }, []);
+
+  useEffect(() => {
+    renderer3dRef.current?.setAnnotations(captions);
+    try {
+      localStorage.setItem(CAPTIONS_KEY, captions ? '1' : '0');
+    } catch {
+      /* storage unavailable */
+    }
+  }, [captions]);
 
   useEffect(() => {
     const onFirstTouch = () => goFullscreenLandscape();
@@ -53,6 +95,8 @@ export default function App() {
     world.start();
     const renderer3d = new Formicarium3DRenderer(container, sim);
     renderer3dRef.current = renderer3d;
+    renderer3d.onCameraMode = setMode;
+    renderer3d.setAnnotations(loadCaptions());
     if (import.meta.env.DEV) (window as unknown as { __r?: unknown }).__r = renderer3d;
     if (import.meta.env.DEV) (window as unknown as { __antz?: unknown }).__antz = { sim, renderer3d };
 
@@ -165,6 +209,31 @@ export default function App() {
         }
       >
         <div ref={mountRef} className="w-full h-full touch-none" aria-label="Ant colony in a glass formicarium" />
+        <div className="hud" data-idle={hudIdle ? '1' : '0'}>
+          {mode === 'follow' && (
+            <div className="hud-group">
+              <button className="hud-btn" aria-pressed="true" onClick={() => renderer3dRef.current?.camCtl.resume()} title="Stop following this ant">
+                <Crosshair /> Following · release
+              </button>
+            </div>
+          )}
+          <div className="hud-group" role="group" aria-label="Camera">
+            <button className="hud-btn" aria-pressed={mode === 'overview'} onClick={() => renderer3dRef.current?.camCtl.setMode('overview')} title="Whole farm">
+              <Maximize2 /> Whole
+            </button>
+            <button className="hud-btn" aria-pressed={mode === 'scan'} onClick={() => renderer3dRef.current?.camCtl.setMode('scan')} title="Full width, sweeping down the nest. Drag up or down to look yourself.">
+              <ArrowUpDown /> Scan
+            </button>
+            <button className="hud-btn" aria-pressed={mode === 'drift'} onClick={() => renderer3dRef.current?.camCtl.setMode('drift')} title="Glide to wherever the colony is busiest">
+              <Compass /> Drift
+            </button>
+          </div>
+          <div className="hud-group">
+            <button className="hud-btn" aria-pressed={captions} onClick={() => setCaptions((c) => !c)} title="Field-note captions">
+              <BookOpen /> Notes
+            </button>
+          </div>
+        </div>
       </div>
     </main>
   );

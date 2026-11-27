@@ -17,7 +17,18 @@ export interface CaseBounds {
   z: number;
 }
 
+export type CameraMode = 'overview' | 'scan' | 'drift' | 'follow' | 'free';
+/** the three hands-off modes the double tap cycles through */
+const AUTO_MODES: CameraMode[] = ['overview', 'scan', 'drift'];
+
 const FOLLOW_DIST = 3.4;
+/** world units per second the scan sweeps up and down the nest */
+const SCAN_SPEED = 0.55;
+/** seconds the scan lingers at the sky / at the deepest chamber */
+const SCAN_DWELL = 2.6;
+/** seconds the sweep stays paused after the viewer slid it by hand */
+const SCAN_RESUME = 4;
+const DRIFT_MAX_SPEED = 3.2;
 const MIN_DIST = 1.6;
 const TAP_MS = 320;
 const TAP_PX = 10;
@@ -41,8 +52,20 @@ export class FlatCameraController {
   private followZoom = false;
   /** the rectangle worth looking at (sky, ground and every chamber); the zoomed-out view frames exactly this */
   private focus: { left: number; right: number; bottom: number; top: number };
-  /** true while the camera sits on the framed overview (tracks it as the nest grows) */
-  private overview = true;
+  private _mode: CameraMode = 'overview';
+  /** the last hands-off mode: tapping away from an ant, or double tapping out of a free view, returns here */
+  private lastAuto: CameraMode = 'overview';
+  /** called whenever the mode changes (UI, annotations) */
+  public onModeChange: ((m: CameraMode) => void) | null = null;
+
+  /** scan: 0 = sky, 1 = deepest chamber */
+  private scanU = 0;
+  private scanDir = 1;
+  private scanDwell = 0;
+  private scanHold = 0;
+  /** drift: where the action is (world coords) and the camera's glide velocity */
+  private driftGoal: { x: number; y: number } | null = null;
+  private readonly driftVel = new THREE.Vector2();
 
   private readonly pointers = new Map<number, { x: number; y: number; sx: number; sy: number; t: number }>();
   private pinchDist = 0;
@@ -113,54 +136,180 @@ export class FlatCameraController {
     this.fit();
   }
 
-  public reset(): void {
-    this.followId = null;
-    this.followZoom = false;
-    this.goal = null;
-    this.overview = true;
+  public get mode(): CameraMode {
+    return this._mode;
   }
 
+  public setMode(m: CameraMode): void {
+    if (m === this._mode && (m !== 'follow' || this.followId !== null)) return;
+    if (AUTO_MODES.includes(m)) this.lastAuto = m;
+    const from = this._mode;
+    this._mode = m;
+    this.goal = null;
+    this.driftVel.set(0, 0);
+    this.scanHold = 0;
+    this.scanDwell = 0;
+    if (m !== 'follow') {
+      this.followId = null;
+      this.followZoom = false;
+    }
+    if (m === 'scan') this.enterScan(from === 'overview');
+    this.onModeChange?.(m);
+  }
+
+  /** Whole farm -> scan -> drift -> whole farm. */
+  public cycleMode(): void {
+    const i = AUTO_MODES.indexOf(this._mode);
+    this.setMode(AUTO_MODES[(i + 1) % AUTO_MODES.length]);
+  }
+
+  public reset(): void {
+    this.setMode('overview');
+  }
+
+  /** Hand the camera back to the last hands-off mode (after following an ant or a manual look around). */
+  public resume(): void {
+    this.setMode(this.lastAuto);
+  }
+
+  /** Where the colony's action is, in world coords, for drift mode (null = nothing special going on). */
+  public setDriftTarget(x: number | null, y?: number): void {
+    this.driftGoal = x === null ? null : { x, y: y ?? 0 };
+  }
+
+  /** Any hands-on gesture leaves the automatic modes for the free camera. */
   private leaveOverview(): void {
-    this.overview = false;
+    if (this._mode === 'follow') return;
+    if (this._mode !== 'free') this.setMode('free');
     this.goal = null;
   }
 
   public follow(id: number): void {
     this.followId = id;
     this.followZoom = true;
-    this.overview = false;
     this.goal = null;
+    if (this._mode !== 'follow') {
+      this._mode = 'follow';
+      this.onModeChange?.('follow');
+    }
+  }
+
+  private widthFitDist(): number {
+    const tan = Math.tan(THREE.MathUtils.degToRad(this.camera.fov) / 2);
+    const halfW = (this.focus.right - this.focus.left) / 2;
+    return THREE.MathUtils.clamp(halfW / (tan * Math.max(0.01, this.camera.aspect)), MIN_DIST, this.maxDist);
+  }
+
+  /** the vertical travel of the camera centre while the whole nest width fills the screen */
+  private scanSpan(): { top: number; bottom: number } {
+    const tan = Math.tan(THREE.MathUtils.degToRad(this.camera.fov) / 2);
+    const halfH = this.widthFitDist() * tan;
+    const top = this.focus.top - halfH;
+    const bottom = this.focus.bottom + halfH;
+    if (top <= bottom) {
+      const mid = (this.focus.top + this.focus.bottom) / 2;
+      return { top: mid, bottom: mid };
+    }
+    return { top, bottom };
+  }
+
+  private enterScan(fromTop: boolean): void {
+    const { top, bottom } = this.scanSpan();
+    const r = top - bottom;
+    // from the whole-farm view, begin in the sky and sweep down; otherwise pick up from where the camera is
+    this.scanU = fromTop || r <= 0.05 ? 0 : THREE.MathUtils.clamp((top - this.target.y) / r, 0, 1);
+    this.scanDir = this.scanU > 0.85 ? -1 : 1;
   }
 
   /** Per-frame update. `followPos` is the followed ant's world position, or null if it is gone. */
   public update(dt: number, followPos: THREE.Vector3 | null): void {
     const k = 1 - Math.exp(-5 * dt);
-    if (this.followId !== null) {
-      if (!followPos) {
-        this.followId = null;
-        this.followZoom = false;
-      } else {
-        this.target.x += (followPos.x - this.target.x) * k;
-        this.target.y += (followPos.y - this.target.y) * k;
-        if (this.followZoom) {
-          this.dist += (Math.min(FOLLOW_DIST, this.maxDist) - this.dist) * k * 0.7;
-          if (Math.abs(this.dist - FOLLOW_DIST) < 0.02) this.followZoom = false;
+    switch (this._mode) {
+      case 'follow':
+        if (this.followId === null || !followPos) {
+          // the ant is gone: back to whatever hands-off view we came from
+          this.followId = null;
+          this.followZoom = false;
+          this.setMode(this.lastAuto);
+        } else {
+          this.target.x += (followPos.x - this.target.x) * k;
+          this.target.y += (followPos.y - this.target.y) * k;
+          if (this.followZoom) {
+            this.dist += (Math.min(FOLLOW_DIST, this.maxDist) - this.dist) * k * 0.7;
+            if (Math.abs(this.dist - FOLLOW_DIST) < 0.02) this.followZoom = false;
+          }
         }
-      }
-    } else if (this.overview) {
-      this.target.x += ((this.focus.left + this.focus.right) / 2 - this.target.x) * k;
-      this.target.y += ((this.focus.bottom + this.focus.top) / 2 - this.target.y) * k;
-      this.dist += (this.maxDist - this.dist) * k;
-    } else if (this.goal) {
-      this.target.x += (this.goal.x - this.target.x) * k;
-      this.target.y += (this.goal.y - this.target.y) * k;
-      this.dist += (this.goal.dist - this.dist) * k;
-      if (Math.abs(this.goal.dist - this.dist) < 0.01 && Math.hypot(this.goal.x - this.target.x, this.goal.y - this.target.y) < 0.01) {
-        this.goal = null;
-      }
+        break;
+      case 'overview':
+        this.target.x += ((this.focus.left + this.focus.right) / 2 - this.target.x) * k;
+        this.target.y += ((this.focus.bottom + this.focus.top) / 2 - this.target.y) * k;
+        this.dist += (this.maxDist - this.dist) * k;
+        break;
+      case 'scan':
+        this.updateScan(dt, k);
+        break;
+      case 'drift':
+        this.updateDrift(dt);
+        break;
+      default:
+        if (this.goal) {
+          this.target.x += (this.goal.x - this.target.x) * k;
+          this.target.y += (this.goal.y - this.target.y) * k;
+          this.dist += (this.goal.dist - this.dist) * k;
+          if (Math.abs(this.goal.dist - this.dist) < 0.01 && Math.hypot(this.goal.x - this.target.x, this.goal.y - this.target.y) < 0.01) {
+            this.goal = null;
+          }
+        }
     }
     this.clamp();
     this.apply();
+  }
+
+  /** Whole nest width on screen; the view slides down to the deepest chamber and back, easing and lingering at each end. */
+  private updateScan(dt: number, k: number): void {
+    const { top, bottom } = this.scanSpan();
+    const range = top - bottom;
+    this.dist += (this.widthFitDist() - this.dist) * k;
+    this.target.x += ((this.focus.left + this.focus.right) / 2 - this.target.x) * k;
+    if (range < 0.05) {
+      this.target.y += ((top + bottom) / 2 - this.target.y) * k;
+      return;
+    }
+    if (this.scanHold > 0) {
+      // the viewer is sliding by hand: follow their finger, resume from wherever they left it
+      this.scanHold -= dt;
+      this.scanU = THREE.MathUtils.clamp((top - this.target.y) / range, 0, 1);
+      return;
+    }
+    if (this.scanDwell > 0) {
+      this.scanDwell -= dt;
+    } else {
+      const edge = this.scanDir > 0 ? 1 - this.scanU : this.scanU;
+      const e = THREE.MathUtils.clamp(edge / 0.14, 0, 1);
+      const f = 0.22 + 0.78 * (e * e * (3 - 2 * e)); // slow into the ends, steady between them
+      this.scanU += (this.scanDir * SCAN_SPEED * f * dt) / range;
+      if (this.scanU >= 1 || this.scanU <= 0) {
+        this.scanU = THREE.MathUtils.clamp(this.scanU, 0, 1);
+        this.scanDir = -this.scanDir;
+        this.scanDwell = SCAN_DWELL;
+      }
+    }
+    const wantY = top - this.scanU * range;
+    this.target.y += (wantY - this.target.y) * k;
+  }
+
+  /** Cinematic glide toward the action: accelerates and settles smoothly instead of snapping. */
+  private updateDrift(dt: number): void {
+    const wantDist = Math.min(this.widthFitDist(), Math.max(this.maxDist * 0.5, 3.2));
+    this.dist += (wantDist - this.dist) * (1 - Math.exp(-0.9 * dt));
+    const gx = this.driftGoal ? this.driftGoal.x : (this.focus.left + this.focus.right) / 2;
+    const gy = this.driftGoal ? this.driftGoal.y : (this.focus.bottom + this.focus.top) / 2;
+    const vk = 1 - Math.exp(-2.2 * dt);
+    for (const axis of ['x', 'y'] as const) {
+      const want = THREE.MathUtils.clamp((axis === 'x' ? gx - this.target.x : gy - this.target.y) * 0.9, -DRIFT_MAX_SPEED, DRIFT_MAX_SPEED);
+      this.driftVel[axis] += (want - this.driftVel[axis]) * vk;
+      this.target[axis] += this.driftVel[axis] * dt;
+    }
   }
 
   /** Converts client coordinates into the canvas's own (possibly rotated) pixel space. */
@@ -249,20 +398,28 @@ export class FlatCameraController {
       if (!this.dragged && Math.hypot(p.x - ptr.sx, p.y - ptr.sy) < TAP_PX) return;
       if (!this.dragged) {
         this.dragged = true;
-        // grabbing the view takes it away from whatever the camera was following
-        this.followId = null;
-        this.followZoom = false;
-        this.leaveOverview();
+        if (this._mode === 'scan') {
+          /* sliding up and down keeps the scan: only the sweep pauses */
+        } else {
+          // grabbing the view takes it away from whatever the camera was doing
+          this.setMode('free');
+        }
       }
       const s = this.wpp();
-      this.target.x -= dx * s;
-      this.target.y += dy * s;
+      if (this._mode === 'scan') {
+        const { top, bottom } = this.scanSpan();
+        this.target.y = THREE.MathUtils.clamp(this.target.y + dy * s, Math.min(top, bottom), Math.max(top, bottom));
+        this.scanHold = SCAN_RESUME;
+      } else {
+        this.target.x -= dx * s;
+        this.target.y += dy * s;
+      }
       this.clamp();
       this.apply();
     } else if (this.pointers.size === 2) {
       const s = this.pinchState();
       if (this.pinchDist > 0 && s.d > 0) this.zoomAbout(s.mx, s.my, this.pinchDist / s.d);
-      if (this.followId === null) {
+      if (this._mode !== 'follow') {
         const w = this.wpp();
         this.target.x -= (s.mx - this.pinchMid.x) * w;
         this.target.y += (s.my - this.pinchMid.y) * w;
@@ -291,8 +448,12 @@ export class FlatCameraController {
       const picked = this.onTap(ptr.x, ptr.y);
       const dbl = now - this.lastTap.t < DOUBLE_TAP_MS && Math.hypot(ptr.x - this.lastTap.x, ptr.y - this.lastTap.y) < 40;
       if (!picked) {
-        // tapping away from an ant lets go of it and pulls back out to the whole nest, sky included
-        if (this.followId !== null || dbl) this.reset();
+        // tapping away from an ant lets go of it; a double tap steps through whole farm / scan / drift
+        if (this._mode === 'follow') this.resume();
+        else if (dbl) {
+          if (this._mode === 'free') this.resume();
+          else this.cycleMode();
+        }
       }
       this.lastTap = { t: dbl ? 0 : now, x: ptr.x, y: ptr.y };
     }
