@@ -75,6 +75,9 @@ const _tfOut = {
 };
 const _dummy = new THREE.Object3D();
 const _pick = new THREE.Vector3();
+// Keep bodies (and the head/tail probes) clear of the cut side faces of the soil block
+const EDGE_L = CASE_LEFT + 28;
+const EDGE_R = CASE_RIGHT - 28;
 const _skyDay = new THREE.Color(0x162231);
 const _skyDusk = new THREE.Color(0x281822);
 const _skyNight = new THREE.Color(0x06080d);
@@ -604,7 +607,7 @@ export class Formicarium3DRenderer {
         continue;
       }
       const effectiveZ = clamp(rig.zLane + zDodge, 0.03, 0.44);
-      const tf = this.compute3DSurfaceTransform(sim, ant.x, ant.y, ant.angle, effectiveZ, probeDist);
+      const tf = this.compute3DSurfaceTransform(sim, clamp(ant.x, EDGE_L, EDGE_R), ant.y, ant.angle, effectiveZ, probeDist);
       _targetPos.set(tf.x, tf.y, tf.z);
       if (ant.carriedById != null) _targetPos.y += 0.05; // lifted off the ground in a nestmate's jaws
 
@@ -704,7 +707,7 @@ export class Formicarium3DRenderer {
         }
       }
       const effectiveZ = clamp(rig.zLane + zDodge, 0.04, 0.43);
-      const tf = this.compute3DSurfaceTransform(sim, m.x, m.y, m.angle, effectiveZ, probeDist);
+      const tf = this.compute3DSurfaceTransform(sim, clamp(m.x, EDGE_L, EDGE_R), m.y, m.angle, effectiveZ, probeDist);
       _targetPos.set(tf.x, tf.y, tf.z);
 
       if (!rig.hasInitPos || rig.smoothPos.distanceToSquared(_targetPos) > 2.25) {
@@ -753,8 +756,9 @@ export class Formicarium3DRenderer {
     let pupaC = 0;
     for (const b of sim.brood) {
       if (b.carriedByAntId !== null) continue;
-      const z = Math.max(this.env3d.sampleCavernBackZ(sim, b.x, b.y) + 0.03, 0.14 + Math.sin(b.id * 1.7) * 0.18);
-      _dummy.position.set(simToWorldX(b.x), simToWorldY(b.y) - 0.015, z);
+      const bx = clamp(b.x, EDGE_L, EDGE_R);
+      const z = Math.max(this.env3d.sampleCavernBackZ(sim, bx, b.y) + 0.03, 0.14 + Math.sin(b.id * 1.7) * 0.18);
+      _dummy.position.set(simToWorldX(bx), simToWorldY(b.y) - 0.015, z);
       if (b.stage === BroodStage.EGG && eggC < 90) {
         _dummy.rotation.set(0, b.id * 0.8, Math.sin(b.wigglePhase) * 0.1);
         _dummy.scale.set(1.15, 0.72, 0.72);

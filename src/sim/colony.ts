@@ -5173,7 +5173,7 @@ export class AntColonySimulation {
     const prevX = ant.x;
     const prevY = ant.y;
     const moved = Math.hypot(nx - prevX, ny - prevY);
-    ant.x = clamp(nx, CASE_LEFT + 14, CASE_RIGHT - 14);
+    ant.x = clamp(nx, CASE_LEFT + 28, CASE_RIGHT - 28);
     ant.y = clamp(ny, CASE_TOP + 14, CASE_BOTTOM - 14);
 
     const checkG = this.grid.worldToGrid(ant.x, ant.y);
