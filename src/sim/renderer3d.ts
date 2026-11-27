@@ -1438,6 +1438,7 @@ export class Formicarium3DRenderer {
       locate: (sub) => this.locate(sim, sub),
       size: () => size,
     });
+    this.camCtl.setCaptionHold(!!note);
     this.overlay?.update(note, note?.subject ? this.locate(sim, note.subject) : null, dt, size);
 
     this.renderer.render(this.scene, this.camera);
