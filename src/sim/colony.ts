@@ -176,7 +176,7 @@ export class AntColonySimulation {
   public particles: Particle[] = [];
   public sprouts: PlantSprout[] = [];
   public creatures: Creature[] = [];
-  private creatureTimers: Record<CreatureKind, number> = { bird: 150, spider: 120, antlion: 200, anteater: 900, worm: 400 };
+  private creatureTimers: Record<CreatureKind, number> = { bird: 150, spider: 120, antlion: 200, anteater: 900, worm: 400, ladybug: 25 };
   public surfaceProps: SurfaceProp[] = [];
   public rootPolylines: Vec2[][] = [];
   public events: ColonyEvent[] = [];
@@ -2456,8 +2456,18 @@ export class AntColonySimulation {
     for (const k of Object.keys(this.creatureTimers) as CreatureKind[]) {
       this.creatureTimers[k] -= dt;
       if (this.creatureTimers[k] > 0 || this.ants.length < 15) continue;
-      this.creatureTimers[k] = 600 + Math.random() * 900;
+      this.creatureTimers[k] = k === 'ladybug' ? 120 + Math.random() * 200 : 600 + Math.random() * 900;
       if (has(k)) continue;
+      if (k === 'ladybug') {
+        if (day && mild && this.aphids.length > 0) {
+          const fromLeft = Math.random() < 0.5;
+          const x = fromLeft ? CASE_LEFT + 20 : CASE_RIGHT - 20;
+          const target = this.aphids[Math.floor(Math.random() * this.aphids.length)].x;
+          this.makeCreature('ladybug', x, CASE_TOP + 90, 'flying', { dir: fromLeft ? 1 : -1, tx: target, life: 1500 + Math.random() * 1500 });
+          this.log('A ladybird lands among the plants');
+        }
+        continue;
+      }
       const surfaceAnts = this.ants.filter((a) => this.isOutside(a.x, a.y));
       if (k === 'bird' && day && mild) {
         const fromLeft = Math.random() < 0.5;
@@ -2506,6 +2516,7 @@ export class AntColonySimulation {
       else if (c.kind === 'spider') gone = this.stepSpider(c, dt);
       else if (c.kind === 'antlion') gone = this.stepAntlion(c, dt);
       else if (c.kind === 'anteater') gone = this.stepAnteater(c, dt);
+      else if (c.kind === 'ladybug') gone = this.stepLadybug(c, dt);
       else gone = this.stepWorm(c, dt);
       if (gone) this.creatures.splice(i, 1);
     }
@@ -2608,6 +2619,78 @@ export class AntColonySimulation {
       }
     }
     return c.life <= 0;
+  }
+
+  /**
+   * A ladybird patrols the plants and eats aphids. It is harmless to the ants and they ignore it (it is not a threat,
+   * so nobody attacks it); it only costs the colony some of its honeydew herd, which slowly breeds back.
+   */
+  private stepLadybug(c: Creature, dt: number): boolean {
+    c.life = (c.life ?? 600) - dt;
+    const ground = this.surfaceTarget(c.x).y - 1;
+    if (c.state === 'flying') {
+      const dx = c.tx - c.x;
+      c.dir = dx >= 0 ? 1 : -1;
+      c.x += Math.sign(dx) * Math.min(Math.abs(dx), 70 * dt);
+      c.y += (ground - c.y) * Math.min(1, dt * 0.9);
+      if (Math.abs(dx) < 2 && c.y > ground - 3) {
+        c.state = 'roaming';
+        c.timer = 3;
+      }
+      return false;
+    }
+    if (c.life <= 0 || this.season === 'Winter') {
+      c.state = 'leaving';
+    }
+    if (c.state === 'leaving') {
+      c.x += c.dir * 60 * dt;
+      c.y -= 30 * dt;
+      return c.x < CASE_LEFT - 20 || c.x > CASE_RIGHT + 20 || c.y < CASE_TOP;
+    }
+    if (c.state === 'eating') {
+      if (c.timer <= 0) c.state = 'roaming';
+      return false;
+    }
+    // choose a hunting target: the nearest aphid, as long as a breeding stock is left
+    let target: Aphid | null = null;
+    let best = 260;
+    c.vy = Math.max(0, c.vy - dt);
+    if (this.aphids.length > 6 && c.vy <= 0) {
+      for (const a of this.aphids) {
+        const d = Math.abs(a.x - c.x);
+        if (d < best) {
+          best = d;
+          target = a;
+        }
+      }
+    }
+    let goalY = ground;
+    if (target) {
+      const t = target as Aphid;
+      const dx = t.x - c.x;
+      c.dir = dx >= 0 ? 1 : -1;
+      goalY = Math.abs(dx) < 14 ? t.y : ground;
+      if (Math.abs(dx) > 3) c.x += c.dir * 11 * dt;
+      else if (Math.abs(c.y - t.y) < 3) {
+        c.state = 'eating';
+        c.timer = 3 + Math.random() * 2;
+        c.vy = 35 + Math.random() * 35; // full for a while
+        this.aphids.splice(this.aphids.indexOf(t), 1);
+        this.spark(t.x, t.y, '#ef4444');
+      }
+    } else {
+      // wander: walk, turn around now and then, stop to preen
+      if (c.timer <= 0) {
+        c.timer = 4 + Math.random() * 8;
+        c.dir = Math.random() < 0.5 ? 1 : -1;
+        c.vx = Math.random() < 0.3 ? 0 : 8;
+      }
+      c.x += c.dir * c.vx * dt;
+      if (c.x < CASE_LEFT + 60) c.dir = 1;
+      if (c.x > CASE_RIGHT - 60) c.dir = -1;
+    }
+    c.y += (goalY - c.y) * Math.min(1, dt * 3);
+    return false;
   }
 
   private stepAnteater(c: Creature, dt: number): boolean {
@@ -4018,6 +4101,11 @@ export class AntColonySimulation {
     this.seedAphids();
     // aphids feed on plant sap and excrete honeydew; warm growing weather means more of it, winter none
     const rate = this.season === 'Winter' ? 0 : 0.35 * antActivity(this.surfaceTempC) * (this.rainIntensity() > 0.5 ? 0.3 : 1);
+    // the herd breeds back (slowly) when it is small, so a hungry ladybird can't wipe it out for good
+    if (rate > 0 && this.aphids.length > 0 && this.aphids.length < 16 && Math.random() < dt / 60) {
+      const parent = this.aphids[Math.floor(Math.random() * this.aphids.length)];
+      this.aphids.push({ ...parent, id: this.allocId(), x: parent.x + (Math.random() - 0.5) * 8, honeydew: 0, tenderId: null, phase: Math.random() * 6.28 });
+    }
     for (const a of this.aphids) {
       a.honeydew = Math.min(12, a.honeydew + rate * dt);
       a.phase += dt;

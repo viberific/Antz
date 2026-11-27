@@ -197,6 +197,37 @@ export function createCreatureRig(kind: CreatureKind): CreatureRig {
     jaws.position.z = 0.03;
     root.add(jaws);
     parts.jaws = jaws;
+  } else if (kind === 'ladybug') {
+    const red = flat(0xd8281f, 0.4);
+    const black = flat(0x15110f, 0.5);
+    const white = flat(0xf4f1e8, 0.5);
+    disposables.push(red, black, white);
+    const body = new THREE.Group();
+    const dome = mesh(sphere, red, 0.13, 0.095, 0.11);
+    body.add(dome);
+    body.add(mesh(box, black, 0.003, 0.09, 0.1, 0, 0.0, 0));
+    // spots sit on the flank facing the viewer (z>0) and mirrored on the far side
+    for (const sz of [1, -1])
+      for (const [x, y] of [[0.06, 0.02], [-0.04, 0.045], [-0.07, -0.01], [0.02, -0.025]] as const)
+        body.add(mesh(sphere, black, 0.03, 0.026, 0.014, x, y, sz * 0.098));
+    const head = mesh(sphere, black, 0.045, 0.045, 0.06, 0.13, -0.015, 0);
+    body.add(head);
+    body.add(mesh(sphere, white, 0.012, 0.014, 0.014, 0.165, 0.0, 0.035));
+    body.add(mesh(sphere, white, 0.012, 0.014, 0.014, 0.165, 0.0, -0.035));
+    const legs = new THREE.Group();
+    for (const z of [0.07, 0, -0.07]) for (const s of [1, -1]) legs.add(mesh(cyl, black, 0.008, 0.045, 0.008, (z - 0.01) * 0.9, -0.085, s * 0.07));
+    body.add(legs);
+    const wingM = flat(0xdcd8cf, 0.3);
+    disposables.push(wingM);
+    const wing = mesh(sphere, wingM, 0.13, 0.008, 0.045, -0.03, 0.1, 0.09);
+    wing.visible = false;
+    body.add(wing);
+    body.position.y = 0.12;
+    root.add(body);
+    parts.body = body;
+    parts.legs = legs;
+    parts.wing = wing;
+    parts.dome = dome;
   } else {
     // earthworm: chain of pink segments positioned by the renderer
     const pink = flat(0xd9867f, 0.55);
@@ -249,6 +280,15 @@ export function animateCreatureRig(rig: CreatureRig, c: Creature, time: number):
     p.body.position.y = 1.1 + dart;
     for (const k of ['a', 'b']) for (let i = 0; i < 4; i++) p[`leg${k}${i}`].rotation.z = wob(time * 0.8 + i, 2) * 0.08;
     p.web.rotation.z = wob(time, 0.6) * 0.01;
+  } else if (rig.kind === 'ladybug') {
+    const flying = c.state === 'flying' || c.state === 'leaving';
+    p.wing.visible = flying;
+    p.wing.rotation.x = flying ? wob(time, 60) * 0.6 : 0;
+    p.dome.rotation.z = flying ? 0.35 : 0;
+    p.body.rotation.z = flying ? (c.state === 'leaving' ? 0.4 : -0.3) : 0;
+    p.body.position.y = 0.12 + (flying ? 0 : Math.abs(wob(time, c.state === 'roaming' ? 7 : 1)) * 0.008);
+    p.legs.rotation.z = c.state === 'roaming' ? wob(time, 14) * 0.18 : 0;
+    p.legs.visible = !flying;
   } else if (rig.kind === 'antlion') {
     p.jaws.position.y = c.state === 'flinging' ? wob(time, 25) * 0.04 : 0;
     p.jaws.scale.setScalar(c.state === 'flinging' ? 1.3 : 1);

@@ -365,7 +365,7 @@ export interface CameraState {
   targetZoom: number;
 }
 
-export type CreatureKind = 'bird' | 'spider' | 'antlion' | 'anteater' | 'worm';
+export type CreatureKind = 'bird' | 'spider' | 'antlion' | 'anteater' | 'worm' | 'ladybug';
 
 /** Wildlife that shares the ground with the colony: predators above the surface, an earthworm below it. */
 export interface Creature {

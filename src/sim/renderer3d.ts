@@ -493,7 +493,7 @@ export class Formicarium3DRenderer {
         continue;
       }
       let wy = simToWorldY(c.y);
-      const z = c.kind === 'bird' ? 0.5 : c.kind === 'anteater' ? 0.42 : c.kind === 'spider' ? 0.3 : SOIL_FRONT_Z + 0.03;
+      const z = c.kind === 'bird' ? 0.5 : c.kind === 'anteater' ? 0.42 : c.kind === 'spider' ? 0.3 : c.kind === 'ladybug' ? 0.34 : SOIL_FRONT_Z + 0.03;
       if (c.kind === 'bird') {
         // a flying bird's body is centred on c.y; once it touches down its feet are on the ground
         const gW = simToWorldY(sim.grid.surfaceY[clamp(Math.floor(c.x / CELL_SIZE), 0, GRID_W - 1)]);
