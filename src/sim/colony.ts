@@ -828,9 +828,19 @@ export class AntColonySimulation {
       digIdx: -1,
       excursion: 0,
       restCooldown: 20 + Math.random() * 60,
+      // personality: bell-shaped around the middle, so most ants are ordinary and a few are clearly bold/shy/lazy
+      bold: this.trait(),
+      industry: this.trait(),
+      social: this.trait(),
     };
+    if (caste === AntCaste.SOLDIER) ant.bold = Math.max(ant.bold ?? 0.5, 0.65);
+    ant.speed *= 0.93 + (ant.industry ?? 0.5) * 0.14;
     this.ants.push(ant);
     return ant;
+  }
+
+  private trait(): number {
+    return clamp((Math.random() + Math.random() + Math.random()) / 3 + (Math.random() - 0.5) * 0.15, 0, 1);
   }
 
   private casteSpeed(caste: AntCaste): number {
@@ -866,6 +876,34 @@ export class AntColonySimulation {
       vy: fallFromCanopy ? 25 + Math.random() * 25 : 0,
       falling: fallFromCanopy,
     });
+  }
+
+  /**
+   * A person tapped the open air above the ground: a crumb of food drops from that spot. Returns false (and does
+   * nothing) for taps at or below ground level, or when plenty of loose food is already lying about.
+   */
+  public dropFoodFromTap(x: number, y: number): boolean {
+    const cx = clamp(x, CASE_LEFT + 32, CASE_RIGHT - 32);
+    const gx = Math.floor(cx / CELL_SIZE);
+    const ground = this.grid.surfaceY[gx];
+    if (y > ground - 6) return false;
+    if (this.foods.filter((f) => f.storedInChamberId === null && !f.large).length >= 14) return false;
+    const r = Math.random();
+    const type = r < 0.4 ? PayloadType.SEED : r < 0.7 ? PayloadType.HONEYDEW : PayloadType.PROTEIN;
+    const amount = type === PayloadType.HONEYDEW ? 45 : type === PayloadType.PROTEIN ? 60 : 50;
+    this.foods.push({
+      id: this.allocId(),
+      type,
+      x: cx,
+      y: Math.max(CASE_TOP + 8, y),
+      amount,
+      maxAmount: amount,
+      radius: type === PayloadType.HONEYDEW ? 5.5 : type === PayloadType.PROTEIN ? 7.5 : 6,
+      storedInChamberId: null,
+      vy: 10,
+      falling: true,
+    });
+    return true;
   }
 
   // ================================================================================================================
@@ -2691,7 +2729,9 @@ export class AntColonySimulation {
         this.lastVisit[this.grid.idx(vg.gx, vg.gy)] = this.simTime;
       }
       // A third of the foragers are the night shift; the rest stay in after dark. Bad weather keeps everyone in.
-      const night = (isNight && ant.id % 3 !== 0) || (!goodWeather && !desperate);
+      const nerve = ant.bold ?? 0.5;
+      const braveEnough = nerve > 0.72 && this.rainIntensity() < 0.5 && this.weather !== 'Snow' && this.surfaceTempC > 5 && this.surfaceTempC < 42;
+      const night = (isNight && !(ant.id % 3 === 0 || nerve > 0.7)) || (!goodWeather && !desperate && !braveEnough);
       ant.age += dt;
       ant.greetCooldown = Math.max(0, ant.greetCooldown - dt);
       ant.signalCooldown = Math.max(0, (ant.signalCooldown ?? 0) - dt);
@@ -2790,7 +2830,7 @@ export class AntColonySimulation {
 
       if (fight !== 'moving') {
         // --- casual greeting between passing nestmates -----------------------------------------------------------
-        if (ant.payload === PayloadType.NONE && ant.greetCooldown <= 0 && Math.random() < dt * 0.4 && this.intruders.length === 0) {
+        if (ant.payload === PayloadType.NONE && ant.greetCooldown <= 0 && Math.random() < dt * (0.15 + (ant.social ?? 0.5) * 0.5) && this.intruders.length === 0) {
           let other: Ant | null = null;
           this.forAntsNear(ant.x, ant.y, 9, (o) => {
             if (o.id !== ant.id && o.caste !== AntCaste.QUEEN && o.greetCooldown <= 0 && !BUSY_TASKS.has(o.task) && o.payload === PayloadType.NONE) {
@@ -2903,9 +2943,10 @@ export class AntColonySimulation {
     const g = this.grid.worldToGrid(m.x, m.y);
     const inside = m.y > this.grid.surfaceY[g.gx] + 8;
     const big = m.species === 'beetle' || m.species === 'centipede' || m.species === 'earwig';
-    if (!soldier && big && !inside && bestD > 16) {
-      // flee from big predators out in the open
-      if (bestD > 45) return 'none';
+    const nerve = ant.bold ?? 0.5;
+    if (!soldier && big && !inside && bestD > 16 && nerve < 0.85) {
+      // flee from big predators out in the open; shy ants bolt from further away
+      if (bestD > 30 + (1 - nerve) * 36) return 'none';
       const away = ant.x >= m.x ? 1 : -1;
       if (ant.task !== AntTask.FLEEING || !ant.targetPos || Math.sign(ant.targetPos.x - ant.x) !== away) {
         const t = this.surfaceTarget(ant.x + away * 90);
@@ -4131,7 +4172,7 @@ export class AntColonySimulation {
         return;
       }
       if ((ant.restCooldown = (ant.restCooldown ?? 30) - dt) <= 0 && Math.random() < 0.3) {
-        ant.restCooldown = 60 + Math.random() * 80;
+        ant.restCooldown = (60 + Math.random() * 80) * (0.6 + (ant.industry ?? 0.5) * 0.8);
         this.seekRest(ant, 'granary', 5 + Math.random() * 10);
         return;
       }
@@ -4981,6 +5022,9 @@ export class AntColonySimulation {
         default:
           break;
       }
+      const work = ant.industry ?? 0.5;
+      pauseRate *= 1.6 - work * 1.2;
+      base *= 0.94 + work * 0.12;
       const ebb = 1 + 0.16 * Math.sin(this.simTime * (0.9 + (ant.id % 7) * 0.13) + ant.id * 1.9);
       target = base * ebb;
       if (pauseRate > 0 && ant.payload === PayloadType.NONE && Math.random() < pauseRate * dt) {

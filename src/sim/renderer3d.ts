@@ -164,7 +164,12 @@ export class Formicarium3DRenderer {
   private readonly debrisMesh: THREE.InstancedMesh;
   private floodKey = '';
 
+  private readonly sim: AntColonySimulation;
+  private readonly _ray = new THREE.Raycaster();
+  private readonly _plane = new THREE.Plane(new THREE.Vector3(0, 0, 1), -SOIL_FRONT_Z);
+
   constructor(container: HTMLElement, sim: AntColonySimulation) {
+    this.sim = sim;
     this.container = container;
     this.isSoftwareGl = detectSoftwareWebGL();
 
@@ -324,7 +329,7 @@ export class Formicarium3DRenderer {
         bottom: simToWorldY(CASE_BOTTOM),
         z: SOIL_FRONT_Z,
       },
-      (lx, ly) => this.pickAnt(lx, ly)
+      (lx, ly) => this.pickAnt(lx, ly) || (this.dropFoodAt(lx, ly), false)
     );
 
     if (!this.isSoftwareGl) {
@@ -382,6 +387,18 @@ export class Formicarium3DRenderer {
 
   public resetCamera(): void {
     this.camCtl.reset();
+  }
+
+  /** A tap on empty sky or open ground above the surface drops food there (underground taps do nothing). */
+  private dropFoodAt(lx: number, ly: number): boolean {
+    const w = this.renderer.domElement.clientWidth || 1;
+    const h = this.renderer.domElement.clientHeight || 1;
+    this._ray.setFromCamera(new THREE.Vector2((lx / w) * 2 - 1, -(ly / h) * 2 + 1), this.camera);
+    const hit = this._ray.ray.intersectPlane(this._plane, _pick);
+    if (!hit) return false;
+    const sx = _pick.x / WORLD_SCALE + WORLD_W * 0.5;
+    const sy = WORLD_H * 0.5 - _pick.y / WORLD_SCALE;
+    return this.sim.dropFoodFromTap(sx, sy);
   }
 
   /** Picks the ant drawn nearest a canvas-local pixel and starts following it. */

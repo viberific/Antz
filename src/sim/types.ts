@@ -193,6 +193,11 @@ export interface Ant {
   flying?: boolean;
   /** excavators: grid cell of the disused gallery this soil load is going into (-1 = to the mound) */
   backfill?: number;
+  /** personality, each 0..1: nerve (stands and fights, goes out at night/in marginal weather), diligence (pace, rests
+   *  less) and sociability (greets, shares and groups up more) */
+  bold?: number;
+  industry?: number;
+  social?: number;
 }
 
 export interface BroodItem {
