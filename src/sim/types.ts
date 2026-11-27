@@ -78,6 +78,8 @@ export enum AntTask {
   CLUSTERING = 'Overwintering Cluster',
   SEALING_ENTRANCE = 'Sealing Entrance',
   BACKFILLING = 'Backfilling Old Gallery',
+  CUTTING_LEAF = 'Cutting Leaf',
+  CARRYING_LEAF = 'Carrying Leaf to Fungus Garden',
 }
 
 export enum PayloadType {
@@ -95,6 +97,8 @@ export enum PayloadType {
   CHAFF = 10,
   /** a twig or grit cleared off a busy trail */
   DEBRIS = 11,
+  /** a snipped piece of leaf for the fungus garden */
+  LEAF = 12,
 }
 
 export enum BroodStage {
@@ -193,6 +197,15 @@ export interface Ant {
   flying?: boolean;
   /** excavators: grid cell of the disused gallery this soil load is going into (-1 = to the mound) */
   backfill?: number;
+  /** personality, each 0..1: nerve (stands and fights, goes out at night/in marginal weather), diligence (pace, rests
+   *  less) and sociability (greets, shares and groups up more) */
+  /** seconds left cutting a leaf fragment (undefined = not cutting) */
+  leafTimer?: number;
+  bold?: number;
+  /** soldier marching out with the counter-raid on the rival nest */
+  warBand?: boolean;
+  industry?: number;
+  social?: number;
 }
 
 export interface BroodItem {
@@ -293,6 +306,10 @@ export interface Intruder {
   age?: number;
   /** has left the home crevice at least once (so it can't 'escape' the moment it spawns) */
   roamed?: boolean;
+  /** soldier of a rival colony at war with ours: keeps fighting until badly hurt instead of losing nerve */
+  warrior?: boolean;
+  /** defender of the rival nest: stays near this x instead of marching on ours */
+  holdPost?: number;
 }
 
 export interface FallenAnt {
@@ -325,6 +342,8 @@ export interface PlantSprout {
   swayPhase: number;
   kind: 'moss' | 'clover' | 'fern' | 'grass';
   shade: number;
+  /** 0..1 how much has been snipped off by leaf-cutters (regrows) */
+  cut?: number;
 }
 
 export interface SurfaceProp {
@@ -344,4 +363,31 @@ export interface CameraState {
   targetX: number;
   targetY: number;
   targetZoom: number;
+}
+
+export type CreatureKind = 'bird' | 'spider' | 'antlion' | 'anteater' | 'worm' | 'ladybug';
+
+/** Wildlife that shares the ground with the colony: predators above the surface, an earthworm below it. */
+export interface Creature {
+  id: number;
+  kind: CreatureKind;
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  /** facing: +1 right, -1 left */
+  dir: 1 | -1;
+  state: string;
+  timer: number;
+  phase: number;
+  /** bites it has taken from defending ants (drives it away when too many) */
+  hits: number;
+  /** goal x (landing spot, dig site...) */
+  tx: number;
+  /** worm: recent positions, head first */
+  trail?: Vec2[];
+  /** worm: sim units of burrow still to dig */
+  left?: number;
+  /** antlion/spider: lifetime left in seconds */
+  life?: number;
 }

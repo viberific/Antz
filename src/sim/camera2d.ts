@@ -39,6 +39,10 @@ export class FlatCameraController {
   private goal: { x: number; y: number; dist: number } | null = null;
   /** while following, ease toward FOLLOW_DIST until the user zooms by hand */
   private followZoom = false;
+  /** the rectangle worth looking at (sky, ground and every chamber); the zoomed-out view frames exactly this */
+  private focus: { left: number; right: number; bottom: number; top: number };
+  /** true while the camera sits on the framed overview (tracks it as the nest grows) */
+  private overview = true;
 
   private readonly pointers = new Map<number, { x: number; y: number; sx: number; sy: number; t: number }>();
   private pinchDist = 0;
@@ -56,6 +60,7 @@ export class FlatCameraController {
     this.dom = dom;
     this.bounds = bounds;
     this.onTap = onTap;
+    this.focus = { ...bounds };
     this.target.set((bounds.left + bounds.right) / 2, (bounds.bottom + bounds.top) / 2);
     this.fit();
     this.dist = this.maxDist;
@@ -82,28 +87,48 @@ export class FlatCameraController {
   /** Recompute the cover distance (call after the camera aspect changes). */
   public fit(): void {
     const tan = Math.tan(THREE.MathUtils.degToRad(this.camera.fov) / 2);
-    const halfW = (this.bounds.right - this.bounds.left) / 2;
-    const halfH = (this.bounds.top - this.bounds.bottom) / 2;
-    this.maxDist = Math.min(halfH / tan, halfW / (tan * Math.max(0.01, this.camera.aspect)));
+    const halfW = (this.focus.right - this.focus.left) / 2;
+    const halfH = (this.focus.top - this.focus.bottom) / 2;
+    // largest zoom-out = just enough to frame the focus rectangle (never beyond what the case itself covers)
+    this.maxDist = Math.max(halfH / tan, halfW / (tan * Math.max(0.01, this.camera.aspect)));
     this.dist = Math.min(this.dist, this.maxDist);
     if (this.goal) this.goal.dist = Math.min(this.goal.dist, this.maxDist);
     this.clamp();
     this.apply();
   }
 
+  public focusCenterX(): number {
+    return (this.focus.left + this.focus.right) / 2;
+  }
+
+  /** Tell the camera what the zoomed-out view should frame (clipped to the case). */
+  public setFocus(f: { left: number; right: number; bottom: number; top: number }): void {
+    const b = this.bounds;
+    this.focus = {
+      left: Math.max(b.left, f.left),
+      right: Math.min(b.right, f.right),
+      bottom: Math.max(b.bottom, f.bottom),
+      top: Math.min(b.top, f.top),
+    };
+    this.fit();
+  }
+
   public reset(): void {
     this.followId = null;
     this.followZoom = false;
-    this.goal = {
-      x: (this.bounds.left + this.bounds.right) / 2,
-      y: (this.bounds.bottom + this.bounds.top) / 2,
-      dist: this.maxDist,
-    };
+    this.goal = null;
+    this.overview = true;
+  }
+
+  private leaveOverview(): void {
+    this.overview = false;
+    this.goal = null;
   }
 
   public follow(id: number): void {
     this.followId = id;
     this.followZoom = true;
+    this.overview = false;
     this.goal = null;
   }
 
@@ -122,6 +147,10 @@ export class FlatCameraController {
           if (Math.abs(this.dist - FOLLOW_DIST) < 0.02) this.followZoom = false;
         }
       }
+    } else if (this.overview) {
+      this.target.x += ((this.focus.left + this.focus.right) / 2 - this.target.x) * k;
+      this.target.y += ((this.focus.bottom + this.focus.top) / 2 - this.target.y) * k;
+      this.dist += (this.maxDist - this.dist) * k;
     } else if (this.goal) {
       this.target.x += (this.goal.x - this.target.x) * k;
       this.target.y += (this.goal.y - this.target.y) * k;
@@ -181,7 +210,7 @@ export class FlatCameraController {
     this.target.x = wx - (lx - w / 2) * after;
     this.target.y = wy + (ly - h / 2) * after;
     this.followZoom = false;
-    this.goal = null;
+    this.leaveOverview();
     this.clamp();
     this.apply();
   }
@@ -223,7 +252,7 @@ export class FlatCameraController {
         // grabbing the view takes it away from whatever the camera was following
         this.followId = null;
         this.followZoom = false;
-        this.goal = null;
+        this.leaveOverview();
       }
       const s = this.wpp();
       this.target.x -= dx * s;
@@ -262,9 +291,8 @@ export class FlatCameraController {
       const picked = this.onTap(ptr.x, ptr.y);
       const dbl = now - this.lastTap.t < DOUBLE_TAP_MS && Math.hypot(ptr.x - this.lastTap.x, ptr.y - this.lastTap.y) < 40;
       if (!picked) {
-        this.followId = null;
-        this.followZoom = false;
-        if (dbl) this.reset();
+        // tapping away from an ant lets go of it and pulls back out to the whole nest, sky included
+        if (this.followId !== null || dbl) this.reset();
       }
       this.lastTap = { t: dbl ? 0 : now, x: ptr.x, y: ptr.y };
     }

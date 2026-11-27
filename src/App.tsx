@@ -48,10 +48,12 @@ export default function App() {
     if (!container) return;
 
     const sim = new AntColonySimulation();
+    if (import.meta.env.DEV) (window as unknown as { __sim?: AntColonySimulation }).__sim = sim;
     const world = new RealWorld(sim);
     world.start();
     const renderer3d = new Formicarium3DRenderer(container, sim);
     renderer3dRef.current = renderer3d;
+    if (import.meta.env.DEV) (window as unknown as { __r?: unknown }).__r = renderer3d;
     if (import.meta.env.DEV) (window as unknown as { __antz?: unknown }).__antz = { sim, renderer3d };
 
     let rafId = 0;

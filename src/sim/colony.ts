@@ -24,6 +24,8 @@ import {
   Particle,
   PayloadType,
   PlantSprout,
+  Creature,
+  CreatureKind,
   SURFACE_BASE_Y,
   SurfaceProp,
   Vec2,
@@ -54,7 +56,7 @@ const DAY_LENGTH = 200;
 
 export type Season = 'Spring' | 'Summer' | 'Autumn' | 'Winter';
 
-type CollapseCause = 'settling' | 'saturation' | 'rain' | 'drought' | 'thaw' | 'span' | 'abandoned' | 'footsteps';
+type CollapseCause = 'settling' | 'saturation' | 'rain' | 'drought' | 'thaw' | 'span' | 'abandoned' | 'footsteps' | 'anteater';
 
 export interface Climate {
   tempC: number;
@@ -173,6 +175,8 @@ export class AntColonySimulation {
   public fallenAnts: FallenAnt[] = [];
   public particles: Particle[] = [];
   public sprouts: PlantSprout[] = [];
+  public creatures: Creature[] = [];
+  private creatureTimers: Record<CreatureKind, number> = { bird: 150, spider: 120, antlion: 200, anteater: 900, worm: 400, ladybug: 25 };
   public surfaceProps: SurfaceProp[] = [];
   public rootPolylines: Vec2[][] = [];
   public events: ColonyEvent[] = [];
@@ -219,6 +223,25 @@ export class AntColonySimulation {
   /** 0 = nothing planned, 1 = planned expansion, 2 = urgent repair of storm damage */
   public digPlan: Uint8Array = new Uint8Array(N_CELLS);
   private projects: DigProject[] = [];
+  /** the colony is moving house: workers dig a new royal chamber, then the queen and brood relocate into it */
+  private emigration: { newId: number; oldId: number; phase: 'digging' | 'moving'; t: number } | null = null;
+  private emigrationCooldown = 400;
+  private royalStress = 0;
+  /** 0..1+: how badly a rival colony's war is going for us (drives emigration) */
+  public warPressure = 0;
+  /** the rival colony next door: tension builds until it declares war, then sends waves; we may counter-raid */
+  public war = {
+    phase: 'peace' as 'peace' | 'war',
+    tension: 0.15,
+    wave: 0,
+    waves: 0,
+    nextWave: 0,
+    kills: 0,
+    lost: 0,
+    edge: 'left' as 'left' | 'right',
+    raid: null as { x: number; t: number; spawned: boolean } | null,
+    raidDone: false,
+  };
   private planCount = 0;
   private repairCount = 0;
 
@@ -828,9 +851,19 @@ export class AntColonySimulation {
       digIdx: -1,
       excursion: 0,
       restCooldown: 20 + Math.random() * 60,
+      // personality: bell-shaped around the middle, so most ants are ordinary and a few are clearly bold/shy/lazy
+      bold: this.trait(),
+      industry: this.trait(),
+      social: this.trait(),
     };
+    if (caste === AntCaste.SOLDIER) ant.bold = Math.max(ant.bold ?? 0.5, 0.65);
+    ant.speed *= 0.93 + (ant.industry ?? 0.5) * 0.14;
     this.ants.push(ant);
     return ant;
+  }
+
+  private trait(): number {
+    return clamp((Math.random() + Math.random() + Math.random()) / 3 + (Math.random() - 0.5) * 0.15, 0, 1);
   }
 
   private casteSpeed(caste: AntCaste): number {
@@ -866,6 +899,34 @@ export class AntColonySimulation {
       vy: fallFromCanopy ? 25 + Math.random() * 25 : 0,
       falling: fallFromCanopy,
     });
+  }
+
+  /**
+   * A person tapped the open air above the ground: a crumb of food drops from that spot. Returns false (and does
+   * nothing) for taps at or below ground level, or when plenty of loose food is already lying about.
+   */
+  public dropFoodFromTap(x: number, y: number): boolean {
+    const cx = clamp(x, CASE_LEFT + 32, CASE_RIGHT - 32);
+    const gx = Math.floor(cx / CELL_SIZE);
+    const ground = this.grid.surfaceY[gx];
+    if (y > ground - 6) return false;
+    if (this.foods.filter((f) => f.storedInChamberId === null && !f.large).length >= 14) return false;
+    const r = Math.random();
+    const type = r < 0.4 ? PayloadType.SEED : r < 0.7 ? PayloadType.HONEYDEW : PayloadType.PROTEIN;
+    const amount = type === PayloadType.HONEYDEW ? 45 : type === PayloadType.PROTEIN ? 60 : 50;
+    this.foods.push({
+      id: this.allocId(),
+      type,
+      x: cx,
+      y: Math.max(CASE_TOP + 8, y),
+      amount,
+      maxAmount: amount,
+      radius: type === PayloadType.HONEYDEW ? 5.5 : type === PayloadType.PROTEIN ? 7.5 : 6,
+      storedInChamberId: null,
+      vy: 10,
+      falling: true,
+    });
+    return true;
   }
 
   // ================================================================================================================
@@ -910,6 +971,7 @@ export class AntColonySimulation {
     this.stepDebris(dt);
     this.stepQueenless(dt);
     this.stepNuptialFlight(dt);
+    this.stepEmigration(dt);
     this.stepEntranceSealing(dt);
     this.stepBrood(dt);
     this.stepQueenLaying(dt);
@@ -919,6 +981,8 @@ export class AntColonySimulation {
     this.pathBudget = 10;
     this.buildHash();
     this.refreshClaims();
+    this.stepWar(dt);
+    this.stepCreatures(dt);
     this.stepIntruders(dt);
     this.stepAnts(dt);
     this.stepGroupTransport(dt);
@@ -1274,6 +1338,7 @@ export class AntColonySimulation {
       }
     }
 
+    for (const sp of this.sprouts) if ((sp.cut ?? 0) > 0) sp.cut = Math.max(0, (sp.cut ?? 0) - dt / 500);
     // Fungus garden blooms when soil is hydrated
     this.fungusTimer -= dt;
     if (this.fungusTimer <= 0) {
@@ -1876,15 +1941,91 @@ export class AntColonySimulation {
     }
   }
 
+  /**
+   * Nest moving. Real colonies emigrate when the nest turns unsafe (flooding, extreme temperatures, a lost war):
+   * scouts and diggers prepare a new royal chamber on safer ground, then the queen and brood move in.
+   */
+  private stepEmigration(dt: number): void {
+    const queen = this.getQueen();
+    if (!queen) return;
+    this.emigrationCooldown -= dt;
+    const royals = this.chambers.filter((c) => c.type === ChamberType.ROYAL);
+
+    if (!this.emigration) {
+      const royal = royals[0];
+      if (!royal || this.emigrationCooldown > 0 || this.projects.length > 1) return;
+      const t = this.tempAt(royal.x, royal.y);
+      let stress = 0;
+      if (this.chamberFlooded(royal)) stress += 1;
+      if (t < 2 || t > 32) stress += 0.5;
+      if (this.warPressure > 0.8) stress += 0.8;
+      this.royalStress = stress > 0 ? this.royalStress + stress * dt : Math.max(0, this.royalStress - dt * 2);
+      if (this.royalStress < 45) return;
+      const why = this.chamberFlooded(royal) ? 'rising water' : this.warPressure > 0.8 ? 'the war' : 'the extreme temperatures';
+      const maxY = this.floodDepth > 0 ? Math.min(CASE_BOTTOM - 60, this.floodLineY() - 40) : CASE_BOTTOM - 60;
+      this.royalStress = 0;
+      this.emigrationCooldown = 300;
+      // first choice: an existing chamber on safer ground swaps roles with the endangered royal chamber
+      const safe = this.chambers
+        .filter((c) => c.type !== ChamberType.ROYAL && c.type !== ChamberType.NURSERY && c.type !== ChamberType.MIDDEN && !this.chamberFlooded(c) && c.rx >= 36)
+        .filter((c) => {
+          const tc = this.tempAt(c.x, c.y);
+          return tc > 3 && tc < 31 && c.y - this.grid.surfaceY[clamp(Math.floor(c.x / CELL_SIZE), 0, GRID_W - 1)] > 50;
+        })
+        .sort((a, b) => b.rx - a.rx)[0];
+      if (safe) {
+        const oldType = safe.type;
+        safe.type = ChamberType.ROYAL;
+        royal.type = oldType;
+        for (const fk of STATIC_FIELDS) this.fieldDirty[fk] = true;
+        this.emigration = { newId: safe.id, oldId: royal.id, phase: 'moving', t: 0 };
+        this.log(`The nest is no longer safe (${why}): the colony is moving the queen to the ${oldType.toLowerCase()}`, 'danger');
+        return;
+      }
+      if (!this.planNewProject(ChamberType.ROYAL, Math.max(SURFACE_BASE_Y + 130, maxY))) return;
+      const proj = this.projects[this.projects.length - 1];
+      this.emigration = { newId: proj.id, oldId: royal.id, phase: 'digging', t: 0 };
+      this.log(`The nest is no longer safe (${why}): workers begin digging a new royal chamber`, 'danger');
+      return;
+    }
+
+    const em = this.emigration;
+    em.t += dt;
+    const fresh = this.chambers.find((c) => c.id === em.newId);
+    if (em.phase === 'digging') {
+      if (!fresh) {
+        if (em.t > 1800 || !this.projects.some((p) => p.id === em.newId)) this.emigration = null; // gave up
+        return;
+      }
+      // the new chamber is ready: it becomes the royal chamber, the old one is handed over to the brood
+      const old = this.chambers.find((c) => c.id === em.oldId);
+      if (old) old.type = ChamberType.NURSERY;
+      for (const fk of STATIC_FIELDS) this.fieldDirty[fk] = true;
+      em.phase = 'moving';
+      em.t = 0;
+      this.log('The colony is moving house: the queen is led to her new chamber', 'good');
+      return;
+    }
+    if (!fresh || em.t > 900) {
+      this.emigration = null;
+      return;
+    }
+    if (this.isInsideChamber(queen, fresh, 1.0)) {
+      this.emigration = null;
+      this.emigrationCooldown = 1500;
+      this.log('The queen has settled into her new royal chamber', 'good');
+    }
+  }
+
   /** Picks a site for a new chamber near the existing nest and plans the tunnel + chamber cells. */
-  private planNewProject(type: ChamberType): boolean {
+  private planNewProject(type: ChamberType, maxY: number = CASE_BOTTOM - 60): boolean {
     let best: { x: number; y: number; rx: number; ry: number; tx: number; ty: number; score: number } | null = null;
     const depthBias = Math.min(1, this.chambers.length / 10);
     for (let attempt = 0; attempt < 70; attempt++) {
       const rx = 40 + Math.random() * 18;
       const ry = 20 + Math.random() * 8;
       const x = CASE_LEFT + 110 + Math.random() * (CASE_RIGHT - CASE_LEFT - 220);
-      const y = SURFACE_BASE_Y + 110 + Math.random() * (CASE_BOTTOM - SURFACE_BASE_Y - 170);
+      const y = SURFACE_BASE_Y + 110 + Math.random() * Math.max(10, maxY - SURFACE_BASE_Y - 110);
       let tooClose = false;
       for (const c of this.chambers.concat(this.projects as unknown as Chamber[])) {
         if (Math.abs(c.x - x) < c.rx + rx + 36 && Math.abs(c.y - y) < c.ry + ry + 40) {
@@ -2260,6 +2401,519 @@ export class AntColonySimulation {
     }
   }
 
+  // ================================================================================================================
+  // Wildlife: predators on the surface, an earthworm underground
+  // ================================================================================================================
+
+  private makeCreature(kind: CreatureKind, x: number, y: number, state: string, extra: Partial<Creature> = {}): Creature {
+    const c: Creature = { id: this.allocId(), kind, x, y, vx: 0, vy: 0, dir: 1, state, timer: 0, phase: Math.random() * 6, hits: 0, tx: x, ...extra };
+    this.creatures.push(c);
+    return c;
+  }
+
+  /** Ants near (x, y) that can run, scatter away from it. */
+  private scatterAnts(x: number, y: number, r: number, panic = 1): void {
+    this.forAntsNear(x, y, r, (a) => {
+      if (a.caste === AntCaste.QUEEN || a.caste === AntCaste.SOLDIER || a.flying || a.buried !== undefined || a.carriedById != null) return;
+      if (!this.isOutside(a.x, a.y) || (a.bold ?? 0.5) > 0.88 / panic) return;
+      const away = a.x >= x ? 1 : -1;
+      const t = this.surfaceTarget(a.x + away * 80);
+      this.goTo(a, t.x, t.y);
+      a.task = AntTask.FLEEING;
+    });
+  }
+
+  /** One surface ant within reach is caught; soldiers and bold foragers get a hit in before it dies. */
+  private snatchAnt(x: number, y: number, reach: number): Ant | null {
+    let victim: Ant | null = null;
+    let best = reach;
+    this.forAntsNear(x, y, reach + 8, (a) => {
+      if (a.caste === AntCaste.QUEEN || a.flying || a.buried !== undefined || !this.isOutside(a.x, a.y)) return;
+      const d = Math.hypot(a.x - x, a.y - y);
+      if (d < best) {
+        best = d;
+        victim = a;
+      }
+    });
+    if (!victim) return null;
+    const v = victim as Ant;
+    this.killAnt(this.ants.indexOf(v), 'combat');
+    return v;
+  }
+
+  private defendersNear(x: number, y: number, r: number): number {
+    let n = 0;
+    this.forAntsNear(x, y, r, (a) => {
+      if (a.caste === AntCaste.SOLDIER || (a.bold ?? 0.5) > 0.6) n++;
+    });
+    return n;
+  }
+
+  private stepCreatures(dt: number): void {
+    const day = !this.isNight();
+    const mild = this.forageWeather() && this.season !== 'Winter';
+    const has = (k: CreatureKind) => this.creatures.some((c) => c.kind === k);
+    for (const k of Object.keys(this.creatureTimers) as CreatureKind[]) {
+      this.creatureTimers[k] -= dt;
+      if (this.creatureTimers[k] > 0 || this.ants.length < 15) continue;
+      this.creatureTimers[k] = k === 'ladybug' ? 120 + Math.random() * 200 : 600 + Math.random() * 900;
+      if (has(k)) continue;
+      if (k === 'ladybug') {
+        if (day && mild && this.aphids.length > 0) {
+          const fromLeft = Math.random() < 0.5;
+          const x = fromLeft ? CASE_LEFT + 20 : CASE_RIGHT - 20;
+          const target = this.aphids[Math.floor(Math.random() * this.aphids.length)].x;
+          this.makeCreature('ladybug', x, CASE_TOP + 90, 'flying', { dir: fromLeft ? 1 : -1, tx: target, life: 1500 + Math.random() * 1500 });
+          this.log('A ladybird lands among the plants');
+        }
+        continue;
+      }
+      const surfaceAnts = this.ants.filter((a) => this.isOutside(a.x, a.y));
+      if (k === 'bird' && day && mild) {
+        const fromLeft = Math.random() < 0.5;
+        const target = surfaceAnts.length ? surfaceAnts[Math.floor(Math.random() * surfaceAnts.length)].x : CASE_LEFT + 200 + Math.random() * 900;
+        const c = this.makeCreature('bird', fromLeft ? CASE_LEFT + 10 : CASE_RIGHT - 10, CASE_TOP + 40, 'arriving', { dir: fromLeft ? 1 : -1, tx: clamp(target, CASE_LEFT + 80, CASE_RIGHT - 80) });
+        this.log('A bird swoops down looking for a meal', 'danger');
+        void c;
+      } else if (k === 'spider' && mild && this.sprouts.length > 0) {
+        const hosts = this.sprouts.filter((s) => s.kind !== 'moss' && Math.abs(s.x - this.entrancePos.x) > 90 && Math.abs(s.x - SIDE_ENTRANCE_X) > 60);
+        if (hosts.length) {
+          const h = hosts[Math.floor(Math.random() * hosts.length)];
+          this.makeCreature('spider', h.x, this.surfaceTarget(h.x).y, 'waiting', { life: 900 + Math.random() * 900 });
+          this.log('A spider spins a web beside the foraging trail', 'danger');
+        }
+      } else if (k === 'antlion' && this.season !== 'Winter') {
+        const x = CASE_LEFT + 140 + Math.random() * (CASE_RIGHT - CASE_LEFT - 280);
+        if (Math.abs(x - this.entrancePos.x) > 110 && Math.abs(x - SIDE_ENTRANCE_X) > 80) {
+          this.makeCreature('antlion', x, this.surfaceTarget(x).y, 'lurking', { life: 2000 + Math.random() * 1500 });
+          this.log('An antlion has dug a sand pit on the foraging ground', 'danger');
+        }
+      } else if (k === 'anteater' && day && mild) {
+        const fromLeft = Math.random() < 0.5;
+        this.makeCreature('anteater', fromLeft ? CASE_LEFT + 24 : CASE_RIGHT - 24, this.surfaceTarget(fromLeft ? CASE_LEFT + 24 : CASE_RIGHT - 24).y, 'approach', {
+          dir: fromLeft ? 1 : -1,
+          tx: this.entrancePos.x + (fromLeft ? -34 : 34),
+        });
+        this.log('An anteater lumbers out of the undergrowth', 'danger');
+      } else if (k === 'worm' && this.season !== 'Winter' && !this.frozen && (this.wetness > 0.05 || Math.random() < 0.5)) {
+        const x = CASE_LEFT + 140 + Math.random() * (CASE_RIGHT - CASE_LEFT - 280);
+        const y = this.grid.surfaceY[clamp(Math.floor(x / CELL_SIZE), 0, GRID_W - 1)] + 70 + Math.random() * 260;
+        const g = this.grid.worldToGrid(x, y);
+        if (this.canExcavate(this.grid.idx(g.gx, g.gy)) && y < CASE_BOTTOM - 70) {
+          const dir: 1 | -1 = Math.random() < 0.5 ? 1 : -1;
+          this.makeCreature('worm', x, y, 'burrowing', { dir, left: 140 + Math.random() * 180, trail: [] });
+          this.log('An earthworm is tunnelling through the soil', 'good');
+        }
+      }
+    }
+
+    for (let i = this.creatures.length - 1; i >= 0; i--) {
+      const c = this.creatures[i];
+      c.phase += dt;
+      c.timer -= dt;
+      let gone = false;
+      if (c.kind === 'bird') gone = this.stepBird(c, dt);
+      else if (c.kind === 'spider') gone = this.stepSpider(c, dt);
+      else if (c.kind === 'antlion') gone = this.stepAntlion(c, dt);
+      else if (c.kind === 'anteater') gone = this.stepAnteater(c, dt);
+      else if (c.kind === 'ladybug') gone = this.stepLadybug(c, dt);
+      else gone = this.stepWorm(c, dt);
+      if (gone) this.creatures.splice(i, 1);
+    }
+  }
+
+  private stepBird(c: Creature, dt: number): boolean {
+    const ground = this.surfaceTarget(c.x).y;
+    if (c.state === 'arriving') {
+      const dx = c.tx - c.x;
+      c.dir = dx >= 0 ? 1 : -1;
+      c.x += Math.sign(dx) * Math.min(Math.abs(dx), 150 * dt);
+      const want = Math.abs(dx) < 120 ? ground - 4 : CASE_TOP + 60;
+      c.y += (want - c.y) * Math.min(1, dt * 1.6);
+      if (Math.abs(dx) < 3 && Math.abs(c.y - (ground - 4)) < 6) {
+        c.state = 'pecking';
+        c.timer = 14 + Math.random() * 10;
+        c.y = ground - 4;
+        c.vx = 0;
+      }
+      this.scatterAnts(c.x, c.y, 120, 1.3);
+      return false;
+    }
+    if (c.state === 'pecking') {
+      c.y = this.surfaceTarget(c.x).y - 4;
+      // hops along the ground toward the nearest foragers
+      c.vx = 0;
+      let nearest: Ant | null = null;
+      let best = 160;
+      this.forAntsNear(c.x, c.y, 160, (a) => {
+        if (!this.isOutside(a.x, a.y)) return;
+        const d = Math.abs(a.x - c.x);
+        if (d < best) {
+          best = d;
+          nearest = a;
+        }
+      });
+      if (nearest) {
+        const n = nearest as Ant;
+        c.dir = n.x >= c.x ? 1 : -1;
+        if (Math.abs(n.x - c.x) > 14) {
+          c.x += c.dir * 32 * dt;
+          c.vx = c.dir * 32;
+        }
+      }
+      this.scatterAnts(c.x, c.y, 90, 1.3);
+      if (Math.floor(c.phase * 0.62) !== Math.floor((c.phase - dt) * 0.62)) {
+        const got = Math.random() < 0.35 ? this.snatchAnt(c.x + c.dir * 8, c.y + 4, 20) : null;
+        if (got) this.log('A bird snatched a forager', 'danger');
+        this.spark(c.x + c.dir * 8, c.y + 4, '#fcd34d');
+      }
+      c.hits += this.defendersNear(c.x, c.y, 30) > 2 ? dt * 0.6 : 0;
+      if (c.timer <= 0 || c.hits > 4) {
+        c.state = 'leaving';
+        c.dir = c.x < (CASE_LEFT + CASE_RIGHT) / 2 ? -1 : 1;
+        if (c.hits > 4) this.log('Soldiers drove the bird off', 'good');
+      }
+      return false;
+    }
+    c.x += c.dir * 170 * dt;
+    c.y -= 70 * dt;
+    return c.x < CASE_LEFT - 30 || c.x > CASE_RIGHT + 30 || c.y < CASE_TOP - 40;
+  }
+
+  private stepSpider(c: Creature, dt: number): boolean {
+    c.life = (c.life ?? 600) - dt;
+    c.y = this.surfaceTarget(c.x).y;
+    // foragers wander into the web; the spider darts out and wraps one now and then
+    c.vy = Math.max(0, c.vy - dt);
+    if (c.state === 'waiting') {
+      if (c.vy <= 0 && Math.random() < dt * 0.25) {
+        const victim = this.snatchAnt(c.x, c.y - 8, 22);
+        if (victim) {
+          c.state = 'wrapping';
+          c.timer = 4;
+          c.vy = 40 + Math.random() * 40;
+          this.log('A forager was caught in a spider web', 'danger');
+        }
+      }
+    } else if (c.timer <= 0) c.state = 'waiting';
+    c.hits += this.defendersNear(c.x, c.y, 36) >= 5 ? dt * 0.5 : 0;
+    if (c.hits > 3) {
+      this.log('A crowd of ants drove the spider away', 'good');
+      return true;
+    }
+    return c.life <= 0;
+  }
+
+  private stepAntlion(c: Creature, dt: number): boolean {
+    c.life = (c.life ?? 600) - dt;
+    c.y = this.surfaceTarget(c.x).y;
+    if (c.state === 'flinging' && c.timer <= 0) c.state = 'lurking';
+    c.vy = Math.max(0, c.vy - dt);
+    if (c.vy <= 0 && Math.random() < dt * 0.3) {
+      const a = this.snatchAnt(c.x, c.y, 9);
+      if (a) {
+        c.state = 'flinging';
+        c.timer = 2.2;
+        c.vy = 30 + Math.random() * 40;
+        this.log('An ant slid into the antlion pit', 'danger');
+      }
+    }
+    return c.life <= 0;
+  }
+
+  /**
+   * A ladybird patrols the plants and eats aphids. It is harmless to the ants and they ignore it (it is not a threat,
+   * so nobody attacks it); it only costs the colony some of its honeydew herd, which slowly breeds back.
+   */
+  private stepLadybug(c: Creature, dt: number): boolean {
+    c.life = (c.life ?? 600) - dt;
+    const ground = this.surfaceTarget(c.x).y - 1;
+    if (c.state === 'flying') {
+      const dx = c.tx - c.x;
+      c.dir = dx >= 0 ? 1 : -1;
+      c.x += Math.sign(dx) * Math.min(Math.abs(dx), 70 * dt);
+      c.y += (ground - c.y) * Math.min(1, dt * 0.9);
+      if (Math.abs(dx) < 2 && c.y > ground - 3) {
+        c.state = 'roaming';
+        c.timer = 3;
+      }
+      return false;
+    }
+    if (c.life <= 0 || this.season === 'Winter') {
+      c.state = 'leaving';
+    }
+    if (c.state === 'leaving') {
+      c.x += c.dir * 60 * dt;
+      c.y -= 30 * dt;
+      return c.x < CASE_LEFT - 20 || c.x > CASE_RIGHT + 20 || c.y < CASE_TOP;
+    }
+    if (c.state === 'eating') {
+      if (c.timer <= 0) c.state = 'roaming';
+      return false;
+    }
+    // choose a hunting target: the nearest aphid, as long as a breeding stock is left
+    let target: Aphid | null = null;
+    let best = 260;
+    c.vy = Math.max(0, c.vy - dt);
+    if (this.aphids.length > 6 && c.vy <= 0) {
+      for (const a of this.aphids) {
+        const d = Math.abs(a.x - c.x);
+        if (d < best) {
+          best = d;
+          target = a;
+        }
+      }
+    }
+    let goalY = ground;
+    if (target) {
+      const t = target as Aphid;
+      const dx = t.x - c.x;
+      c.dir = dx >= 0 ? 1 : -1;
+      goalY = Math.abs(dx) < 14 ? t.y : ground;
+      if (Math.abs(dx) > 3) c.x += c.dir * 11 * dt;
+      else if (Math.abs(c.y - t.y) < 3) {
+        c.state = 'eating';
+        c.timer = 3 + Math.random() * 2;
+        c.vy = 35 + Math.random() * 35; // full for a while
+        this.aphids.splice(this.aphids.indexOf(t), 1);
+        this.spark(t.x, t.y, '#ef4444');
+      }
+    } else {
+      // wander: walk, turn around now and then, stop to preen
+      if (c.timer <= 0) {
+        c.timer = 4 + Math.random() * 8;
+        c.dir = Math.random() < 0.5 ? 1 : -1;
+        c.vx = Math.random() < 0.3 ? 0 : 8;
+      }
+      c.x += c.dir * c.vx * dt;
+      if (c.x < CASE_LEFT + 60) c.dir = 1;
+      if (c.x > CASE_RIGHT - 60) c.dir = -1;
+    }
+    c.y += (goalY - c.y) * Math.min(1, dt * 3);
+    return false;
+  }
+
+  private stepAnteater(c: Creature, dt: number): boolean {
+    const ground = this.surfaceTarget(c.x).y;
+    c.y = ground;
+    const edgeX = c.dir > 0 ? CASE_RIGHT + 40 : CASE_LEFT - 40;
+    if (c.state === 'approach') {
+      const dx = c.tx - c.x;
+      c.dir = dx >= 0 ? 1 : -1;
+      c.x += Math.sign(dx) * Math.min(Math.abs(dx), 24 * dt);
+      c.vx = c.dir * 24;
+      if (Math.abs(dx) < 2) {
+        c.state = 'digging';
+        c.timer = 22;
+        c.vx = 0;
+      }
+      this.scatterAnts(c.x, c.y, 70, 1.2);
+      return false;
+    }
+    if (c.state === 'digging') {
+      this.shake = Math.max(this.shake, 0.35);
+      this.scatterAnts(c.x, c.y, 60, 1.2);
+      if (Math.floor(c.phase * 0.5) !== Math.floor((c.phase - dt) * 0.5)) {
+        // long sticky tongue flicks out at the foragers streaming from the nest
+        const got = Math.random() < 0.6 ? this.snatchAnt(c.x + c.dir * 40, c.y, 34) : null;
+        if (got) this.log('The anteater licked up an ant', 'danger');
+      }
+      if (Math.floor(c.phase * 0.25) !== Math.floor((c.phase - dt) * 0.25)) {
+        // claws rake the mound over the entrance
+        const gx0 = Math.floor((c.x + c.dir * 18) / CELL_SIZE);
+        for (let gx = gx0 - 2; gx <= gx0 + 2; gx++) {
+          const sg = Math.floor(this.grid.surfaceY[clamp(gx, 0, GRID_W - 1)] / CELL_SIZE);
+          for (let gy = sg + 1; gy < sg + 7; gy++) {
+            const i = gy * GRID_W + gx;
+            if (this.grid.terrain[i] === CellType.TUNNEL && Math.random() < 0.3) {
+              this.collapseAt(gx, gy, 'anteater', this.cellInUse(i), 2);
+              this.lastCollapseTime = this.simTime;
+              break;
+            }
+          }
+        }
+        this.shake = Math.max(this.shake, 0.7);
+      }
+      c.hits += this.defendersNear(c.x + c.dir * 20, c.y, 30) >= 4 ? dt * 0.4 : 0;
+      if (c.timer <= 0 || c.hits > 3) {
+        c.state = 'leaving';
+        c.dir = c.x < (CASE_LEFT + CASE_RIGHT) / 2 ? -1 : 1;
+        this.log(c.hits > 3 ? 'Biting soldiers drove the anteater away' : 'The anteater wanders off', c.hits > 3 ? 'good' : undefined);
+      }
+      return false;
+    }
+    c.x += c.dir * 30 * dt;
+    c.vx = c.dir * 30;
+    return Math.abs(c.x - edgeX) < 4 || c.x < CASE_LEFT + 6 || c.x > CASE_RIGHT - 6;
+  }
+
+  private stepWorm(c: Creature, dt: number): boolean {
+    const trail = (c.trail ??= []);
+    if (c.state === 'burrowing') {
+      const step = 7 * dt;
+      c.x += c.dir * step;
+      c.y += Math.sin(c.phase * 0.7) * 3 * dt;
+      c.left = (c.left ?? 0) - step;
+      const gx = Math.floor(c.x / CELL_SIZE);
+      const gy = Math.floor(c.y / CELL_SIZE);
+      // the burrow is about two cells tall
+      for (let oy = -1; oy <= 0; oy++) {
+        if (!this.grid.inBounds(gx, gy + oy)) continue;
+        const i = this.grid.idx(gx, gy + oy);
+        if (this.canExcavate(i)) {
+          this.grid.setTerrain(gx, gy + oy, CellType.TUNNEL);
+          this.grid.updateSurfaceColumn(gx);
+          this.fieldDirty.dig = true;
+        }
+      }
+      if (gx < 12 || gx > GRID_W - 12 || this.grid.terrain[this.grid.idx(gx, gy)] === CellType.PEBBLE) c.left = 0;
+      if (trail.length === 0 || Math.hypot(trail[0].x - c.x, trail[0].y - c.y) > 4) {
+        trail.unshift({ x: c.x, y: c.y });
+        if (trail.length > 9) trail.pop();
+      }
+      // ants that meet it just stop and feel it with their antennae
+      if (Math.random() < dt * 2) this.scatterWormEncounter(c);
+      if ((c.left ?? 0) <= 0) {
+        c.state = 'leaving';
+        c.timer = 6;
+      }
+      return false;
+    }
+    // slips off down a side shaft: the body shrinks away into the burrow
+    if (trail.length > 0 && Math.random() < dt * 2.5) trail.pop();
+    return trail.length === 0 || c.timer <= -8;
+  }
+
+  private scatterWormEncounter(c: Creature): void {
+    this.forAntsNear(c.x, c.y, 18, (a) => {
+      if (a.caste === AntCaste.QUEEN || a.payload !== PayloadType.NONE || BUSY_TASKS.has(a.task) || a.flying || a.buried !== undefined) return;
+      a.task = AntTask.GREETING;
+      a.stateTimer = 1.5 + Math.random() * 1.5;
+      a.angle = Math.atan2(c.y - a.y, c.x - a.x);
+      this.stopMoving(a);
+    });
+  }
+
+  private makeRival(x: number, behavior: Intruder['behavior'], edge: 'left' | 'right', opts: { holdPost?: number } = {}): void {
+    const p = this.surfaceTarget(x);
+    const maxHp = 55;
+    this.intruders.push({
+      id: this.allocId(),
+      x: p.x,
+      y: p.y - 1,
+      vx: 0,
+      vy: 0,
+      angle: edge === 'left' ? 0 : Math.PI,
+      hp: maxHp,
+      maxHp,
+      legPhase: Math.random() * Math.PI * 2,
+      species: 'rival_ant',
+      aggression: 1,
+      attackCooldown: 0,
+      behavior,
+      carryingFoodAmount: 0,
+      targetFoodId: null,
+      homeEdge: edge,
+      path: [],
+      pathIndex: 0,
+      lastPathTime: -10,
+      warrior: true,
+      holdPost: opts.holdPost,
+    });
+  }
+
+  private stepWar(dt: number): void {
+    const w = this.war;
+    const season = this.season === 'Summer' ? 1.3 : this.season === 'Spring' ? 1 : this.season === 'Autumn' ? 0.8 : 0;
+    if (w.phase === 'peace') {
+      this.warPressure = Math.max(0, this.warPressure - dt / 600);
+      if (this.ants.length > 25 && !this.isNight()) w.tension += (dt * season) / 1800;
+      if (w.tension < 1) return;
+      w.phase = 'war';
+      w.wave = 0;
+      w.waves = 3 + Math.floor(Math.random() * 3);
+      w.nextWave = 8;
+      w.kills = 0;
+      w.lost = 0;
+      w.raid = null;
+      w.raidDone = false;
+      w.edge = Math.random() < 0.5 ? 'left' : 'right';
+      this.log('The neighbouring colony has declared war!', 'danger');
+      return;
+    }
+
+    const warriors = this.intruders.filter((m) => m.warrior && m.holdPost === undefined).length;
+    w.nextWave -= dt;
+    if (w.wave < w.waves && w.nextWave <= 0 && warriors < 10) {
+      const n = 3 + w.wave + Math.floor(Math.random() * 2);
+      const edge = w.edge;
+      const sign = edge === 'left' ? 1 : -1;
+      const x0 = edge === 'left' ? CASE_LEFT + 78 : CASE_RIGHT - 78;
+      for (let k = 0; k < n; k++) {
+        const behavior: Intruder['behavior'] = k === 0 ? 'infiltrating_brood' : k % 3 === 1 ? 'hunting_ants' : 'raiding_food';
+        this.makeRival(x0 + sign * k * 10, behavior, edge);
+      }
+      w.wave++;
+      w.nextWave = 70 + Math.random() * 40;
+      this.log(w.wave === w.waves ? `Final assault: ${n} enemy soldiers storm in` : `Wave ${w.wave} of the war: ${n} enemy soldiers advance`, 'danger');
+    }
+
+    // counter-raid: our soldiers march out against the rival nest
+    const raid = w.raid;
+    if (!raid && !w.raidDone && w.wave >= 2) {
+      const soldiers = this.ants.filter((a) => a.caste === AntCaste.SOLDIER && !this.isAlate(a) && (a.hp ?? 0) > 20);
+      if (soldiers.length >= 3) {
+        const x = w.edge === 'left' ? CASE_LEFT + 78 : CASE_RIGHT - 78;
+        w.raid = { x, t: 0, spawned: false };
+        for (const a of soldiers.slice(0, 8)) a.warBand = true;
+        this.log('Soldiers march out to strike back at the rival nest', 'good');
+      } else w.raidDone = true;
+    }
+    if (w.raid) {
+      const r = w.raid;
+      r.t += dt;
+      const band = this.ants.filter((a) => a.warBand);
+      if (!r.spawned && band.some((a) => Math.abs(a.x - r.x) < 170 && this.isOutside(a.x, a.y))) {
+        r.spawned = true;
+        const sign = w.edge === 'left' ? -1 : 1;
+        for (let k = 0; k < 4; k++) this.makeRival(r.x + sign * k * 9, 'hunting_ants', w.edge, { holdPost: r.x });
+        this.log('The raiders reach the rival nest: its defenders swarm out', 'danger');
+      }
+      const defenders = this.intruders.filter((m) => m.holdPost !== undefined).length;
+      const won = r.spawned && defenders === 0;
+      if (won || r.t > 220 || band.length === 0) {
+        for (const a of band) a.warBand = false;
+        w.raid = null;
+        w.raidDone = true;
+        if (won) {
+          this.dropFoodAt(this.entrancePos.x + 60, this.surfaceTarget(this.entrancePos.x + 60).y - 1, PayloadType.PROTEIN, 70);
+          this.log('The raid succeeded: the soldiers return with captured spoils', 'good');
+          w.kills += 2;
+        } else this.log('The raid fell apart', 'danger');
+      }
+    }
+
+    // the war ends once every wave is spent and the field is clear
+    if (w.wave >= w.waves && warriors === 0 && !w.raid) {
+      const defeat = w.lost > w.kills * 1.2 + 2;
+      if (defeat) {
+        this.warPressure = 1.2;
+        let plundered = 0;
+        for (const f of this.foods) if (f.storedInChamberId !== null) {
+          const take = f.amount * 0.25;
+          f.amount -= take;
+          plundered += take;
+        }
+        this.log(`The colony lost the war: ${Math.round(plundered)} units of stored food were plundered`, 'danger');
+        w.tension = 0.3;
+      } else {
+        this.log(`The rival colony is beaten back (${w.kills} enemy soldiers fell, ${w.lost} of ours)`, 'good');
+        w.tension = 0;
+      }
+      w.phase = 'peace';
+    }
+  }
+
   private stepIntruders(dt: number): void {
     this.intruderTimer -= dt;
     if (this.intruderTimer <= 0) {
@@ -2275,7 +2929,7 @@ export class AntColonySimulation {
       const shelterXHome = (m.homeEdge ?? 'left') === 'left' ? CASE_LEFT + 72 : CASE_RIGHT - 72;
       if (Math.abs(m.x - shelterXHome) > 70) m.roamed = true;
       // invaders lose their nerve after a while (or when the alarm brings a crowd of defenders)
-      if (m.age > 80 || (m.age > 20 && this.countAntsNear(m.x, m.y, 26) >= (m.species === 'beetle' ? 7 : 5))) m.behavior = 'retreating';
+      if (!m.warrior && (m.age > 80 || (m.age > 20 && this.countAntsNear(m.x, m.y, 26) >= (m.species === 'beetle' ? 7 : 5)))) m.behavior = 'retreating';
       const prevX = m.x;
       const prevY = m.y;
 
@@ -2334,6 +2988,9 @@ export class AntColonySimulation {
             food.amount -= stolen;
             m.carryingFoodAmount = stolen;
           }
+        } else if (m.holdPost !== undefined) {
+          // defenders mill about their own nest entrance
+          goalX = m.holdPost + Math.sin(this.simTime * 0.6 + m.id) * 22;
         } else {
           // raid inside the nest
           const key: FieldKey = m.species === 'mite' || m.species === 'centipede' ? 'nursery' : 'granary';
@@ -2444,6 +3101,7 @@ export class AntColonySimulation {
       const escaped = retreating && !underground && Math.abs(m.x - shelterX) < 12 && (m.roamed || m.age > 25);
       if (m.hp <= 0 || escaped) {
         if (m.hp <= 0) {
+          if (m.warrior && this.war.phase === 'war') this.war.kills++;
           if ((m.carryingFoodAmount ?? 0) > 0) this.dropFoodAt(m.x - 5, m.y, PayloadType.SEED, m.carryingFoodAmount ?? 0);
           this.dropFoodAt(m.x, m.y, PayloadType.PROTEIN, m.species === 'rival_ant' || m.species === 'mite' ? 22 : 40);
           const name = m.species === 'rival_ant' ? 'a rival ant' : m.species === 'earwig' ? 'an earwig' : `a ${m.species}`;
@@ -2642,6 +3300,20 @@ export class AntColonySimulation {
       }
     }
     this.fallenAnts.push({ id: this.allocId(), x: fx, y: fy, angle: ant.angle, carriedByAntId: null, atMidden: false, decayTimer: 25 });
+    if (cause === 'combat' && this.war.phase === 'war') this.war.lost++;
+    // nestmates stop to inspect the body (ants recognise death by the fatty acids a corpse gives off) before the
+    // undertakers carry it off; they don't dawdle in the middle of a fight
+    if (this.intruders.length === 0) {
+      let paused = 0;
+      this.forAntsNear(fx, fy, 30, (a) => {
+        if (a.id === ant.id || a.caste === AntCaste.QUEEN || a.payload !== PayloadType.NONE || a.carriedById != null || a.buried !== undefined || a.flying || BUSY_TASKS.has(a.task)) return;
+        a.task = AntTask.GREETING;
+        a.stateTimer = 2 + Math.random() * 2.5;
+        a.angle = Math.atan2(fy - a.y, fx - a.x);
+        this.stopMoving(a);
+        return ++paused >= 4;
+      });
+    }
     this.ants.splice(index, 1);
     if (ant.caste === AntCaste.QUEEN) this.log('The queen has died! The colony cannot raise new workers', 'danger');
     else if (cause === 'buried') this.log('A buried worker suffocated before it could be dug out', 'danger');
@@ -2691,7 +3363,9 @@ export class AntColonySimulation {
         this.lastVisit[this.grid.idx(vg.gx, vg.gy)] = this.simTime;
       }
       // A third of the foragers are the night shift; the rest stay in after dark. Bad weather keeps everyone in.
-      const night = (isNight && ant.id % 3 !== 0) || (!goodWeather && !desperate);
+      const nerve = ant.bold ?? 0.5;
+      const braveEnough = nerve > 0.72 && this.rainIntensity() < 0.5 && this.weather !== 'Snow' && this.surfaceTempC > 5 && this.surfaceTempC < 42;
+      const night = (isNight && !(ant.id % 3 === 0 || nerve > 0.7)) || (!goodWeather && !desperate && !braveEnough);
       ant.age += dt;
       ant.greetCooldown = Math.max(0, ant.greetCooldown - dt);
       ant.signalCooldown = Math.max(0, (ant.signalCooldown ?? 0) - dt);
@@ -2790,7 +3464,7 @@ export class AntColonySimulation {
 
       if (fight !== 'moving') {
         // --- casual greeting between passing nestmates -----------------------------------------------------------
-        if (ant.payload === PayloadType.NONE && ant.greetCooldown <= 0 && Math.random() < dt * 0.4 && this.intruders.length === 0) {
+        if (ant.payload === PayloadType.NONE && ant.greetCooldown <= 0 && Math.random() < dt * (0.15 + (ant.social ?? 0.5) * 0.5) && this.intruders.length === 0) {
           let other: Ant | null = null;
           this.forAntsNear(ant.x, ant.y, 9, (o) => {
             if (o.id !== ant.id && o.caste !== AntCaste.QUEEN && o.greetCooldown <= 0 && !BUSY_TASKS.has(o.task) && o.payload === PayloadType.NONE) {
@@ -2903,9 +3577,10 @@ export class AntColonySimulation {
     const g = this.grid.worldToGrid(m.x, m.y);
     const inside = m.y > this.grid.surfaceY[g.gx] + 8;
     const big = m.species === 'beetle' || m.species === 'centipede' || m.species === 'earwig';
-    if (!soldier && big && !inside && bestD > 16) {
-      // flee from big predators out in the open
-      if (bestD > 45) return 'none';
+    const nerve = ant.bold ?? 0.5;
+    if (!soldier && big && !inside && bestD > 16 && nerve < 0.85) {
+      // flee from big predators out in the open; shy ants bolt from further away
+      if (bestD > 30 + (1 - nerve) * 36) return 'none';
       const away = ant.x >= m.x ? 1 : -1;
       if (ant.task !== AntTask.FLEEING || !ant.targetPos || Math.sign(ant.targetPos.x - ant.x) !== away) {
         const t = this.surfaceTarget(ant.x + away * 90);
@@ -3003,7 +3678,7 @@ export class AntColonySimulation {
     this.footstepTimer -= dt;
     if (this.footstepTimer <= 0) {
       this.footstepTimer = 900 + Math.random() * 1500;
-      if (!this.isNight() || Math.random() < 0.3) this.footsteps();
+      // (no giant footsteps: the colony's only visitors are wildlife)
     }
 
     this.structTimer -= dt;
@@ -3154,6 +3829,7 @@ export class AntColonySimulation {
         span: 'A wide chamber roof sagged and fell',
         abandoned: 'A disused gallery silted up and fell in',
         footsteps: 'Heavy footsteps overhead caved in a shallow tunnel',
+        anteater: 'The anteater\'s claws caved in the entrance tunnel',
       };
       this.log(msg[cause] + (inUse ? ': excavators move in to clear it' : ''), inUse ? 'danger' : 'info');
     }
@@ -3425,6 +4101,11 @@ export class AntColonySimulation {
     this.seedAphids();
     // aphids feed on plant sap and excrete honeydew; warm growing weather means more of it, winter none
     const rate = this.season === 'Winter' ? 0 : 0.35 * antActivity(this.surfaceTempC) * (this.rainIntensity() > 0.5 ? 0.3 : 1);
+    // the herd breeds back (slowly) when it is small, so a hungry ladybird can't wipe it out for good
+    if (rate > 0 && this.aphids.length > 0 && this.aphids.length < 16 && Math.random() < dt / 60) {
+      const parent = this.aphids[Math.floor(Math.random() * this.aphids.length)];
+      this.aphids.push({ ...parent, id: this.allocId(), x: parent.x + (Math.random() - 0.5) * 8, honeydew: 0, tenderId: null, phase: Math.random() * 6.28 });
+    }
     for (const a of this.aphids) {
       a.honeydew = Math.min(12, a.honeydew + rate * dt);
       a.phase += dt;
@@ -3482,6 +4163,73 @@ export class AntColonySimulation {
     ant.payload = PayloadType.CHAFF;
     ant.payloadValue = 0;
     return true;
+  }
+
+  private fungusStock(): number {
+    const c = this.getChamber(ChamberType.FUNGUS);
+    if (!c) return 0;
+    let n = 0;
+    for (const f of this.foods) if (f.storedInChamberId === c.id) n += f.amount;
+    return n;
+  }
+
+  /** Leaf-cutters snip fragments off living plants and haul them down to be chewed into the fungus's compost. */
+  private tryCutLeaf(ant: Ant, dt: number): boolean {
+    if (ant.id % 8 !== 4 || !this.getChamber(ChamberType.FUNGUS)) return false;
+    if (ant.leafTimer === undefined && this.fungusStock() > 90) return false;
+    let plant: PlantSprout | null = null;
+    let bestD = 260;
+    for (const s of this.sprouts) {
+      if (s.kind === 'moss' || (s.cut ?? 0) > 0.7) continue;
+      const d = Math.abs(s.x - ant.x);
+      if (d < bestD) {
+        bestD = d;
+        plant = s;
+      }
+    }
+    if (!plant) {
+      ant.leafTimer = undefined;
+      return false;
+    }
+    const pl = plant as PlantSprout;
+    ant.task = AntTask.CUTTING_LEAF;
+    if (Math.abs(pl.x - ant.x) > 5) {
+      ant.leafTimer = undefined;
+      const t = this.surfaceTarget(pl.x);
+      this.goTo(ant, t.x, t.y);
+      return true;
+    }
+    if (ant.leafTimer === undefined) ant.leafTimer = 3 + Math.random() * 2.5;
+    this.stopMoving(ant);
+    ant.leafTimer -= dt;
+    if (Math.random() < dt * 6) this.spawnCrumbs(ant.x, ant.y - 2, '#5fae45', 1);
+    if (ant.leafTimer <= 0) {
+      ant.leafTimer = undefined;
+      pl.cut = Math.min(1, (pl.cut ?? 0) + 0.12);
+      ant.payload = PayloadType.LEAF;
+      ant.payloadValue = 1;
+    }
+    return true;
+  }
+
+  private carryLeaf(ant: Ant): void {
+    ant.task = AntTask.CARRYING_LEAF;
+    const fc = this.nearestChamber(ChamberType.FUNGUS, ant.x, ant.y);
+    if (!fc) {
+      this.releasePayload(ant);
+      return;
+    }
+    const d = this.go(ant, 'fungus');
+    if (d <= 0.5 || this.isInsideChamber(ant, fc, 0.6)) {
+      const bed = this.foods.filter((f) => f.storedInChamberId === fc.id).sort((a, b) => a.amount - b.amount)[0];
+      if (bed) bed.amount = Math.min(bed.maxAmount, bed.amount + 7);
+      else
+        this.foods.push({ id: this.allocId(), type: PayloadType.FUNGUS, x: fc.x, y: fc.y + 10, amount: 8, maxAmount: 50, radius: 7, storedInChamberId: fc.id });
+      ant.payload = PayloadType.NONE;
+      ant.payloadValue = 0;
+      ant.task = AntTask.TENDING_FUNGUS;
+      this.busy(ant, AntTask.TENDING_FUNGUS, 3 + Math.random() * 3);
+    }
   }
 
   private carryChaff(ant: Ant): void {
@@ -4079,6 +4827,10 @@ export class AntColonySimulation {
       this.tryClearTrail(ant);
       return;
     }
+    if (ant.payload === PayloadType.LEAF) {
+      this.carryLeaf(ant);
+      return;
+    }
 
     if (isFoodPayload(ant.payload)) {
       ant.task = AntTask.RETURNING_WITH_FOOD;
@@ -4131,7 +4883,7 @@ export class AntColonySimulation {
         return;
       }
       if ((ant.restCooldown = (ant.restCooldown ?? 30) - dt) <= 0 && Math.random() < 0.3) {
-        ant.restCooldown = 60 + Math.random() * 80;
+        ant.restCooldown = (60 + Math.random() * 80) * (0.6 + (ant.industry ?? 0.5) * 0.8);
         this.seekRest(ant, 'granary', 5 + Math.random() * 10);
         return;
       }
@@ -4161,6 +4913,8 @@ export class AntColonySimulation {
     if (ant.id % 5 === 0 && this.tryClearTrail(ant)) return;
     // a share of the foragers are herders that milk the colony's aphids
     if (ant.id % 3 === 1 && this.tryTendAphids(ant)) return;
+    // ...and a few are leaf-cutters feeding the fungus garden
+    if (this.tryCutLeaf(ant, dt)) return;
 
     if (ant.hydration < 55) {
       const drop = this.droplets.find((dd) => dd.settled && Math.abs(dd.x - ant.x) < 60 && Math.abs(dd.y - ant.y) < 20);
@@ -4864,6 +5618,24 @@ export class AntColonySimulation {
       return;
     }
     const onSurface = this.isOutside(ant.x, ant.y);
+    if (ant.warBand) {
+      const raid = this.war.raid;
+      if (!raid) ant.warBand = false;
+      else {
+        ant.task = AntTask.PATROLLING;
+        if (!onSurface) {
+          if (this.go(ant, 'surface') >= INF) ant.warBand = false;
+          return;
+        }
+        ant.stateTimer -= dt;
+        if (ant.stateTimer <= 0 || !ant.targetPos) {
+          ant.stateTimer = 2.5;
+          const t = this.surfaceTarget(raid.x + ((ant.id % 5) - 2) * 9);
+          this.goTo(ant, t.x, t.y);
+        }
+        return;
+      }
+    }
     const guard = ant.id % 3 !== 0 && !(night && ant.id % 2 === 0) && this.forageWeather();
     ant.task = AntTask.PATROLLING;
     ant.stateTimer -= dt;
@@ -4981,6 +5753,9 @@ export class AntColonySimulation {
         default:
           break;
       }
+      const work = ant.industry ?? 0.5;
+      pauseRate *= 1.6 - work * 1.2;
+      base *= 0.94 + work * 0.12;
       const ebb = 1 + 0.16 * Math.sin(this.simTime * (0.9 + (ant.id % 7) * 0.13) + ant.id * 1.9);
       target = base * ebb;
       if (pauseRate > 0 && ant.payload === PayloadType.NONE && Math.random() < pauseRate * dt) {
@@ -5173,7 +5948,7 @@ export class AntColonySimulation {
     const prevX = ant.x;
     const prevY = ant.y;
     const moved = Math.hypot(nx - prevX, ny - prevY);
-    ant.x = clamp(nx, CASE_LEFT + 14, CASE_RIGHT - 14);
+    ant.x = clamp(nx, CASE_LEFT + 28, CASE_RIGHT - 28);
     ant.y = clamp(ny, CASE_TOP + 14, CASE_BOTTOM - 14);
 
     const checkG = this.grid.worldToGrid(ant.x, ant.y);
