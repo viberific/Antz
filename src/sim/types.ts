@@ -77,6 +77,7 @@ export enum AntTask {
   WAITING_TO_SWARM = 'Waiting for Flight Weather',
   CLUSTERING = 'Overwintering Cluster',
   SEALING_ENTRANCE = 'Sealing Entrance',
+  BACKFILLING = 'Backfilling Old Gallery',
 }
 
 export enum PayloadType {
@@ -190,6 +191,8 @@ export interface Ant {
   carryingAntId?: number | null;
   /** alates: airborne on the nuptial flight */
   flying?: boolean;
+  /** excavators: grid cell of the disused gallery this soil load is going into (-1 = to the mound) */
+  backfill?: number;
 }
 
 export interface BroodItem {

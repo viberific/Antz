@@ -54,6 +54,8 @@ const DAY_LENGTH = 200;
 
 export type Season = 'Spring' | 'Summer' | 'Autumn' | 'Winter';
 
+type CollapseCause = 'settling' | 'saturation' | 'rain' | 'drought' | 'thaw' | 'span' | 'abandoned' | 'footsteps';
+
 export interface Climate {
   tempC: number;
   /** 0..1 */
@@ -230,7 +232,23 @@ export class AntColonySimulation {
   private damageTimer: number = 4;
   private pherAccum = 0;
   /** running totals, handy for tuning and debugging */
-  public counters = { pickups: 0, deliveries: 0, digs: 0, deposits: 0, larvaFeeds: 0, queenFeeds: 0, tandems: 0, rescues: 0, flights: 0 };
+  public counters = { pickups: 0, deliveries: 0, digs: 0, deposits: 0, larvaFeeds: 0, queenFeeds: 0, tandems: 0, rescues: 0, flights: 0, collapses: 0, backfills: 0 };
+  /** sim time an ant last stood in each cell: galleries nobody uses stop being maintained */
+  private lastVisit = new Float32Array(N_CELLS);
+  private structTimer = 2;
+  private maintenanceTimer = 0;
+  private lastCollapseTime = -999;
+  private lastCollapseLog = -999;
+  private footstepTimer = 600 + Math.random() * 900;
+  private frozen = false;
+  private thawStress = 0;
+  private backfillTargets: number[] = [];
+  /** open gallery cells with soil directly above them (the ones that can cave in) */
+  private roofCells: number[] = [];
+  /** open (dug) cells in the nest right now */
+  public openCells = 0;
+  /** 0..1 ground tremor (collapses, footsteps) for the renderer */
+  public shake = 0;
   public aphids: Aphid[] = [];
   public debris: Debris[] = [];
   private repleteTimer = 5;
@@ -292,6 +310,8 @@ export class AntColonySimulation {
     }
     for (const k of Object.keys(this.fields) as FieldKey[]) this.rebuildField(k);
     this.fieldTerrainVersion = this.grid.terrainVersion;
+    // treat the whole existing nest as freshly used so nothing falls in the moment the game opens
+    this.lastVisit.fill(this.simTime);
   }
 
   private allocId(): number {
@@ -883,6 +903,7 @@ export class AntColonySimulation {
     this.stepDroplets(dt);
     this.stepEcosystem(dt);
     this.stepStormDamage(dt);
+    this.stepStructure(dt);
     this.updateBroodClimate(dt);
     this.stepAphids(dt);
     this.stepRepletes(dt);
@@ -1849,7 +1870,7 @@ export class AntColonySimulation {
         else if (pop > this.chambers.length * 30) type = this.chambers.length % 2 === 0 ? ChamberType.NURSERY : ChamberType.GRANARY;
         else type = Math.random() < 0.5 ? ChamberType.NURSERY : ChamberType.GRANARY;
         if (Math.random() < 0.3 || !this.planNewProject(type)) this.planGallery();
-      } else if (this.tunnelsDugCells < 3500 && Math.random() < 0.25) {
+      } else if (this.openCells < 2600 && Math.random() < 0.25) {
         this.planGallery();
       }
     }
@@ -2075,8 +2096,8 @@ export class AntColonySimulation {
     if (this.damageTimer > 0) return;
     // real rain lasts hours, not seconds: wear the nest down steadily rather than in a burst
     this.damageTimer = (14 + Math.random() * 22) / rain;
-    if (Math.random() < 0.6) this.erodeMound();
-    else this.collapseShallowTunnel();
+    // tunnel collapses are handled by the soil-stability model (stepStructure); rain here washes the mound down
+    this.erodeMound();
   }
 
   /** Rain washes soil down the steep faces of the mound; some runs back into the entrance crater and plugs it. */
@@ -2140,43 +2161,6 @@ export class AntColonySimulation {
       }
     }
     return -1;
-  }
-
-  /** Soaked ceilings of shallow tunnels slump in; the debris must be dug out again. */
-  private collapseShallowTunnel(): void {
-    for (let tries = 0; tries < 40; tries++) {
-      const gx = 14 + Math.floor(Math.random() * (GRID_W - 28));
-      const surf = Math.floor(this.grid.surfaceY[gx] / CELL_SIZE);
-      const gy = surf + 3 + Math.floor(Math.random() * 10);
-      if (!this.grid.inBounds(gx, gy)) continue;
-      if (this.grid.terrain[this.grid.idx(gx, gy)] !== CellType.TUNNEL) continue;
-      // only beneath wet soil, and never inside the royal chamber
-      const above = this.grid.idx(gx, Math.max(0, gy - 2));
-      if (this.grid.moisture[above] < 0.4 && Math.random() < 0.6) continue;
-      if (this.chambers.some((c) => c.type === ChamberType.ROYAL && Math.hypot((gx * CELL_SIZE - c.x) / c.rx, (gy * CELL_SIZE - c.y) / c.ry) < 1.3)) continue;
-      let n = 0;
-      const blob = 2 + Math.floor(Math.random() * 4);
-      for (let k = 0; k < 9 && n < blob; k++) {
-        const cx = gx + (k % 3) - 1;
-        const cy = gy + Math.floor(k / 3) - 1;
-        const i = this.grid.idx(cx, cy);
-        if (this.grid.terrain[i] !== CellType.TUNNEL) continue;
-        // occasionally the slump lands right on a worker, which must then be rescued
-        if (this.cellOccupied(cx, cy)) {
-          if (Math.random() > 0.35) continue;
-          this.buryAntsAt(cx, cy);
-        }
-        this.grid.setTerrain(cx, cy, CellType.SUBSOIL);
-        this.digPlan[i] = 2;
-        n++;
-      }
-      if (n > 0) {
-        this.spawnCrumbs(gx * CELL_SIZE, gy * CELL_SIZE, '#4a3828', 6);
-        this.fieldDirty.dig = true;
-        this.log('A soaked tunnel ceiling caved in', 'danger');
-        return;
-      }
-    }
   }
 
   private cellOccupied(gx: number, gy: number): boolean {
@@ -2702,6 +2686,10 @@ export class AntColonySimulation {
       let act = this.activityAt(ant.x, ant.y);
       if (this.floodDepth > 0 && ant.y > floodY && !this.isOutside(ant.x, ant.y)) act *= 0.45;
       const dt = stepDt * act;
+      {
+        const vg = this.grid.worldToGrid(ant.x, ant.y);
+        this.lastVisit[this.grid.idx(vg.gx, vg.gy)] = this.simTime;
+      }
       // A third of the foragers are the night shift; the rest stay in after dark. Bad weather keeps everyone in.
       const night = (isNight && ant.id % 3 !== 0) || (!goodWeather && !desperate);
       ant.age += dt;
@@ -2974,6 +2962,328 @@ export class AntColonySimulation {
       ant.stateTimer = 3 + Math.random() * 4;
       this.goTo(ant, royal.x + (Math.random() - 0.5) * royal.rx * 0.7, royal.y + royal.ry * 0.3);
     }
+  }
+
+  // ================================================================================================================
+  // Soil stability: tunnels settle, slump and cave in for the reasons real nests do
+  // ================================================================================================================
+
+  /** Has an ant been near this cell recently, or does the chamber around it hold brood or food? */
+  private cellInUse(i: number): boolean {
+    const gx = i % GRID_W;
+    const gy = (i - gx) / GRID_W;
+    const recent = this.simTime - 240;
+    for (let dy = -2; dy <= 2; dy++) {
+      for (let dx = -2; dx <= 2; dx++) {
+        const x = gx + dx;
+        const y = gy + dy;
+        if (x < 0 || y < 0 || x >= GRID_W || y >= GRID_H) continue;
+        if (this.lastVisit[y * GRID_W + x] > recent) return true;
+      }
+    }
+    const wx = (gx + 0.5) * CELL_SIZE;
+    const wy = (gy + 0.5) * CELL_SIZE;
+    const c = this.chambers.find((ch) => Math.hypot((wx - ch.x) / ch.rx, (wy - ch.y) / ch.ry) < 1.15);
+    if (!c) return false;
+    if (c.type === ChamberType.ROYAL) return true;
+    return this.brood.some((b) => b.chamberId === c.id) || this.foods.some((f) => f.storedInChamberId === c.id);
+  }
+
+  /** Width of the open space this cell's roof has to span (wide unsupported roofs sag). */
+  private roofSpan(gx: number, gy: number): number {
+    let n = 1;
+    for (let x = gx - 1; x >= 0 && n < 16 && this.grid.terrain[gy * GRID_W + x] === CellType.TUNNEL; x--) n++;
+    for (let x = gx + 1; x < GRID_W && n < 16 && this.grid.terrain[gy * GRID_W + x] === CellType.TUNNEL; x++) n++;
+    return n;
+  }
+
+  private stepStructure(dt: number): void {
+    // a heavy animal (or a person) crossing the ground above shakes shallow galleries loose
+    this.shake = Math.max(0, this.shake - dt * 1.5);
+    this.footstepTimer -= dt;
+    if (this.footstepTimer <= 0) {
+      this.footstepTimer = 900 + Math.random() * 1500;
+      if (!this.isNight() || Math.random() < 0.3) this.footsteps();
+    }
+
+    this.structTimer -= dt;
+    if (this.structTimer > 0) return;
+    this.structTimer = 1;
+
+    // freeze-thaw: ice lenses heave the soil apart; when it thaws the loosened ceilings crumble
+    if (this.surfaceTempC < -0.5) this.frozen = true;
+    else if (this.frozen && this.surfaceTempC > 1.5) {
+      this.frozen = false;
+      this.thawStress = 1;
+      this.log('Thaw: frost-loosened soil starts crumbling into the shallow tunnels', 'danger');
+    }
+    this.thawStress = Math.max(0, this.thawStress - 1 / 900);
+
+    this.maintenanceTimer -= 1;
+    if (this.maintenanceTimer <= 0) {
+      this.maintenanceTimer = 10;
+      this.surveyNest();
+    }
+
+    if (this.simTime - this.lastCollapseTime < 4) return;
+    // the colony can only take so much at once: with a big repair backlog only neglected galleries keep falling
+    const overloaded = this.repairCount > 50;
+    const rain = this.rainIntensity();
+    const drought = this.climate.humidity < 0.4 && this.wetness < 0.05 && this.surfaceTempC > 26;
+    const queen = this.getQueen();
+    const royal = this.chambers.filter((c) => c.type === ChamberType.ROYAL);
+    // assess every roofed gallery cell; each has a small chance per second of giving way
+    let total = 0;
+    const risks: { i: number; r: number; cause: CollapseCause; inUse: boolean; stress: number }[] = [];
+    for (const i of this.roofCells) {
+      if (this.grid.terrain[i] !== CellType.TUNNEL) continue;
+      const roof = this.grid.terrain[i - GRID_W];
+      if (roof !== CellType.TOPSOIL && roof !== CellType.SUBSOIL && roof !== CellType.DEEP_CLAY && roof !== CellType.ROOT) continue;
+      const gx = i % GRID_W;
+      const gy = (i - gx) / GRID_W;
+      const depth = gy * CELL_SIZE - this.grid.surfaceY[gx];
+      if (depth < 6) continue;
+      const wx = (gx + 0.5) * CELL_SIZE;
+      const wy = (gy + 0.5) * CELL_SIZE;
+      if (royal.some((c) => Math.hypot((wx - c.x) / c.rx, (wy - c.y) / c.ry) < 1.25)) continue;
+      if (queen && Math.hypot(queen.x - wx, queen.y - wy) < 30) continue;
+
+      const moist = this.grid.moisture[i - GRID_W];
+      // loose topsoil and roots hold least; dense clay best, until it is waterlogged
+      const soilK = roof === CellType.TOPSOIL ? 1.6 : roof === CellType.DEEP_CLAY ? (moist > 0.75 ? 1.2 : 0.5) : roof === CellType.ROOT ? 0.7 : 1;
+      const shallow = depth < 50 ? 1.6 : depth < 110 ? 1.15 : 1;
+      let stress = 1;
+      let cause: CollapseCause = 'settling';
+      let top = 0;
+      const add = (v: number, c: CollapseCause) => {
+        if (v <= 0) return;
+        stress += v;
+        if (v > top && v > 0.8) {
+          top = v;
+          cause = c;
+        }
+      };
+      // saturated soil loses its cohesion; rain soaking down from the surface hits the upper galleries hardest
+      add(moist > 0.55 ? (moist - 0.55) * 7 : 0, 'saturation');
+      add(rain * (depth < 160 ? 6 : 1.5), 'rain');
+      add(drought && depth < 80 && moist < 0.15 ? 2.2 : 0, 'drought');
+      add(this.thawStress * (depth < 100 ? 7 : 1), 'thaw');
+      const span = this.roofSpan(gx, gy);
+      add(span > 6 ? (span - 6) * 0.35 : 0, 'span');
+      const inUse = this.cellInUse(i);
+      // nobody maintains an abandoned gallery: it silts up and slumps far sooner
+      let neglect = 1;
+      if (!inUse) {
+        neglect = 4;
+        if (stress < 2) cause = 'abandoned';
+      } else if (overloaded) continue;
+      const r = 0.00006 * soilK * shallow * stress * neglect;
+      total += r;
+      risks.push({ i, r, cause, inUse, stress });
+    }
+    if (total <= 0 || Math.random() > 1 - Math.exp(-total)) return;
+    let pick = Math.random() * total;
+    for (const c of risks) {
+      pick -= c.r;
+      if (pick > 0) continue;
+      const gx = c.i % GRID_W;
+      this.collapseAt(gx, (c.i - gx) / GRID_W, c.cause, c.inUse, 2 + Math.floor(Math.random() * Math.min(6, 1 + c.stress)));
+      break;
+    }
+  }
+
+  /** The roof over (gx, gy) falls in, filling up to `size` open cells; used galleries are flagged for repair. */
+  private collapseAt(gx: number, gy: number, cause: CollapseCause, inUse: boolean, size: number): number {
+    const queue: number[] = [gy * GRID_W + gx];
+    const seen = new Set<number>(queue);
+    let filled = 0;
+    while (queue.length && filled < size) {
+      const i = queue.shift()!;
+      const cx = i % GRID_W;
+      const cy = (i - cx) / GRID_W;
+      if (this.grid.terrain[i] !== CellType.TUNNEL) continue;
+      if (this.cellOccupied(cx, cy)) {
+        // the fall usually just sends ants scrambling, but sometimes it lands right on one
+        if (Math.random() > 0.3) continue;
+        this.buryAntsAt(cx, cy);
+      }
+      const depth = cy * CELL_SIZE - this.grid.surfaceY[cx];
+      this.grid.setTerrain(cx, cy, depth < 40 ? CellType.TOPSOIL : CellType.SUBSOIL);
+      this.grid.moisture[i] = Math.max(this.grid.moisture[i], this.grid.moisture[i - GRID_W] ?? 0);
+      if (inUse) {
+        this.digPlan[i] = 2;
+        this.repairCount++;
+      }
+      filled++;
+      // debris spreads sideways along the gallery first, then down
+      for (const n of [i - 1, i + 1, i + GRID_W, i - 1 + GRID_W, i + 1 + GRID_W]) {
+        if (n >= 0 && n < N_CELLS && !seen.has(n)) {
+          seen.add(n);
+          queue.push(n);
+        }
+      }
+    }
+    if (filled === 0) return 0;
+    // just under the surface the ground above sags into the void: a small sinkhole
+    const depth = gy * CELL_SIZE - this.grid.surfaceY[gx];
+    if (depth < 24 && cause !== 'abandoned') {
+      const sg = Math.floor(this.grid.surfaceY[gx] / CELL_SIZE);
+      for (const x of [gx - 1, gx, gx + 1]) {
+        const si = sg * GRID_W + x;
+        if (this.grid.terrain[si] === CellType.TOPSOIL && !this.cellOccupied(x, sg)) {
+          this.grid.setTerrain(x, sg, CellType.AIR);
+          this.grid.updateSurfaceColumn(x);
+        }
+      }
+    }
+    this.lastCollapseTime = this.simTime;
+    this.counters.collapses++;
+    this.fieldDirty.dig = true;
+    for (const fk of STATIC_FIELDS) this.fieldDirty[fk] = true;
+    const w = this.grid.gridToWorld(gx, gy);
+    this.spawnCrumbs(w.x, w.y, '#4a3828', 4 + filled * 2);
+    this.shake = Math.max(this.shake, Math.min(0.6, filled * 0.08));
+    if (this.simTime - this.lastCollapseLog > 25 || filled >= 5) {
+      this.lastCollapseLog = this.simTime;
+      const msg: Record<CollapseCause, string> = {
+        settling: 'A tunnel roof settled and slumped in',
+        saturation: 'Waterlogged soil lost its grip: a gallery caved in',
+        rain: 'Rain soaked through and a shallow tunnel collapsed',
+        drought: 'Bone-dry soil crumbled and blocked a tunnel',
+        thaw: 'Frost-heaved soil gave way as it thawed',
+        span: 'A wide chamber roof sagged and fell',
+        abandoned: 'A disused gallery silted up and fell in',
+        footsteps: 'Heavy footsteps overhead caved in a shallow tunnel',
+      };
+      this.log(msg[cause] + (inUse ? ': excavators move in to clear it' : ''), inUse ? 'danger' : 'info');
+    }
+    return filled;
+  }
+
+  /** Something heavy walks across the case lid / ground: shallow galleries under its feet crush. */
+  private footsteps(): void {
+    const x = CASE_LEFT + 80 + Math.random() * (CASE_RIGHT - CASE_LEFT - 160);
+    const gx0 = Math.floor(x / CELL_SIZE);
+    let hit = 0;
+    for (let gx = gx0 - 6; gx <= gx0 + 6; gx++) {
+      if (gx < 10 || gx >= GRID_W - 10) continue;
+      const sg = Math.floor(this.grid.surfaceY[gx] / CELL_SIZE);
+      for (let gy = sg + 1; gy < sg + 9 && gy < GRID_H - 2; gy++) {
+        const i = gy * GRID_W + gx;
+        if (this.grid.terrain[i] !== CellType.TUNNEL || Math.random() > 0.35) continue;
+        hit += this.collapseAt(gx, gy, 'footsteps', this.cellInUse(i), 2);
+        this.lastCollapseTime = -999;
+      }
+    }
+    this.lastCollapseTime = this.simTime;
+    this.shake = 1;
+    for (let k = 0; k < 14; k++) this.spawnCrumbs(x + (Math.random() - 0.5) * 70, this.surfaceTarget(x).y - 2, '#6b5640', 1);
+    if (hit > 0) this.log('Heavy footsteps overhead! Shallow tunnels are crushed', 'danger');
+    else this.log('The ground trembles under heavy footsteps overhead');
+  }
+
+  /**
+   * Every few seconds: count the open nest, list neglected galleries that excavators can backfill with spoil, and
+   * let the colony give up chambers nobody has used in a long time (they slump shut and are struck off).
+   */
+  private surveyNest(): void {
+    let open = 0;
+    const cands: number[] = [];
+    const old = this.simTime - 400;
+    this.roofCells = [];
+    for (let i = GRID_W; i < N_CELLS - GRID_W; i++) {
+      if (this.grid.terrain[i] !== CellType.TUNNEL) continue;
+      open++;
+      const roof = this.grid.terrain[i - GRID_W];
+      if (roof !== CellType.TUNNEL && roof !== CellType.AIR && roof !== CellType.GLASS_WALL && roof !== CellType.PEBBLE) this.roofCells.push(i);
+      if (this.lastVisit[i] > old || this.digPlan[i]) continue;
+      const gx = i % GRID_W;
+      const gy = (i - gx) / GRID_W;
+      if (gy * CELL_SIZE - this.grid.surfaceY[gx] < 40) continue;
+      if (cands.length < 400 && Math.random() < 0.3 && !this.cellInUse(i)) cands.push(i);
+    }
+    this.openCells = open;
+    this.backfillTargets = cands.slice(0, 40);
+
+    for (let k = this.chambers.length - 1; k >= 0; k--) {
+      const c = this.chambers[k];
+      if (c.type === ChamberType.ROYAL) continue;
+      if (this.chambers.filter((o) => o.type === c.type).length <= 1) continue;
+      let total = 0;
+      let solid = 0;
+      for (let gy = Math.floor((c.y - c.ry) / CELL_SIZE); gy <= Math.ceil((c.y + c.ry) / CELL_SIZE); gy++) {
+        for (let gx = Math.floor((c.x - c.rx) / CELL_SIZE); gx <= Math.ceil((c.x + c.rx) / CELL_SIZE); gx++) {
+          if (!this.grid.inBounds(gx, gy)) continue;
+          const w = this.grid.gridToWorld(gx, gy);
+          if (((w.x - c.x) / c.rx) ** 2 + ((w.y - c.y) / c.ry) ** 2 > 0.8) continue;
+          total++;
+          if (this.grid.terrain[gy * GRID_W + gx] !== CellType.TUNNEL) solid++;
+        }
+      }
+      if (total > 0 && solid / total > 0.6 && !this.cellInUse(this.grid.idx(Math.floor(c.x / CELL_SIZE), Math.floor(c.y / CELL_SIZE)))) {
+        this.chambers.splice(k, 1);
+        for (const fk of STATIC_FIELDS) this.fieldDirty[fk] = true;
+        this.log(`The colony abandoned a fallen-in ${c.type.toLowerCase()}`);
+      }
+    }
+  }
+
+  /** Real excavators often dump spoil into old, unused galleries instead of hauling it all the way up. */
+  private tryBackfill(ant: Ant): boolean {
+    if (ant.backfill === undefined) {
+      if (this.backfillTargets.length === 0 || Math.random() > 0.5) {
+        ant.backfill = -1;
+        return false;
+      }
+      let best = -1;
+      let bestD = 220;
+      for (const i of this.backfillTargets) {
+        const w = this.grid.gridToWorld(i % GRID_W, Math.floor(i / GRID_W));
+        const d = Math.abs(w.x - ant.x) + Math.abs(w.y - ant.y);
+        if (d < bestD) {
+          bestD = d;
+          best = i;
+        }
+      }
+      ant.backfill = best;
+      if (best >= 0) this.backfillTargets.splice(this.backfillTargets.indexOf(best), 1);
+    }
+    const i = ant.backfill;
+    if (i < 0) return false;
+    if (this.grid.terrain[i] !== CellType.TUNNEL) {
+      // it already fell in: take the soil up to the mound after all
+      ant.backfill = -1;
+      return false;
+    }
+    const gx = i % GRID_W;
+    const gy = (i - gx) / GRID_W;
+    const w = this.grid.gridToWorld(gx, gy);
+    ant.task = AntTask.BACKFILLING;
+    if (Math.hypot(w.x - ant.x, w.y - ant.y) > 9) {
+      this.goPath(ant, w.x, w.y, 'backfill:' + i);
+      if (ant.path.length === 0 && !ant.targetPos) ant.backfill = -1;
+      return true;
+    }
+    // pack the pellets into the dead gallery, starting at the far end from the ant
+    let placed = 0;
+    for (const n of [i, i + 1, i - 1, i + GRID_W, i - GRID_W]) {
+      if (placed >= Math.max(1, ant.payloadValue)) break;
+      const nx = n % GRID_W;
+      const ny = (n - nx) / GRID_W;
+      if (this.grid.terrain[n] !== CellType.TUNNEL || this.digPlan[n] || this.cellOccupied(nx, ny)) continue;
+      this.grid.setTerrain(nx, ny, CellType.SUBSOIL);
+      placed++;
+    }
+    if (placed > 0) {
+      this.counters.backfills++;
+      this.spawnCrumbs(w.x, w.y, '#7c5836', 2);
+      for (const fk of STATIC_FIELDS) this.fieldDirty[fk] = true;
+    }
+    ant.payload = PayloadType.NONE;
+    ant.payloadValue = 0;
+    ant.backfill = undefined;
+    this.busy(ant, AntTask.GROOMING, 0.6);
+    return true;
   }
 
   // ================================================================================================================
@@ -4354,6 +4664,7 @@ export class AntColonySimulation {
 
   private stepExcavator(ant: Ant, dt: number): void {
     if (ant.payload === PayloadType.SOIL) {
+      if (this.tryBackfill(ant)) return;
       ant.task = AntTask.CARRYING_SOIL;
       const d = this.go(ant, 'mound');
       const cell = this.grid.worldToGrid(ant.x, ant.y);
@@ -4362,6 +4673,7 @@ export class AntColonySimulation {
         for (let k = 0; k < Math.max(1, ant.payloadValue); k++) this.depositSoil(ant.x + (k % 2 === 0 ? 0 : (ant.x >= this.entrancePos.x ? 6 : -6)));
         ant.payload = PayloadType.NONE;
         ant.payloadValue = 0;
+        ant.backfill = undefined;
         ant.pauseTimer = 0.3 + Math.random() * 0.3;
         ant.task = AntTask.EXCAVATING;
         this.stopMoving(ant);
@@ -4459,7 +4771,7 @@ export class AntColonySimulation {
     if (ant.payloadValue >= 2 || this.planCount + this.repairCount <= 1) ant.payload = PayloadType.SOIL;
     const w = this.grid.gridToWorld(gx, gy);
     this.spawnCrumbs(w.x, w.y, '#7c5836', 3);
-    if (wasRepair && this.repairCount === 0) this.log('Storm damage repaired', 'good');
+    if (wasRepair && this.repairCount === 0) this.log('Caved-in tunnels cleared and repaired', 'good');
   }
 
   /** Drop a pellet of soil on the mound; it rolls down until the slope is stable (angle of repose). */

@@ -3,6 +3,7 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { AntColonySimulation } from './colony';
 import {
   MaterialBank,
+  SOIL_BACK_Z,
   SOIL_FRONT_Z,
   WORLD_SCALE,
   detectSoftwareWebGL,
@@ -152,7 +153,8 @@ export class Formicarium3DRenderer {
   private disposed = false;
   private lightningFlash = 0;
   private readonly snowMesh: THREE.InstancedMesh;
-  private readonly snowCapMesh: THREE.InstancedMesh;
+  private readonly snowCapMesh: THREE.Mesh;
+  private snowKey = '';
   private readonly floodMesh: THREE.InstancedMesh;
   private readonly aphidMesh: THREE.InstancedMesh;
   private readonly debrisMesh: THREE.InstancedMesh;
@@ -283,7 +285,7 @@ export class Formicarium3DRenderer {
     this.dustMesh = makeInst(new THREE.IcosahedronGeometry(0.011, 1), dustMat, 140, false);
     this.rainMesh = makeInst(new THREE.BoxGeometry(0.014, 0.24, 0.014), rainMat, 220, false);
     const snowMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.9 });
-    const snowCapMat = new THREE.MeshStandardMaterial({ color: 0xf4f7fb, roughness: 0.9, metalness: 0 });
+    const snowCapMat = new THREE.MeshStandardMaterial({ color: 0xf4f7fb, roughness: 0.85, metalness: 0, side: THREE.DoubleSide });
     const floodMat = new THREE.MeshStandardMaterial({
       color: 0x5b7f96,
       roughness: 0.08,
@@ -294,7 +296,12 @@ export class Formicarium3DRenderer {
     });
     this.extraMats.push(snowMat, snowCapMat, floodMat);
     this.snowMesh = makeInst(new THREE.IcosahedronGeometry(0.022, 0), snowMat, 220, false);
-    this.snowCapMesh = makeInst(new THREE.BoxGeometry(CELL_SIZE * 2 * WORLD_SCALE * 1.05, 0.06, 1.0), snowCapMat, GRID_W, true);
+    // one continuous snow blanket, rebuilt along the smoothed ground contour whenever it changes
+    this.snowCapMesh = new THREE.Mesh(new THREE.BufferGeometry(), snowCapMat);
+    this.snowCapMesh.receiveShadow = true;
+    this.snowCapMesh.frustumCulled = false;
+    this.snowCapMesh.visible = false;
+    this.scene.add(this.snowCapMesh);
     this.floodMesh = makeInst(new THREE.BoxGeometry(CELL_SIZE * WORLD_SCALE * 1.02, CELL_SIZE * WORLD_SCALE * 1.02, 0.7), floodMat, 1600, false);
     this.aphidMesh = makeInst(new THREE.IcosahedronGeometry(0.035, 1), this.bank.aphidMat, 60);
     this.debrisMesh = makeInst(new THREE.IcosahedronGeometry(0.06, 0), this.bank.debrisMat, 16);
@@ -887,25 +894,89 @@ export class Formicarium3DRenderer {
     this.sparkMesh.instanceMatrix.needsUpdate = true;
   }
 
+  /**
+   * Snow lying on the ground: a smooth ribbon that follows the same smoothed contour the soil mesh is built from,
+   * with a soft rounded lip at the front glass. Thickness grows with the snow cover and drifts a little.
+   */
+  private updateSnowBlanket(sim: AntColonySimulation): void {
+    const cover = sim.snowCover;
+    if (cover < 0.02) {
+      this.snowCapMesh.visible = false;
+      this.snowKey = '';
+      return;
+    }
+    const key = `${this.env3d.fieldVersion}:${Math.round(cover * 40)}`;
+    this.snowCapMesh.visible = true;
+    if (key === this.snowKey) return;
+    this.snowKey = key;
+
+    const STEP = 3;
+    const x0 = CASE_LEFT + 2;
+    const n = Math.floor((CASE_RIGHT - 2 - x0) / STEP) + 1;
+    const ys = new Float32Array(n);
+    for (let j = 0; j < n; j++) {
+      const sx = x0 + j * STEP;
+      const gx = clamp(Math.floor(sx / CELL_SIZE), 0, GRID_W - 1);
+      ys[j] = this.env3d.groundYAt(sx, sim.grid.surfaceY[gx] + CELL_SIZE * 2.5);
+    }
+    // lightly smooth what we found, never across a gap (entrance holes stay open)
+    const sm = new Float32Array(n);
+    for (let j = 0; j < n; j++) {
+      if (Number.isNaN(ys[j])) {
+        sm[j] = NaN;
+        continue;
+      }
+      let sum = 0;
+      let w = 0;
+      for (let k = -2; k <= 2; k++) {
+        const v = ys[j + k];
+        if (v === undefined || Number.isNaN(v)) continue;
+        const wk = 3 - Math.abs(k);
+        sum += v * wk;
+        w += wk;
+      }
+      sm[j] = sum / w;
+    }
+
+    const zBack = SOIL_BACK_Z + 0.02;
+    const zFront = SOIL_FRONT_Z;
+    const base = 0.012 + cover * 0.07;
+    const pos: number[] = [];
+    const idx: number[] = [];
+    const ROW = 5;
+    let prevValid = false;
+    for (let j = 0; j < n; j++) {
+      const sy = sm[j];
+      const valid = !Number.isNaN(sy);
+      // drift: thickness wanders gently, and thins toward the edges of a gap
+      const edge = valid && (Number.isNaN(sm[j - 1] ?? NaN) || Number.isNaN(sm[j + 1] ?? NaN)) ? 0.35 : 1;
+      const th = base * edge * (0.85 + 0.15 * Math.sin(j * 0.37) + 0.08 * Math.sin(j * 1.31));
+      const x = simToWorldX(x0 + j * STEP);
+      const y = valid ? simToWorldY(sy) : 0;
+      // back edge, top, start of the rounded front lip, lip, bottom of the lip against the glass
+      pos.push(x, y + th * 0.8, zBack);
+      pos.push(x, y + th, zBack + (zFront - zBack) * 0.3);
+      pos.push(x, y + th * 0.96, zFront - 0.05);
+      pos.push(x, y + th * 0.55, zFront + 0.012);
+      pos.push(x, y - 0.012, zFront + 0.016);
+      if (valid && prevValid) {
+        const a = (j - 1) * ROW;
+        const b = j * ROW;
+        for (let r = 0; r < ROW - 1; r++) idx.push(a + r, b + r, a + r + 1, a + r + 1, b + r, b + r + 1);
+      }
+      prevValid = valid;
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    g.setIndex(idx);
+    g.computeVertexNormals();
+    this.snowCapMesh.geometry.dispose();
+    this.snowCapMesh.geometry = g;
+  }
+
   /** Snow lying on the ground, floodwater in the tunnels, aphids on the plants, trail debris. */
   private syncWeatherEntities(sim: AntColonySimulation): void {
-    // snow cap: a white crust following the ground profile, thickening as snow settles
-    let capC = 0;
-    if (sim.snowCover > 0.02) {
-      for (let gx = 9; gx < GRID_W - 9 && capC < GRID_W; gx += 2) {
-        const y0 = sim.grid.surfaceY[gx];
-        const y1 = sim.grid.surfaceY[Math.min(GRID_W - 1, gx + 2)];
-        const x = simToWorldX((gx + 1) * CELL_SIZE);
-        _dummy.position.set(x, simToWorldY((y0 + y1) / 2) + 0.015 + sim.snowCover * 0.05, 0.18);
-        // lie along the slope instead of stepping
-        _dummy.rotation.set(0, 0, Math.atan2(y0 - y1, CELL_SIZE * 2));
-        _dummy.scale.set(1, 0.4 + sim.snowCover * 1.6, 1);
-        _dummy.updateMatrix();
-        this.snowCapMesh.setMatrixAt(capC++, _dummy.matrix);
-      }
-    }
-    this.snowCapMesh.count = capC;
-    this.snowCapMesh.instanceMatrix.needsUpdate = true;
+    this.updateSnowBlanket(sim);
 
     // floodwater fills open cells below the water line (rebuilt only when the level or the nest changes)
     const key = sim.floodDepth > 0.5 ? `${Math.round(sim.floodDepth)}:${sim.grid.terrainVersion}` : '';
@@ -967,6 +1038,12 @@ export class Formicarium3DRenderer {
       }
     }
     this.camCtl.update(dt, followPos);
+    // the ground trembles when tunnels cave in or something heavy walks overhead
+    if (sim.shake > 0.01) {
+      const k = sim.shake * sim.shake * 0.05;
+      this.camera.position.x += (Math.random() - 0.5) * k;
+      this.camera.position.y += (Math.random() - 0.5) * k;
+    }
 
     // Wind sway on 3D surface sprouts + keep seated on growing entrance mounds
     const keepSproutsSeated = sim.grid.dirtVisualDirty;
@@ -995,6 +1072,7 @@ export class Formicarium3DRenderer {
   public dispose(): void {
     this.disposed = true;
     this.camCtl.dispose();
+    this.snowCapMesh.geometry.dispose();
     this.batcher.dispose();
     this.env3d.dispose();
     this.geo.dispose();
