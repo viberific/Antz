@@ -503,6 +503,21 @@ export class Formicarium3DRenderer {
       rig.root.position.set(simToWorldX(c.x), wy, z);
       const sc = c.kind === 'anteater' ? 0.8 : 1;
       rig.root.scale.set(c.dir * sc, sc, sc);
+      if (c.kind === 'ladybug' || c.kind === 'anteater') {
+        // follow the ground: tilt with the slope, and turn head-up when climbing a plant
+        const ud = rig.root.userData as { px?: number; py?: number; ang?: number };
+        const dx = (c.x - (ud.px ?? c.x)) * WORLD_SCALE;
+        const dy = -(c.y - (ud.py ?? c.y)) * WORLD_SCALE;
+        let ang = ud.ang ?? 0;
+        if (Math.hypot(dx, dy) > 1e-4 && c.state !== 'flying' && c.state !== 'leaving') {
+          const want = Math.atan2(dy * c.dir, Math.max(dx * c.dir, 0) + Math.abs(dy) * 0.0);
+          ang += (clamp(want, -1.45, 1.45) - ang) * 0.12;
+        } else if (c.state === 'flying' || c.state === 'leaving') ang *= 0.9;
+        ud.px = c.x;
+        ud.py = c.y;
+        ud.ang = ang;
+        rig.root.rotation.z = ang * (c.kind === 'ladybug' ? 1 : 0.5);
+      }
       animateCreatureRig(rig, c, sim.simTime);
     }
     for (const [id, rig] of this.creatureRigs) {
