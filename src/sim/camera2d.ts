@@ -63,6 +63,9 @@ export class FlatCameraController {
   private scanDir = 1;
   private scanDwell = 0;
   private scanHold = 0;
+  /** 0..1: how fast the sweep is moving right now; eases to 0 while a caption is up and back to 1 after */
+  private scanSpeed = 1;
+  private captionHold = false;
   /** drift: where the action is (world coords) and the camera's glide velocity */
   private driftGoal: { x: number; y: number } | null = null;
   private readonly driftVel = new THREE.Vector2();
@@ -134,6 +137,11 @@ export class FlatCameraController {
       top: Math.min(b.top, f.top),
     };
     this.fit();
+  }
+
+  /** While a caption is showing the up-down sweep eases to a stop; when it goes, the sweep eases back in. */
+  public setCaptionHold(on: boolean): void {
+    this.captionHold = on;
   }
 
   public get mode(): CameraMode {
@@ -281,13 +289,14 @@ export class FlatCameraController {
       this.scanU = THREE.MathUtils.clamp((top - this.target.y) / range, 0, 1);
       return;
     }
+    this.scanSpeed += ((this.captionHold ? 0 : 1) - this.scanSpeed) * (1 - Math.exp(-2.2 * dt));
     if (this.scanDwell > 0) {
-      this.scanDwell -= dt;
+      this.scanDwell -= dt * this.scanSpeed;
     } else {
       const edge = this.scanDir > 0 ? 1 - this.scanU : this.scanU;
       const e = THREE.MathUtils.clamp(edge / 0.14, 0, 1);
       const f = 0.22 + 0.78 * (e * e * (3 - 2 * e)); // slow into the ends, steady between them
-      this.scanU += (this.scanDir * SCAN_SPEED * f * dt) / range;
+      this.scanU += (this.scanDir * SCAN_SPEED * f * this.scanSpeed * dt) / range;
       if (this.scanU >= 1 || this.scanU <= 0) {
         this.scanU = THREE.MathUtils.clamp(this.scanU, 0, 1);
         this.scanDir = -this.scanDir;

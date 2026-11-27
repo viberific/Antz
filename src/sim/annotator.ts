@@ -75,11 +75,9 @@ const CARRYING_TASKS = new Set<AntTask>([
 const FADE_IN = 0.7;
 const FADE_OUT = 0.5;
 /** quiet time between two annotations, so the screen is never crowded */
-const GAP = 1.6;
-
-function words(s: string): number {
-  return s.split(/\s+/).length;
-}
+const GAP = 1.0;
+/** every annotation stays up for this long (seconds, not counting the fades) */
+export const HOLD = 5;
 
 /**
  * Chooses what to annotate, one thing at a time.
@@ -165,7 +163,7 @@ export class Annotator {
       const last = this.shown.get('event:' + note.id);
       if (last !== undefined && sim.simTime - last < note.cooldown) continue;
       this.pending.push({ note, at: sim.simTime });
-      if (this.pending.length > 3) this.pending.shift();
+      if (this.pending.length > 5) this.pending.shift();
     }
   }
 
@@ -190,7 +188,7 @@ export class Annotator {
     const age = now - a.startedAt;
     if (a.view.layout === 'banner') return age < a.duration;
     // an event that matters more than any one ant takes the screen, once the current caption has had time to be read
-    if (age > 3.5 && this.bannerWaiting(now, host)) return false;
+    if (age > 3 && this.bannerWaiting(now, host)) return false;
     if (age > a.duration) return false;
     const s = a.subject;
     if (!s) return false;
@@ -229,7 +227,7 @@ export class Annotator {
         undefined,
         undefined,
         now,
-        Math.min(15, Math.max(8.5, 4.5 + words(note.body) * 0.26))
+        HOLD
       );
       this.bannerEnd = now + this.active!.duration;
       return;
@@ -245,12 +243,12 @@ export class Annotator {
       this.shown.set('ant:' + pick.id, now);
       this.shown.set('caste:' + ant.caste, now);
     }
-    const dur = host.mode() === 'follow' ? Infinity : Math.min(14, Math.max(8, 4.5 + words(built.view.body) * 0.26));
+    const dur = host.mode() === 'follow' ? Infinity : HOLD;
     this.begin(built.view, pick, built.task, now, dur);
   }
 
   private bannerWaiting(now: number, host: AnnotatorHost): boolean {
-    return this.pending.length > 0 && host.mode() !== 'follow' && now - this.bannerEnd >= 18;
+    return this.pending.length > 0 && host.mode() !== 'follow' && now - this.bannerEnd >= 9;
   }
 
   private begin(view: Omit<AnnotationView, 'alpha'>, subject: Subject | undefined, task: AntTask | undefined, now: number, duration: number): void {
@@ -313,8 +311,8 @@ export class Annotator {
       let interest = note.interest;
       if (a.caste === AntCaste.QUEEN || a.caste === AntCaste.GYNE || a.caste === AntCaste.MALE) interest += 1.2;
       consider({ kind: 'ant', id: a.id }, interest, [
-        ['task:' + a.task, 45, 0.2],
-        ['ant:' + a.id, 120, 0.15],
+        ['task:' + a.task, 30, 0.2],
+        ['ant:' + a.id, 80, 0.15],
         ['caste:' + a.caste, 20, 0.6],
       ]);
     }
