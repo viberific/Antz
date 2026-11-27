@@ -78,6 +78,8 @@ export enum AntTask {
   CLUSTERING = 'Overwintering Cluster',
   SEALING_ENTRANCE = 'Sealing Entrance',
   BACKFILLING = 'Backfilling Old Gallery',
+  CUTTING_LEAF = 'Cutting Leaf',
+  CARRYING_LEAF = 'Carrying Leaf to Fungus Garden',
 }
 
 export enum PayloadType {
@@ -95,6 +97,8 @@ export enum PayloadType {
   CHAFF = 10,
   /** a twig or grit cleared off a busy trail */
   DEBRIS = 11,
+  /** a snipped piece of leaf for the fungus garden */
+  LEAF = 12,
 }
 
 export enum BroodStage {
@@ -195,6 +199,8 @@ export interface Ant {
   backfill?: number;
   /** personality, each 0..1: nerve (stands and fights, goes out at night/in marginal weather), diligence (pace, rests
    *  less) and sociability (greets, shares and groups up more) */
+  /** seconds left cutting a leaf fragment (undefined = not cutting) */
+  leafTimer?: number;
   bold?: number;
   /** soldier marching out with the counter-raid on the rival nest */
   warBand?: boolean;
@@ -336,6 +342,8 @@ export interface PlantSprout {
   swayPhase: number;
   kind: 'moss' | 'clover' | 'fern' | 'grass';
   shade: number;
+  /** 0..1 how much has been snipped off by leaf-cutters (regrows) */
+  cut?: number;
 }
 
 export interface SurfaceProp {

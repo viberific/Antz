@@ -1124,6 +1124,8 @@ export class Formicarium3DRenderer {
         const gx = clamp(Math.floor(simX / CELL_SIZE), 0, GRID_W - 1);
         sp.mesh.position.y = simToWorldY(sim.grid.surfaceY[gx]);
       }
+      const cut = sim.sprouts[i]?.cut ?? 0;
+      sp.mesh.scale.y += ((1 - cut * 0.45) - sp.mesh.scale.y) * 0.08;
       sp.mesh.rotation.z =
         Math.sin(sim.simTime * 2.1 + sp.phase) * (0.045 + Math.abs(sim.windStrength) * 0.06);
     }

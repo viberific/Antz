@@ -147,6 +147,7 @@ export class MaterialBank {
   public readonly wingMat: THREE.MeshStandardMaterial;
   public readonly maleBody: THREE.MeshStandardMaterial;
   public readonly chaffMat: THREE.MeshStandardMaterial;
+  public readonly cutLeafMat: THREE.MeshStandardMaterial;
   public readonly aphidMat: THREE.MeshStandardMaterial;
   public readonly debrisMat: THREE.MeshStandardMaterial;
   public readonly queenAbdomen: THREE.MeshStandardMaterial;
@@ -437,6 +438,7 @@ export class MaterialBank {
       })
     );
     this.maleBody = reg(new THREE.MeshStandardMaterial({ color: 0x17120f, roughness: 0.4, metalness: 0.08 }));
+    this.cutLeafMat = reg(new THREE.MeshStandardMaterial({ color: 0x5fae45, roughness: 0.7, metalness: 0, flatShading: true, side: THREE.DoubleSide }));
     this.chaffMat = reg(new THREE.MeshStandardMaterial({ color: 0xc9a86a, roughness: 0.85, metalness: 0, flatShading: true }));
     this.aphidMat = reg(new THREE.MeshStandardMaterial({ color: 0x9bd46a, roughness: 0.45, metalness: 0, emissive: 0x1a2a0c, emissiveIntensity: 0.3 }));
     this.debrisMat = reg(new THREE.MeshStandardMaterial({ color: 0x6b5a45, roughness: 0.92, metalness: 0, flatShading: true }));

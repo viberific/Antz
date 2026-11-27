@@ -509,10 +509,15 @@ export function createAntRig(
   const debrisMesh = new THREE.Mesh(geo.icosa0, bank.debrisMat);
   debrisMesh.scale.set(0.06, 0.025, 0.03);
   debrisMesh.visible = false;
-  payloadGroup.add(chaffMesh, debrisMesh);
+  const leafMesh = new THREE.Mesh(geo.icosa0, bank.cutLeafMat);
+  leafMesh.scale.set(0.085, 0.01, 0.06);
+  leafMesh.position.y = 0.035;
+  leafMesh.visible = false;
+  payloadGroup.add(chaffMesh, debrisMesh, leafMesh);
 
   const payloadMeshes: Record<number, THREE.Object3D> = {
     [PayloadType.CHAFF]: chaffMesh,
+    [PayloadType.LEAF]: leafMesh,
     [PayloadType.DEBRIS]: debrisMesh,
     [PayloadType.SEED]: seedMesh,
     [PayloadType.HONEYDEW]: honeyMesh,

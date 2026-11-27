@@ -1333,6 +1333,7 @@ export class AntColonySimulation {
       }
     }
 
+    for (const sp of this.sprouts) if ((sp.cut ?? 0) > 0) sp.cut = Math.max(0, (sp.cut ?? 0) - dt / 500);
     // Fungus garden blooms when soil is hydrated
     this.fungusTimer -= dt;
     if (this.fungusTimer <= 0) {
@@ -3747,6 +3748,73 @@ export class AntColonySimulation {
     return true;
   }
 
+  private fungusStock(): number {
+    const c = this.getChamber(ChamberType.FUNGUS);
+    if (!c) return 0;
+    let n = 0;
+    for (const f of this.foods) if (f.storedInChamberId === c.id) n += f.amount;
+    return n;
+  }
+
+  /** Leaf-cutters snip fragments off living plants and haul them down to be chewed into the fungus's compost. */
+  private tryCutLeaf(ant: Ant, dt: number): boolean {
+    if (ant.id % 8 !== 4 || !this.getChamber(ChamberType.FUNGUS)) return false;
+    if (ant.leafTimer === undefined && this.fungusStock() > 90) return false;
+    let plant: PlantSprout | null = null;
+    let bestD = 260;
+    for (const s of this.sprouts) {
+      if (s.kind === 'moss' || (s.cut ?? 0) > 0.7) continue;
+      const d = Math.abs(s.x - ant.x);
+      if (d < bestD) {
+        bestD = d;
+        plant = s;
+      }
+    }
+    if (!plant) {
+      ant.leafTimer = undefined;
+      return false;
+    }
+    const pl = plant as PlantSprout;
+    ant.task = AntTask.CUTTING_LEAF;
+    if (Math.abs(pl.x - ant.x) > 5) {
+      ant.leafTimer = undefined;
+      const t = this.surfaceTarget(pl.x);
+      this.goTo(ant, t.x, t.y);
+      return true;
+    }
+    if (ant.leafTimer === undefined) ant.leafTimer = 3 + Math.random() * 2.5;
+    this.stopMoving(ant);
+    ant.leafTimer -= dt;
+    if (Math.random() < dt * 6) this.spawnCrumbs(ant.x, ant.y - 2, '#5fae45', 1);
+    if (ant.leafTimer <= 0) {
+      ant.leafTimer = undefined;
+      pl.cut = Math.min(1, (pl.cut ?? 0) + 0.12);
+      ant.payload = PayloadType.LEAF;
+      ant.payloadValue = 1;
+    }
+    return true;
+  }
+
+  private carryLeaf(ant: Ant): void {
+    ant.task = AntTask.CARRYING_LEAF;
+    const fc = this.nearestChamber(ChamberType.FUNGUS, ant.x, ant.y);
+    if (!fc) {
+      this.releasePayload(ant);
+      return;
+    }
+    const d = this.go(ant, 'fungus');
+    if (d <= 0.5 || this.isInsideChamber(ant, fc, 0.6)) {
+      const bed = this.foods.filter((f) => f.storedInChamberId === fc.id).sort((a, b) => a.amount - b.amount)[0];
+      if (bed) bed.amount = Math.min(bed.maxAmount, bed.amount + 7);
+      else
+        this.foods.push({ id: this.allocId(), type: PayloadType.FUNGUS, x: fc.x, y: fc.y + 10, amount: 8, maxAmount: 50, radius: 7, storedInChamberId: fc.id });
+      ant.payload = PayloadType.NONE;
+      ant.payloadValue = 0;
+      ant.task = AntTask.TENDING_FUNGUS;
+      this.busy(ant, AntTask.TENDING_FUNGUS, 3 + Math.random() * 3);
+    }
+  }
+
   private carryChaff(ant: Ant): void {
     ant.task = AntTask.CARRYING_CHAFF;
     const d = this.go(ant, 'midden');
@@ -4342,6 +4410,10 @@ export class AntColonySimulation {
       this.tryClearTrail(ant);
       return;
     }
+    if (ant.payload === PayloadType.LEAF) {
+      this.carryLeaf(ant);
+      return;
+    }
 
     if (isFoodPayload(ant.payload)) {
       ant.task = AntTask.RETURNING_WITH_FOOD;
@@ -4424,6 +4496,8 @@ export class AntColonySimulation {
     if (ant.id % 5 === 0 && this.tryClearTrail(ant)) return;
     // a share of the foragers are herders that milk the colony's aphids
     if (ant.id % 3 === 1 && this.tryTendAphids(ant)) return;
+    // ...and a few are leaf-cutters feeding the fungus garden
+    if (this.tryCutLeaf(ant, dt)) return;
 
     if (ant.hydration < 55) {
       const drop = this.droplets.find((dd) => dd.settled && Math.abs(dd.x - ant.x) < 60 && Math.abs(dd.y - ant.y) < 20);
