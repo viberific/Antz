@@ -152,6 +152,10 @@ export interface Ant {
   trophallaxisPartnerId: number | null;
   lastPathCalcTime: number;
   stuckTimer: number;
+  /** progress watchdog: the waypoint being approached, the closest we have been to it, and for how long we have not got closer */
+  progTarget?: Vec2 | null;
+  progBest?: number;
+  progTimer?: number;
   prevX: number;
   prevY: number;
   greetCooldown: number;

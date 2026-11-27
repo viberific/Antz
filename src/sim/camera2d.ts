@@ -29,6 +29,8 @@ const SCAN_DWELL = 2.6;
 /** seconds the sweep stays paused after the viewer slid it by hand */
 const SCAN_RESUME = 4;
 const DRIFT_MAX_SPEED = 3.2;
+/** drift's closest approach to the action (camera distance; MIN_DIST is the hard limit) */
+const DRIFT_MIN_DIST = 2.4;
 const MIN_DIST = 1.6;
 const TAP_MS = 320;
 const TAP_PX = 10;
@@ -69,6 +71,8 @@ export class FlatCameraController {
   /** drift: where the action is (world coords) and the camera's glide velocity */
   private driftGoal: { x: number; y: number } | null = null;
   private readonly driftVel = new THREE.Vector2();
+  /** 0..1: how much of its glide drift is using right now; eases to 0 while a caption is up */
+  private driftSpeed = 1;
 
   private readonly pointers = new Map<number, { x: number; y: number; sx: number; sy: number; t: number }>();
   private pinchDist = 0;
@@ -309,13 +313,18 @@ export class FlatCameraController {
 
   /** Cinematic glide toward the action: accelerates and settles smoothly instead of snapping. */
   private updateDrift(dt: number): void {
-    const wantDist = Math.min(this.widthFitDist(), Math.max(this.maxDist * 0.5, 3.2));
-    this.dist += (wantDist - this.dist) * (1 - Math.exp(-0.9 * dt));
+    // close in on the action: a good deal tighter than the whole nest width
+    const wantDist = Math.min(this.widthFitDist() * 0.55, Math.max(this.maxDist * 0.3, DRIFT_MIN_DIST));
+    this.dist += (wantDist - this.dist) * (1 - Math.exp(-1.2 * dt));
     const gx = this.driftGoal ? this.driftGoal.x : (this.focus.left + this.focus.right) / 2;
     const gy = this.driftGoal ? this.driftGoal.y : (this.focus.bottom + this.focus.top) / 2;
+    // while a note is up the glide settles to a stop (and stays put until the note has faded), then eases back in
+    this.driftSpeed += ((this.captionHold ? 0 : 1) - this.driftSpeed) * (1 - Math.exp(-(this.captionHold ? 2.4 : 1.2) * dt));
     const vk = 1 - Math.exp(-2.2 * dt);
     for (const axis of ['x', 'y'] as const) {
-      const want = THREE.MathUtils.clamp((axis === 'x' ? gx - this.target.x : gy - this.target.y) * 0.9, -DRIFT_MAX_SPEED, DRIFT_MAX_SPEED);
+      const want =
+        THREE.MathUtils.clamp((axis === 'x' ? gx - this.target.x : gy - this.target.y) * 0.9, -DRIFT_MAX_SPEED, DRIFT_MAX_SPEED) *
+        this.driftSpeed;
       this.driftVel[axis] += (want - this.driftVel[axis]) * vk;
       this.target[axis] += this.driftVel[axis] * dt;
     }
