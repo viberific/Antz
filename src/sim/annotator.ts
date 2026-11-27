@@ -76,8 +76,18 @@ const FADE_IN = 0.7;
 const FADE_OUT = 0.5;
 /** quiet time between two annotations, so the screen is never crowded */
 const GAP = 1.0;
-/** every annotation stays up for this long (seconds, not counting the fades) */
-export const HOLD = 5;
+/** every annotation stays up for at least this long (seconds, not counting the fades) */
+export const HOLD_MIN = 10;
+/** ...and for this long when the text is long */
+export const HOLD_MAX = 15;
+/** text length (characters) at which the hold reaches HOLD_MAX */
+const HOLD_LONG_CHARS = 220;
+
+/** 10–15 seconds, scaled by how much there is to read */
+export function holdFor(view: Pick<AnnotationView, 'kicker' | 'title' | 'term' | 'body' | 'chips'>): number {
+  const chars = view.kicker.length + view.title.length + (view.term?.length ?? 0) + view.body.length + view.chips.join(' ').length;
+  return HOLD_MIN + (HOLD_MAX - HOLD_MIN) * Math.min(1, chars / HOLD_LONG_CHARS);
+}
 
 /**
  * Chooses what to annotate, one thing at a time.
@@ -188,7 +198,7 @@ export class Annotator {
     const age = now - a.startedAt;
     if (a.view.layout === 'banner') return age < a.duration;
     // an event that matters more than any one ant takes the screen, once the current caption has had time to be read
-    if (age > 3 && this.bannerWaiting(now, host)) return false;
+    if (age > HOLD_MIN && this.bannerWaiting(now, host)) return false;
     if (age > a.duration) return false;
     const s = a.subject;
     if (!s) return false;
@@ -214,21 +224,16 @@ export class Annotator {
       if (last !== undefined && now - last < note.cooldown) continue;
       this.shown.set('event:' + note.id, now);
       if (note.creature) this.shown.set('creature:' + note.creature, now);
-      this.begin(
-        {
-          layout: 'banner',
-          key: 'event:' + note.id + ':' + now.toFixed(0),
-          kicker: note.kicker,
-          title: note.title,
-          body: note.body,
-          chips: [],
-          accent: note.accent,
-        },
-        undefined,
-        undefined,
-        now,
-        HOLD
-      );
+      const bannerView: Omit<AnnotationView, 'alpha'> = {
+        layout: 'banner',
+        key: 'event:' + note.id + ':' + now.toFixed(0),
+        kicker: note.kicker,
+        title: note.title,
+        body: note.body,
+        chips: [],
+        accent: note.accent,
+      };
+      this.begin(bannerView, undefined, undefined, now, holdFor(bannerView));
       this.bannerEnd = now + this.active!.duration;
       return;
     }
@@ -243,7 +248,7 @@ export class Annotator {
       this.shown.set('ant:' + pick.id, now);
       this.shown.set('caste:' + ant.caste, now);
     }
-    const dur = host.mode() === 'follow' ? Infinity : HOLD;
+    const dur = host.mode() === 'follow' ? Infinity : holdFor(built.view);
     this.begin(built.view, pick, built.task, now, dur);
   }
 
