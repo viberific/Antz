@@ -34,6 +34,84 @@ function smoothstep(edge0: number, edge1: number, x: number): number {
 const _dummy = new THREE.Object3D();
 const _col = new THREE.Color();
 
+/**
+ * A reusable, growable typed-array buffer for rebuilding meshes.
+ *
+ * The soil mesh is rebuilt every second or so while ants dig, with ~150k vertices. Building it in plain JS arrays
+ * produced hundreds of MB of garbage a minute, and on memory-tight Android phones Chrome killed the tab. These keep
+ * their storage between rebuilds; only the exact-size copy handed to the GPU is new each time.
+ */
+class ScratchF32 {
+  private buf: Float32Array;
+  public length = 0;
+  constructor(initial = 4096) {
+    this.buf = new Float32Array(initial);
+  }
+  public reset(): void {
+    this.length = 0;
+  }
+  private grow(need: number): void {
+    let cap = this.buf.length;
+    while (cap < need) cap *= 2;
+    const next = new Float32Array(cap);
+    next.set(this.buf.subarray(0, this.length));
+    this.buf = next;
+  }
+  public push2(a: number, b: number): void {
+    if (this.length + 2 > this.buf.length) this.grow(this.length + 2);
+    const o = this.length;
+    this.buf[o] = a;
+    this.buf[o + 1] = b;
+    this.length = o + 2;
+  }
+  public push3(a: number, b: number, c: number): void {
+    if (this.length + 3 > this.buf.length) this.grow(this.length + 3);
+    const o = this.length;
+    this.buf[o] = a;
+    this.buf[o + 1] = b;
+    this.buf[o + 2] = c;
+    this.length = o + 3;
+  }
+  public get(i: number): number {
+    return this.buf[i];
+  }
+  /** An exact-size copy that the geometry can own. */
+  public take(): Float32Array {
+    return this.buf.slice(0, this.length);
+  }
+}
+
+class ScratchU32 {
+  private buf: Uint32Array;
+  public length = 0;
+  constructor(initial = 4096) {
+    this.buf = new Uint32Array(initial);
+  }
+  public reset(): void {
+    this.length = 0;
+  }
+  public push6(a: number, b: number, c: number, d: number, e: number, f: number): void {
+    if (this.length + 6 > this.buf.length) {
+      let cap = this.buf.length;
+      while (cap < this.length + 6) cap *= 2;
+      const next = new Uint32Array(cap);
+      next.set(this.buf.subarray(0, this.length));
+      this.buf = next;
+    }
+    const o = this.length;
+    this.buf[o] = a;
+    this.buf[o + 1] = b;
+    this.buf[o + 2] = c;
+    this.buf[o + 3] = d;
+    this.buf[o + 4] = e;
+    this.buf[o + 5] = f;
+    this.length = o + 6;
+  }
+  public take(): Uint32Array {
+    return this.buf.slice(0, this.length);
+  }
+}
+
 function clamp(v: number, min: number, max: number): number {
   return v < min ? min : v > max ? max : v;
 }
@@ -232,6 +310,20 @@ export class FormicariumEnvironment3D {
 
   private smoothSoilField = new Float32Array(GRID_W * GRID_H);
   private smoothAirField = new Float32Array(GRID_W * GRID_H);
+  // scratch storage reused by every rebuildTerrain() (see ScratchF32)
+  private readonly sPositions = new ScratchF32(1 << 19);
+  private readonly sNormals = new ScratchF32(1 << 19);
+  private readonly sUvs = new ScratchF32(1 << 18);
+  private readonly sColors = new ScratchF32(1 << 19);
+  private readonly sCPositions = new ScratchF32(1 << 15);
+  private readonly sCUvs = new ScratchF32(1 << 14);
+  private readonly sCColors = new ScratchF32(1 << 15);
+  private readonly sCIndices = new ScratchU32(1 << 15);
+  private readonly fieldA = new Float32Array(GRID_W * GRID_H);
+  private readonly fieldB = new Float32Array(GRID_W * GRID_H);
+  private readonly airA = new Float32Array(GRID_W * GRID_H);
+  private readonly airB = new Float32Array(GRID_W * GRID_H);
+  private readonly curvedVertexMap = new Int32Array((GRID_W + 1) * (GRID_H + 1));
   private lastRebuildTime = -10;
   private builtTerrainVersion = -1;
   private lastBackTexTime = -10;
@@ -583,10 +675,7 @@ export class FormicariumEnvironment3D {
 
     // --- 1. Build smoothed scalar soil occupancy & air-exposure fields ---
     const len = GRID_W * GRID_H;
-    const fieldA = new Float32Array(len);
-    const fieldB = new Float32Array(len);
-    const airA = new Float32Array(len);
-    const airB = new Float32Array(len);
+    const { fieldA, fieldB, airA, airB } = this;
 
     for (let gy = minGy; gy <= maxGy; gy++) {
       const row = gy * GRID_W;
@@ -711,10 +800,14 @@ export class FormicariumEnvironment3D {
     };
 
     // --- PART A: Smooth Marching Squares Cross-Section + Multi-Ring Rounded Tunnel Bevels ---
-    const positions: number[] = [];
-    const normals: number[] = [];
-    const uvs: number[] = [];
-    const colors: number[] = [];
+    const positions = this.sPositions;
+    const normals = this.sNormals;
+    const uvs = this.sUvs;
+    const colors = this.sColors;
+    positions.reset();
+    normals.reset();
+    uvs.reset();
+    colors.reset();
 
     const pushTri = (
       ax: number, ay: number, az: number, au: number, av: number,
@@ -727,10 +820,18 @@ export class FormicariumEnvironment3D {
       cb: [number, number, number],
       cc: [number, number, number]
     ) => {
-      positions.push(ax, ay, az, bx, by, bz, cx, cy, cz);
-      normals.push(na[0], na[1], na[2], nb[0], nb[1], nb[2], nc[0], nc[1], nc[2]);
-      uvs.push(au, av, bu, bv, cu, cv);
-      colors.push(ca[0], ca[1], ca[2], cb[0], cb[1], cb[2], cc[0], cc[1], cc[2]);
+      positions.push3(ax, ay, az);
+      positions.push3(bx, by, bz);
+      positions.push3(cx, cy, cz);
+      normals.push3(na[0], na[1], na[2]);
+      normals.push3(nb[0], nb[1], nb[2]);
+      normals.push3(nc[0], nc[1], nc[2]);
+      uvs.push2(au, av);
+      uvs.push2(bu, bv);
+      uvs.push2(cu, cv);
+      colors.push3(ca[0], ca[1], ca[2]);
+      colors.push3(cb[0], cb[1], cb[2]);
+      colors.push3(cc[0], cc[1], cc[2]);
     };
 
     const FRONT_N: [number, number, number] = [0, 0, 1];
@@ -1216,11 +1317,16 @@ export class FormicariumEnvironment3D {
 
     const stride = GRID_W + 1;
     const vCount = (GRID_W + 1) * (GRID_H + 1);
-    const curvedVertexMap = new Int32Array(vCount).fill(-1);
-    const cPositions: number[] = [];
-    const cUvs: number[] = [];
-    const cColors: number[] = [];
-    const cIndices: number[] = [];
+    const curvedVertexMap = this.curvedVertexMap;
+    curvedVertexMap.fill(-1, 0, vCount);
+    const cPositions = this.sCPositions;
+    const cUvs = this.sCUvs;
+    const cColors = this.sCColors;
+    const cIndices = this.sCIndices;
+    cPositions.reset();
+    cUvs.reset();
+    cColors.reset();
+    cIndices.reset();
 
     const ensureCurvedVertex = (vx: number, vy: number, m: number): number => {
       const key = vy * stride + vx;
@@ -1237,8 +1343,8 @@ export class FormicariumEnvironment3D {
       const dx = (deterministicRand(vx, vy, 61) - 0.5) * 0.018 * edgeLock;
       const dy = (deterministicRand(vx, vy, 62) - 0.5) * 0.018 * edgeLock;
       const dz = (deterministicRand(vx, vy, 63) - 0.5) * 0.024;
-      cPositions.push(baseX + dx, baseY + dy, cavityDepthToZ(d) + dz);
-      cUvs.push(vx * 0.06, (GRID_H - vy) * 0.06);
+      cPositions.push3(baseX + dx, baseY + dy, cavityDepthToZ(d) + dz);
+      cUvs.push2(vx * 0.06, (GRID_H - vy) * 0.06);
 
       const depthShade = clamp(0.82 - d * 0.075, 0.44, 0.85);
       const [sr, sg, sb] = granuleColorSrgb(
@@ -1248,7 +1354,7 @@ export class FormicariumEnvironment3D {
         deterministicRand(vx, vy, 71)
       );
       _col.setRGB(sr * depthShade, sg * depthShade, sb * depthShade, THREE.SRGBColorSpace);
-      cColors.push(_col.r, _col.g, _col.b);
+      cColors.push3(_col.r, _col.g, _col.b);
       return idx;
     };
 
@@ -1265,7 +1371,7 @@ export class FormicariumEnvironment3D {
           const iBR = ensureCurvedVertex(gx + 1, gy + 1, m);
           const iTR = ensureCurvedVertex(gx + 1, gy, m);
           const iTL = ensureCurvedVertex(gx, gy, m);
-          cIndices.push(iBL, iBR, iTR, iBL, iTR, iTL);
+          cIndices.push6(iBL, iBR, iTR, iBL, iTR, iTL);
 
           if (t === CellType.TUNNEL) {
             const cellDepth = cavityDepth[idx];
@@ -1278,15 +1384,15 @@ export class FormicariumEnvironment3D {
               const ib = useTri0 ? iBR : iTR;
               const ic = useTri0 ? iTR : iTL;
 
-              const ax = cPositions[ia * 3];
-              const ay = cPositions[ia * 3 + 1];
-              const az = cPositions[ia * 3 + 2];
-              const bx = cPositions[ib * 3];
-              const by = cPositions[ib * 3 + 1];
-              const bz = cPositions[ib * 3 + 2];
-              const cx = cPositions[ic * 3];
-              const cy = cPositions[ic * 3 + 1];
-              const cz = cPositions[ic * 3 + 2];
+              const ax = cPositions.get(ia * 3);
+              const ay = cPositions.get(ia * 3 + 1);
+              const az = cPositions.get(ia * 3 + 2);
+              const bx = cPositions.get(ib * 3);
+              const by = cPositions.get(ib * 3 + 1);
+              const bz = cPositions.get(ib * 3 + 2);
+              const cx = cPositions.get(ic * 3);
+              const cy = cPositions.get(ic * 3 + 1);
+              const cz = cPositions.get(ic * 3 + 2);
 
               let u = deterministicRand(gx, gy, 11 + k * 5);
               let v = deterministicRand(gx, gy, 12 + k * 5);
@@ -1340,20 +1446,20 @@ export class FormicariumEnvironment3D {
     }
 
     const solidGeo = new THREE.BufferGeometry();
-    solidGeo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-    solidGeo.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
-    solidGeo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
-    solidGeo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+    solidGeo.setAttribute('position', new THREE.BufferAttribute(positions.take(), 3));
+    solidGeo.setAttribute('normal', new THREE.BufferAttribute(normals.take(), 3));
+    solidGeo.setAttribute('uv', new THREE.BufferAttribute(uvs.take(), 2));
+    solidGeo.setAttribute('color', new THREE.BufferAttribute(colors.take(), 3));
     solidGeo.computeBoundingSphere();
 
     this.solidMesh.geometry.dispose();
     this.solidMesh.geometry = solidGeo;
 
     const curvedGeo = new THREE.BufferGeometry();
-    curvedGeo.setAttribute('position', new THREE.Float32BufferAttribute(cPositions, 3));
-    curvedGeo.setAttribute('uv', new THREE.Float32BufferAttribute(cUvs, 2));
-    curvedGeo.setAttribute('color', new THREE.Float32BufferAttribute(cColors, 3));
-    curvedGeo.setIndex(cIndices);
+    curvedGeo.setAttribute('position', new THREE.BufferAttribute(cPositions.take(), 3));
+    curvedGeo.setAttribute('uv', new THREE.BufferAttribute(cUvs.take(), 2));
+    curvedGeo.setAttribute('color', new THREE.BufferAttribute(cColors.take(), 3));
+    curvedGeo.setIndex(new THREE.BufferAttribute(cIndices.take(), 1));
     curvedGeo.computeVertexNormals();
     curvedGeo.computeBoundingSphere();
 
