@@ -6027,7 +6027,12 @@ export class AntColonySimulation {
       // crawl up it. (Sliding along a wall we are heading straight into means "don't move" - that is how
       // ants used to freeze at the foot of soil mounds.)
       const climbY = this.findFaceClimb(ant, stepDist, moveTarget, isOpen);
-      if (climbY !== null) {
+      // A goal that lies below us (down a shaft, past a wall corner at the throat of an entrance) is reached by
+      // sliding down along the wall, not by climbing it: otherwise the ant bobs up and down at the corner forever.
+      const goalBelow = moveTarget !== null && moveTarget.y > ant.y + 1 && ny > ant.y;
+      if (goalBelow && isOpen(ant.x, ny)) {
+        nx = ant.x;
+      } else if (climbY !== null) {
         nx = ant.x;
         ny = climbY;
         climbing = true;
@@ -6156,6 +6161,31 @@ export class AntColonySimulation {
       }
     } else {
       ant.stuckTimer = 0;
+    }
+
+    // Progress watchdog: bobbing against a wall corner moves the ant a pixel or two every frame, so the check above
+    // never trips. If the ant is no nearer to its current waypoint after a while, the route is no good: replan.
+    if (moveTarget && pace >= 0.25) {
+      const d = Math.hypot(moveTarget.x - ant.x, moveTarget.y - ant.y);
+      if (ant.progTarget !== moveTarget || ant.progBest === undefined || d < ant.progBest - 0.6) {
+        ant.progTarget = moveTarget;
+        ant.progBest = d;
+        ant.progTimer = 0;
+      } else if ((ant.progTimer = (ant.progTimer ?? 0) + dt) > 1.6) {
+        ant.progTimer = 0;
+        ant.progBest = undefined;
+        if (ant.path.length > 0) {
+          ant.path = [];
+          ant.pathIndex = 0;
+          ant.lastPathCalcTime = -10;
+        }
+        ant.targetPos = null;
+        ant.angle = wrapAngle(ant.angle + Math.PI * (0.4 + Math.random() * 0.5));
+        ant.stuckTimer = 0;
+      }
+    } else {
+      ant.progBest = undefined;
+      ant.progTimer = 0;
     }
     ant.prevX = ant.x;
     ant.prevY = ant.y;
