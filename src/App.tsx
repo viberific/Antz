@@ -2,6 +2,18 @@ import { useEffect, useRef, useState } from 'react';
 import { AntColonySimulation } from './sim/colony';
 import { RealWorld } from './sim/realworld';
 import { Formicarium3DRenderer } from './sim/renderer3d';
+import type { CameraMode } from './sim/camera2d';
+import { ArrowUpDown, BookOpen, Compass, Footprints, Maximize2, X } from 'lucide-react';
+
+const CAPTIONS_KEY = 'formicarium_captions';
+
+function loadCaptions(): boolean {
+  try {
+    return localStorage.getItem(CAPTIONS_KEY) !== '0';
+  } catch {
+    return true;
+  }
+}
 
 /** Fixed simulation step: behaviour no longer depends on the device's frame rate. */
 const SIM_STEP = 1 / 30;
@@ -31,6 +43,52 @@ export default function App() {
   const renderer3dRef = useRef<Formicarium3DRenderer | null>(null);
   const [vp, setVp] = useState(viewport);
   const portrait = vp.h > vp.w;
+  const [mode, setMode] = useState<CameraMode>('overview');
+  const [captions, setCaptions] = useState(loadCaptions);
+  const [hudIdle, setHudIdle] = useState(false);
+
+  // controls fade back a few seconds after the last touch, so they never sit in the picture
+  useEffect(() => {
+    let timer = 0;
+    const wake = () => {
+      setHudIdle(false);
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => setHudIdle(true), 4500);
+    };
+    wake();
+    window.addEventListener('pointerdown', wake);
+    window.addEventListener('pointermove', wake);
+    return () => {
+      window.clearTimeout(timer);
+      window.removeEventListener('pointerdown', wake);
+      window.removeEventListener('pointermove', wake);
+    };
+  }, []);
+
+  // desktop shortcuts: 1 / 2 / 3 camera modes, N notes, Esc stop following
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      const cam = renderer3dRef.current?.camCtl;
+      if (!cam) return;
+      if (e.key === '1') cam.setMode('overview');
+      else if (e.key === '2') cam.setMode('scan');
+      else if (e.key === '3') cam.setMode('drift');
+      else if (e.key === 'n' || e.key === 'N') setCaptions((c) => !c);
+      else if (e.key === 'Escape' && cam.mode === 'follow') cam.resume();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
+
+  useEffect(() => {
+    renderer3dRef.current?.setAnnotations(captions);
+    try {
+      localStorage.setItem(CAPTIONS_KEY, captions ? '1' : '0');
+    } catch {
+      /* storage unavailable */
+    }
+  }, [captions]);
 
   useEffect(() => {
     const onFirstTouch = () => goFullscreenLandscape();
@@ -53,6 +111,8 @@ export default function App() {
     world.start();
     const renderer3d = new Formicarium3DRenderer(container, sim);
     renderer3dRef.current = renderer3d;
+    renderer3d.onCameraMode = setMode;
+    renderer3d.setAnnotations(loadCaptions());
     if (import.meta.env.DEV) (window as unknown as { __r?: unknown }).__r = renderer3d;
     if (import.meta.env.DEV) (window as unknown as { __antz?: unknown }).__antz = { sim, renderer3d };
 
@@ -157,14 +217,39 @@ export default function App() {
     <main className="fixed inset-0 overflow-hidden bg-black">
       <div
         data-rotated={portrait ? '1' : '0'}
-        className="absolute left-0 top-0"
+        className="stage absolute left-0 top-0"
         style={
           portrait
             ? { width: vp.h, height: vp.w, transform: 'rotate(90deg) translateY(-100%)', transformOrigin: 'top left' }
             : { width: vp.w, height: vp.h }
         }
       >
-        <div ref={mountRef} className="w-full h-full touch-none" aria-label="Ant colony in a glass formicarium" />
+        <div ref={mountRef} className="w-full h-full touch-none cursor-grab active:cursor-grabbing" aria-label="Ant colony in a glass formicarium" />
+        <div className="hud" data-idle={hudIdle ? '1' : '0'}>
+          {mode === 'follow' && (
+            <div className="hud-group">
+              <button className="hud-btn" aria-pressed="true" onClick={() => renderer3dRef.current?.camCtl.resume()} title="Stop following (Esc)">
+                <Footprints /> <span className="hud-label">Following</span> <X />
+              </button>
+            </div>
+          )}
+          <div className="hud-group" role="group" aria-label="Camera">
+            <button className="hud-btn" aria-pressed={mode === 'overview'} onClick={() => renderer3dRef.current?.camCtl.setMode('overview')} title="Whole farm (1)">
+              <Maximize2 /> <span className="hud-label">Whole</span>
+            </button>
+            <button className="hud-btn" aria-pressed={mode === 'scan'} onClick={() => renderer3dRef.current?.camCtl.setMode('scan')} title="Scan: full width, sweeping down the nest. Drag up or down to look yourself (2)">
+              <ArrowUpDown /> <span className="hud-label">Scan</span>
+            </button>
+            <button className="hud-btn" aria-pressed={mode === 'drift'} onClick={() => renderer3dRef.current?.camCtl.setMode('drift')} title="Drift: glide to wherever the colony is busiest (3)">
+              <Compass /> <span className="hud-label">Drift</span>
+            </button>
+          </div>
+          <div className="hud-group">
+            <button className="hud-btn" aria-pressed={captions} onClick={() => setCaptions((c) => !c)} title="Field notes (N)">
+              <BookOpen /> <span className="hud-label">Notes</span>
+            </button>
+          </div>
+        </div>
       </div>
     </main>
   );

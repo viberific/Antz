@@ -73,12 +73,145 @@ function granuleColorSrgb(type: CellType, moisture: number, gy: number, tint: nu
     return [0.135 * mDark * v, 0.078 * mDark * v, 0.046 * mDark * v];
   }
   if (type === CellType.PEBBLE) {
-    return [0.27 * v, 0.25 * v, 0.23 * v];
+    // the stone itself is a separate mesh; the soil under and around it stays earth-coloured so it leaves no grey haze
+    return [0.13 * v, 0.078 * v, 0.046 * v];
   }
   if (type === CellType.ROOT) {
     return [0.18 * mDark * v, 0.105 * mDark * v, 0.06 * mDark * v];
   }
   return [0.16 * v, 0.095 * v, 0.055 * v];
+}
+
+const ROCK_PALETTE: [number, number, number][] = [
+  [0.34, 0.33, 0.32], // granite
+  [0.43, 0.36, 0.29], // sandstone
+  [0.23, 0.23, 0.25], // basalt
+  [0.3, 0.32, 0.35], // slate
+  [0.38, 0.34, 0.3], // limestone
+];
+
+/** Smooth 3D value-ish noise from a few sines: cheap, deterministic, no tables. */
+function rockNoise(x: number, y: number, z: number, seed: number): number {
+  return (
+    Math.sin(x * 3.1 + seed) * Math.sin(y * 2.7 + seed * 1.3) * 0.5 +
+    Math.sin(z * 3.7 + x * 1.9 + seed * 0.7) * 0.3 +
+    Math.sin((x + y + z) * 5.3 + seed * 2.1) * 0.2
+  );
+}
+
+/**
+ * Finds each connected cluster of rock cells and builds a lumpy stone that fills exactly that footprint: the outline
+ * follows the cells, the face is a faceted dome that stands slightly proud of the soil. All stones share one mesh.
+ */
+function buildRockGeometry(sim: AntColonySimulation): THREE.BufferGeometry | null {
+  const grid = sim.grid;
+  const seen = new Uint8Array(GRID_W * GRID_H);
+  const half = CELL_SIZE * WORLD_SCALE * 0.5;
+  const BINS = 24;
+  const positions: number[] = [];
+  const colors: number[] = [];
+  const unit = new THREE.IcosahedronGeometry(1, 2);
+  const up = unit.attributes.position;
+  const col = new THREE.Color();
+  let rockIndex = 0;
+
+  for (let start = 0; start < GRID_W * GRID_H; start++) {
+    if (seen[start] || grid.terrain[start] !== CellType.PEBBLE) continue;
+    // flood fill (8-way, so diagonal neighbours join one stone)
+    const cells: number[] = [];
+    const stack = [start];
+    seen[start] = 1;
+    while (stack.length) {
+      const i = stack.pop()!;
+      cells.push(i);
+      const x = i % GRID_W;
+      const y = (i - x) / GRID_W;
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const nx = x + dx;
+          const ny = y + dy;
+          if (nx < 0 || ny < 0 || nx >= GRID_W || ny >= GRID_H) continue;
+          const j = ny * GRID_W + nx;
+          if (seen[j] || grid.terrain[j] !== CellType.PEBBLE) continue;
+          seen[j] = 1;
+          stack.push(j);
+        }
+      }
+    }
+
+    const pts = cells.map((i) => {
+      const gx = i % GRID_W;
+      const gy = (i - gx) / GRID_W;
+      return { x: simToWorldX((gx + 0.5) * CELL_SIZE), y: simToWorldY((gy + 0.5) * CELL_SIZE) };
+    });
+    let cx = 0;
+    let cy = 0;
+    for (const p of pts) {
+      cx += p.x;
+      cy += p.y;
+    }
+    cx /= pts.length;
+    cy /= pts.length;
+
+    // radial outline: how far the cells reach in each direction
+    const raw = new Float32Array(BINS);
+    for (const p of pts) {
+      const a = Math.atan2(p.y - cy, p.x - cx);
+      const b = (((Math.round((a / (Math.PI * 2)) * BINS) % BINS) + BINS) % BINS) | 0;
+      raw[b] = Math.max(raw[b], Math.hypot(p.x - cx, p.y - cy) + half * 1.05);
+    }
+    const minR = half * 1.15;
+    for (let b = 0; b < BINS; b++) {
+      if (raw[b] > 0) continue;
+      // an empty direction: borrow from the nearest filled ones
+      let l = 1;
+      while (raw[(b - l + BINS) % BINS] === 0 && l < BINS) l++;
+      let r = 1;
+      while (raw[(b + r) % BINS] === 0 && r < BINS) r++;
+      raw[b] = (raw[(b - l + BINS) % BINS] + raw[(b + r) % BINS]) * 0.5 * 0.9;
+    }
+    const prof = new Float32Array(BINS);
+    for (let b = 0; b < BINS; b++) {
+      const sm = (raw[(b + BINS - 1) % BINS] + raw[b] * 2 + raw[(b + 1) % BINS]) / 4;
+      prof[b] = Math.max(minR, sm, raw[b] * 0.92);
+    }
+    let meanR = 0;
+    for (let b = 0; b < BINS; b++) meanR += prof[b];
+    meanR /= BINS;
+
+    const seed = (rockIndex * 7.31 + cx * 3.1 + cy * 5.7) % 100;
+    const depth = clamp(meanR * 0.5, 0.07, 0.26);
+    const zc = SOIL_FRONT_Z + 0.07 - depth;
+    const base = ROCK_PALETTE[rockIndex % ROCK_PALETTE.length];
+    const tint = 0.9 + (deterministicRand(rockIndex, 3, 7) - 0.5) * 0.3;
+    rockIndex++;
+
+    for (let v = 0; v < up.count; v++) {
+      const ux = up.getX(v);
+      const uy = up.getY(v);
+      const uz = up.getZ(v);
+      const theta = Math.atan2(uy, ux);
+      const f = (((theta / (Math.PI * 2)) * BINS) % BINS + BINS) % BINS;
+      const b0 = Math.floor(f) % BINS;
+      const r = prof[b0] + (prof[(b0 + 1) % BINS] - prof[b0]) * (f - Math.floor(f));
+      const n = rockNoise(ux, uy, uz, seed) * 0.13;
+      const m = 1 + n;
+      positions.push(cx + ux * r * m, cy + uy * r * m, zc + (uz > 0 ? uz * depth * (1 + n * 0.8) : uz * depth));
+      // lit from the top front, darker underneath, with a little grain
+      const grain = (deterministicRand(Math.round(ux * 60), Math.round(uy * 60 + uz * 40), seed) - 0.5) * 0.14;
+      const shade = clamp((0.8 + uy * 0.2 + uz * 0.16 + n * 0.5 + grain) * tint, 0.35, 1.25);
+      col.setRGB(base[0] * shade, base[1] * shade, base[2] * shade, THREE.SRGBColorSpace);
+      colors.push(col.r, col.g, col.b);
+    }
+  }
+  unit.dispose();
+  if (positions.length === 0) return null;
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+  geo.computeVertexNormals();
+  geo.computeBoundingSphere();
+  return geo;
 }
 
 export class FormicariumEnvironment3D {
@@ -94,7 +227,7 @@ export class FormicariumEnvironment3D {
   private readonly backEarthTex: THREE.CanvasTexture;
 
   private readonly rootMeshes: THREE.Mesh[] = [];
-  private readonly pebbleInstanced: THREE.InstancedMesh | null = null;
+  private readonly rockMesh: THREE.Mesh | null = null;
   private readonly disposables: (THREE.BufferGeometry | THREE.Material | THREE.Texture)[] = [];
 
   private smoothSoilField = new Float32Array(GRID_W * GRID_H);
@@ -193,43 +326,16 @@ export class FormicariumEnvironment3D {
       this.disposables.push(tubeGeo);
     }
 
-    // 9. 3D Embedded River Pebbles
-    const pebbleCoords: { x: number; y: number; gx: number; gy: number }[] = [];
-    for (let gy = 30; gy < GRID_H - 8; gy += 2) {
-      for (let gx = 10; gx < GRID_W - 10; gx += 2) {
-        if (sim.grid.terrain[sim.grid.idx(gx, gy)] === CellType.PEBBLE) {
-          pebbleCoords.push({
-            x: simToWorldX((gx + 0.5) * CELL_SIZE),
-            y: simToWorldY((gy + 0.5) * CELL_SIZE),
-            gx,
-            gy,
-          });
-        }
-      }
-    }
-    if (pebbleCoords.length > 0) {
-      const pebGeo = new THREE.IcosahedronGeometry(0.11, 0);
-      this.pebbleInstanced = new THREE.InstancedMesh(pebGeo, bank.pebbleMat, pebbleCoords.length);
-      this.pebbleInstanced.castShadow = !isSoftwareGl;
-      this.pebbleInstanced.receiveShadow = true;
-      const col = new THREE.Color();
-      for (let i = 0; i < pebbleCoords.length; i++) {
-        const p = pebbleCoords[i];
-        const j = deterministicRand(p.gx, p.gy, 1) - 0.5;
-        _dummy.position.set(p.x, p.y, SOIL_FRONT_Z - 0.05 + j * 0.08);
-        _dummy.rotation.set(j * 2.1, j * 3.4, j * 1.7);
-        _dummy.scale.set(1.1 + j * 0.35, 0.8 + j * 0.25, 0.9);
-        _dummy.updateMatrix();
-        this.pebbleInstanced.setMatrixAt(i, _dummy.matrix);
-        const tone = 0.28 + j * 0.08;
-        col.setRGB(tone, tone * 0.94, tone * 0.88, THREE.SRGBColorSpace);
-        this.pebbleInstanced.setColorAt(i, col);
-      }
-      this.pebbleInstanced.instanceMatrix.needsUpdate = true;
-      if (this.pebbleInstanced.instanceColor) this.pebbleInstanced.instanceColor.needsUpdate = true;
-      this.pebbleInstanced.computeBoundingSphere();
-      this.group.add(this.pebbleInstanced);
-      this.disposables.push(pebGeo);
+    // 9. Rocks: one sculpted stone per cluster of rock cells, so what you see is exactly what blocks the ants
+    const rockGeo = buildRockGeometry(sim);
+    if (rockGeo) {
+      const rockMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.86, metalness: 0.04, flatShading: true });
+      this.rockMesh = new THREE.Mesh(rockGeo, rockMat);
+      this.rockMesh.castShadow = !isSoftwareGl;
+      this.rockMesh.receiveShadow = true;
+      this.rockMesh.frustumCulled = false;
+      this.group.add(this.rockMesh);
+      this.disposables.push(rockGeo, rockMat);
     }
 
     this.rebuildTerrain(sim);

@@ -394,15 +394,7 @@ export class AntColonySimulation {
       }
     }
 
-    // 2. Embedded river pebbles
-    for (let p = 0; p < 55; p++) {
-      const px = CASE_LEFT + 60 + Math.random() * (CASE_RIGHT - CASE_LEFT - 120);
-      const py = SURFACE_BASE_Y + 45 + Math.random() * (CASE_BOTTOM - SURFACE_BASE_Y - 90);
-      if (Math.abs(px - 700) < 120 && py < 660) continue;
-      const rx = 6 + Math.random() * 14;
-      const ry = 4 + Math.random() * 9;
-      this.paintEllipse(px, py, rx, ry, CellType.PEBBLE, true);
-    }
+    // 2. Rocks are scattered once the nest is carved (see scatterRocks)
 
     // 3. Organic subterranean plant roots
     const rootOrigins = [190, 340, 560, 960, 1140, 1280];
@@ -554,6 +546,7 @@ export class AntColonySimulation {
       { id: this.allocId(), type: PayloadType.FUNGUS, x: fungus.x + 16, y: fungus.y + 11, amount: 28, maxAmount: 50, radius: 7, storedInChamberId: fungus.id }
     );
 
+    this.scatterRocks();
     this.grid.rebuildNav();
     this.baseGround = Float32Array.from(this.grid.surfaceY);
 
@@ -648,6 +641,132 @@ export class AntColonySimulation {
       kind: 'dust',
       color: '#f5e6c8',
     };
+  }
+
+  /**
+   * Paints one irregular stone into the grid and returns the cells it changed (so a boulder can be undone).
+   * Rock cells are solid and not diggable: excavators tunnel around them and ants walk around them.
+   */
+  private paintRock(cx: number, cy: number, rx: number, ry: number, rot: number, seed: number, intoTunnels: boolean): { idx: number; prev: CellType }[] {
+    const changed: { idx: number; prev: CellType }[] = [];
+    const cos = Math.cos(-rot);
+    const sin = Math.sin(-rot);
+    const reach = Math.max(rx, ry) * 1.35;
+    const minGx = Math.floor((cx - reach) / CELL_SIZE);
+    const maxGx = Math.ceil((cx + reach) / CELL_SIZE);
+    const minGy = Math.floor((cy - reach) / CELL_SIZE);
+    const maxGy = Math.ceil((cy + reach) / CELL_SIZE);
+    for (let gy = minGy; gy <= maxGy; gy++) {
+      for (let gx = minGx; gx <= maxGx; gx++) {
+        if (!this.grid.inBounds(gx, gy)) continue;
+        const dx = (gx + 0.5) * CELL_SIZE - cx;
+        const dy = (gy + 0.5) * CELL_SIZE - cy;
+        const lx = (dx * cos - dy * sin) / rx;
+        const ly = (dx * sin + dy * cos) / ry;
+        const th = Math.atan2(ly, lx);
+        // a lumpy outline: no two stones share a shape
+        const edge = 0.86 * (1 + 0.2 * Math.sin(th * 2 + seed) + 0.13 * Math.sin(th * 3 + seed * 1.7) + 0.08 * Math.sin(th * 5 + seed * 2.3));
+        if (Math.hypot(lx, ly) > edge) continue;
+        const idx = this.grid.idx(gx, gy);
+        const cur = this.grid.terrain[idx];
+        if (cur === CellType.GLASS_WALL || cur === CellType.AIR || cur === CellType.PEBBLE || cur === CellType.ROOT) continue;
+        if (cur === CellType.TUNNEL && !intoTunnels) continue;
+        changed.push({ idx, prev: cur });
+        this.grid.setTerrain(gx, gy, CellType.PEBBLE);
+      }
+    }
+    return changed;
+  }
+
+  private undoRock(changed: { idx: number; prev: CellType }[]): void {
+    for (const c of changed) this.grid.setTerrain(c.idx % GRID_W, Math.floor(c.idx / GRID_W), c.prev);
+  }
+
+  /**
+   * Scatters stones through the soil. Most are embedded in the earth; a handful are boulders that stand inside
+   * chambers and tunnels, so ants have to path around them. A boulder is dropped again if it would cut off any
+   * chamber or entrance, or sit on food or the heart of a chamber.
+   */
+  private scatterRocks(): void {
+    // 1. stones embedded in the soil (they never overwrite tunnels)
+    for (let n = 0; n < 40; n++) {
+      const px = CASE_LEFT + 50 + Math.random() * (CASE_RIGHT - CASE_LEFT - 100);
+      const py = SURFACE_BASE_Y + 40 + Math.random() * (CASE_BOTTOM - SURFACE_BASE_Y - 80);
+      const big = Math.random() < 0.18;
+      const rx = big ? 24 + Math.random() * 16 : 9 + Math.random() * 14;
+      const ry = rx * (0.5 + Math.random() * 0.35);
+      this.paintRock(px, py, rx, ry, (Math.random() - 0.5) * 1.2, Math.random() * 20, false);
+    }
+
+    // 2. boulders in the way
+    const cellOf = (x: number, y: number) => this.grid.worldToGrid(x, y);
+    const reach = (from: { gx: number; gy: number }): Uint8Array => {
+      const seen = new Uint8Array(GRID_W * GRID_H);
+      const stack = [from.gy * GRID_W + from.gx];
+      seen[stack[0]] = 1;
+      while (stack.length) {
+        const i = stack.pop()!;
+        const x = i % GRID_W;
+        const y = (i - x) / GRID_W;
+        for (const [nx, ny] of [[x + 1, y], [x - 1, y], [x, y + 1], [x, y - 1]]) {
+          if (nx < 0 || ny < 0 || nx >= GRID_W || ny >= GRID_H) continue;
+          const j = ny * GRID_W + nx;
+          if (seen[j] || this.grid.terrain[j] !== CellType.TUNNEL) continue;
+          seen[j] = 1;
+          stack.push(j);
+        }
+      }
+      return seen;
+    };
+    const home = this.chambers[this.chambers.length - 1];
+    const start = cellOf(home.x, home.y);
+    const baseline = reach(start);
+    // every place that must stay reachable: the chamber hearts, and the two entrance shafts
+    const must: number[] = [];
+    const addMust = (x: number, y: number) => {
+      const g = cellOf(x, y);
+      const i = g.gy * GRID_W + g.gx;
+      if (baseline[i]) must.push(i);
+    };
+    for (const c of this.chambers) addMust(c.x, c.y);
+    addMust(700, this.entrancePos.y + 12);
+    addMust(405, this.grid.surfaceY[Math.floor(405 / CELL_SIZE)] + 12);
+
+    const protectedSpot = (idx: number): boolean => {
+      const x = ((idx % GRID_W) + 0.5) * CELL_SIZE;
+      const y = (Math.floor(idx / GRID_W) + 0.5) * CELL_SIZE;
+      for (const c of this.chambers) {
+        const nx = (x - c.x) / c.rx;
+        const ny = (y - c.y) / c.ry;
+        if (nx * nx + ny * ny < 0.62 * 0.62) return true; // the heart of a chamber stays clear for nurses, brood and the queen
+      }
+      for (const f of this.foods) if (Math.hypot(x - f.x, y - f.y) < f.radius + 10) return true;
+      return Math.abs(x - 700) < 46 && y < 330; // the main shaft below the entrance
+    };
+
+    const tunnelCells: number[] = [];
+    for (let gy = Math.floor((SURFACE_BASE_Y + 60) / CELL_SIZE); gy < GRID_H - 6; gy++) {
+      for (let gx = 4; gx < GRID_W - 4; gx++) {
+        const i = gy * GRID_W + gx;
+        if (this.grid.terrain[i] === CellType.TUNNEL) tunnelCells.push(i);
+      }
+    }
+    let placed = 0;
+    for (let attempt = 0; attempt < 60 && placed < 9 && tunnelCells.length; attempt++) {
+      const i = tunnelCells[Math.floor(Math.random() * tunnelCells.length)];
+      const cx = ((i % GRID_W) + 0.5) * CELL_SIZE;
+      const cy = (Math.floor(i / GRID_W) + 0.5) * CELL_SIZE;
+      const rx = 9 + Math.random() * 7;
+      const ry = rx * (0.6 + Math.random() * 0.3);
+      const changed = this.paintRock(cx, cy, rx, ry, Math.random() * Math.PI, Math.random() * 20, true);
+      let ok = changed.length >= 3 && !changed.some((c) => protectedSpot(c.idx));
+      if (ok) {
+        const after = reach(start);
+        ok = must.every((m) => after[m] === 1);
+      }
+      if (ok) placed++;
+      else this.undoRock(changed);
+    }
   }
 
   private paintEllipse(cx: number, cy: number, rx: number, ry: number, type: CellType, onlyInSoil: boolean): void {
