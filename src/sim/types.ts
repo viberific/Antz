@@ -196,6 +196,8 @@ export interface Ant {
   /** personality, each 0..1: nerve (stands and fights, goes out at night/in marginal weather), diligence (pace, rests
    *  less) and sociability (greets, shares and groups up more) */
   bold?: number;
+  /** soldier marching out with the counter-raid on the rival nest */
+  warBand?: boolean;
   industry?: number;
   social?: number;
 }
@@ -298,6 +300,10 @@ export interface Intruder {
   age?: number;
   /** has left the home crevice at least once (so it can't 'escape' the moment it spawns) */
   roamed?: boolean;
+  /** soldier of a rival colony at war with ours: keeps fighting until badly hurt instead of losing nerve */
+  warrior?: boolean;
+  /** defender of the rival nest: stays near this x instead of marching on ours */
+  holdPost?: number;
 }
 
 export interface FallenAnt {

@@ -225,6 +225,19 @@ export class AntColonySimulation {
   private royalStress = 0;
   /** 0..1+: how badly a rival colony's war is going for us (drives emigration) */
   public warPressure = 0;
+  /** the rival colony next door: tension builds until it declares war, then sends waves; we may counter-raid */
+  public war = {
+    phase: 'peace' as 'peace' | 'war',
+    tension: 0.15,
+    wave: 0,
+    waves: 0,
+    nextWave: 0,
+    kills: 0,
+    lost: 0,
+    edge: 'left' as 'left' | 'right',
+    raid: null as { x: number; t: number; spawned: boolean } | null,
+    raidDone: false,
+  };
   private planCount = 0;
   private repairCount = 0;
 
@@ -964,6 +977,7 @@ export class AntColonySimulation {
     this.pathBudget = 10;
     this.buildHash();
     this.refreshClaims();
+    this.stepWar(dt);
     this.stepIntruders(dt);
     this.stepAnts(dt);
     this.stepGroupTransport(dt);
@@ -2381,6 +2395,126 @@ export class AntColonySimulation {
     }
   }
 
+  private makeRival(x: number, behavior: Intruder['behavior'], edge: 'left' | 'right', opts: { holdPost?: number } = {}): void {
+    const p = this.surfaceTarget(x);
+    const maxHp = 55;
+    this.intruders.push({
+      id: this.allocId(),
+      x: p.x,
+      y: p.y - 1,
+      vx: 0,
+      vy: 0,
+      angle: edge === 'left' ? 0 : Math.PI,
+      hp: maxHp,
+      maxHp,
+      legPhase: Math.random() * Math.PI * 2,
+      species: 'rival_ant',
+      aggression: 1,
+      attackCooldown: 0,
+      behavior,
+      carryingFoodAmount: 0,
+      targetFoodId: null,
+      homeEdge: edge,
+      path: [],
+      pathIndex: 0,
+      lastPathTime: -10,
+      warrior: true,
+      holdPost: opts.holdPost,
+    });
+  }
+
+  private stepWar(dt: number): void {
+    const w = this.war;
+    const season = this.season === 'Summer' ? 1.3 : this.season === 'Spring' ? 1 : this.season === 'Autumn' ? 0.8 : 0;
+    if (w.phase === 'peace') {
+      this.warPressure = Math.max(0, this.warPressure - dt / 600);
+      if (this.ants.length > 25 && !this.isNight()) w.tension += (dt * season) / 1800;
+      if (w.tension < 1) return;
+      w.phase = 'war';
+      w.wave = 0;
+      w.waves = 3 + Math.floor(Math.random() * 3);
+      w.nextWave = 8;
+      w.kills = 0;
+      w.lost = 0;
+      w.raid = null;
+      w.raidDone = false;
+      w.edge = Math.random() < 0.5 ? 'left' : 'right';
+      this.log('The neighbouring colony has declared war!', 'danger');
+      return;
+    }
+
+    const warriors = this.intruders.filter((m) => m.warrior && m.holdPost === undefined).length;
+    w.nextWave -= dt;
+    if (w.wave < w.waves && w.nextWave <= 0 && warriors < 10) {
+      const n = 3 + w.wave + Math.floor(Math.random() * 2);
+      const edge = w.edge;
+      const sign = edge === 'left' ? 1 : -1;
+      const x0 = edge === 'left' ? CASE_LEFT + 78 : CASE_RIGHT - 78;
+      for (let k = 0; k < n; k++) {
+        const behavior: Intruder['behavior'] = k === 0 ? 'infiltrating_brood' : k % 3 === 1 ? 'hunting_ants' : 'raiding_food';
+        this.makeRival(x0 + sign * k * 10, behavior, edge);
+      }
+      w.wave++;
+      w.nextWave = 70 + Math.random() * 40;
+      this.log(w.wave === w.waves ? `Final assault: ${n} enemy soldiers storm in` : `Wave ${w.wave} of the war: ${n} enemy soldiers advance`, 'danger');
+    }
+
+    // counter-raid: our soldiers march out against the rival nest
+    const raid = w.raid;
+    if (!raid && !w.raidDone && w.wave >= 2) {
+      const soldiers = this.ants.filter((a) => a.caste === AntCaste.SOLDIER && !this.isAlate(a) && (a.hp ?? 0) > 20);
+      if (soldiers.length >= 3) {
+        const x = w.edge === 'left' ? CASE_LEFT + 78 : CASE_RIGHT - 78;
+        w.raid = { x, t: 0, spawned: false };
+        for (const a of soldiers.slice(0, 8)) a.warBand = true;
+        this.log('Soldiers march out to strike back at the rival nest', 'good');
+      } else w.raidDone = true;
+    }
+    if (w.raid) {
+      const r = w.raid;
+      r.t += dt;
+      const band = this.ants.filter((a) => a.warBand);
+      if (!r.spawned && band.some((a) => Math.abs(a.x - r.x) < 170 && this.isOutside(a.x, a.y))) {
+        r.spawned = true;
+        const sign = w.edge === 'left' ? -1 : 1;
+        for (let k = 0; k < 4; k++) this.makeRival(r.x + sign * k * 9, 'hunting_ants', w.edge, { holdPost: r.x });
+        this.log('The raiders reach the rival nest: its defenders swarm out', 'danger');
+      }
+      const defenders = this.intruders.filter((m) => m.holdPost !== undefined).length;
+      const won = r.spawned && defenders === 0;
+      if (won || r.t > 220 || band.length === 0) {
+        for (const a of band) a.warBand = false;
+        w.raid = null;
+        w.raidDone = true;
+        if (won) {
+          this.dropFoodAt(this.entrancePos.x + 60, this.surfaceTarget(this.entrancePos.x + 60).y - 1, PayloadType.PROTEIN, 70);
+          this.log('The raid succeeded: the soldiers return with captured spoils', 'good');
+          w.kills += 2;
+        } else this.log('The raid fell apart', 'danger');
+      }
+    }
+
+    // the war ends once every wave is spent and the field is clear
+    if (w.wave >= w.waves && warriors === 0 && !w.raid) {
+      const defeat = w.lost > w.kills * 1.2 + 2;
+      if (defeat) {
+        this.warPressure = 1.2;
+        let plundered = 0;
+        for (const f of this.foods) if (f.storedInChamberId !== null) {
+          const take = f.amount * 0.25;
+          f.amount -= take;
+          plundered += take;
+        }
+        this.log(`The colony lost the war: ${Math.round(plundered)} units of stored food were plundered`, 'danger');
+        w.tension = 0.3;
+      } else {
+        this.log(`The rival colony is beaten back (${w.kills} enemy soldiers fell, ${w.lost} of ours)`, 'good');
+        w.tension = 0;
+      }
+      w.phase = 'peace';
+    }
+  }
+
   private stepIntruders(dt: number): void {
     this.intruderTimer -= dt;
     if (this.intruderTimer <= 0) {
@@ -2396,7 +2530,7 @@ export class AntColonySimulation {
       const shelterXHome = (m.homeEdge ?? 'left') === 'left' ? CASE_LEFT + 72 : CASE_RIGHT - 72;
       if (Math.abs(m.x - shelterXHome) > 70) m.roamed = true;
       // invaders lose their nerve after a while (or when the alarm brings a crowd of defenders)
-      if (m.age > 80 || (m.age > 20 && this.countAntsNear(m.x, m.y, 26) >= (m.species === 'beetle' ? 7 : 5))) m.behavior = 'retreating';
+      if (!m.warrior && (m.age > 80 || (m.age > 20 && this.countAntsNear(m.x, m.y, 26) >= (m.species === 'beetle' ? 7 : 5)))) m.behavior = 'retreating';
       const prevX = m.x;
       const prevY = m.y;
 
@@ -2455,6 +2589,9 @@ export class AntColonySimulation {
             food.amount -= stolen;
             m.carryingFoodAmount = stolen;
           }
+        } else if (m.holdPost !== undefined) {
+          // defenders mill about their own nest entrance
+          goalX = m.holdPost + Math.sin(this.simTime * 0.6 + m.id) * 22;
         } else {
           // raid inside the nest
           const key: FieldKey = m.species === 'mite' || m.species === 'centipede' ? 'nursery' : 'granary';
@@ -2565,6 +2702,7 @@ export class AntColonySimulation {
       const escaped = retreating && !underground && Math.abs(m.x - shelterX) < 12 && (m.roamed || m.age > 25);
       if (m.hp <= 0 || escaped) {
         if (m.hp <= 0) {
+          if (m.warrior && this.war.phase === 'war') this.war.kills++;
           if ((m.carryingFoodAmount ?? 0) > 0) this.dropFoodAt(m.x - 5, m.y, PayloadType.SEED, m.carryingFoodAmount ?? 0);
           this.dropFoodAt(m.x, m.y, PayloadType.PROTEIN, m.species === 'rival_ant' || m.species === 'mite' ? 22 : 40);
           const name = m.species === 'rival_ant' ? 'a rival ant' : m.species === 'earwig' ? 'an earwig' : `a ${m.species}`;
@@ -2763,6 +2901,7 @@ export class AntColonySimulation {
       }
     }
     this.fallenAnts.push({ id: this.allocId(), x: fx, y: fy, angle: ant.angle, carriedByAntId: null, atMidden: false, decayTimer: 25 });
+    if (cause === 'combat' && this.war.phase === 'war') this.war.lost++;
     this.ants.splice(index, 1);
     if (ant.caste === AntCaste.QUEEN) this.log('The queen has died! The colony cannot raise new workers', 'danger');
     else if (cause === 'buried') this.log('A buried worker suffocated before it could be dug out', 'danger');
@@ -4988,6 +5127,24 @@ export class AntColonySimulation {
       return;
     }
     const onSurface = this.isOutside(ant.x, ant.y);
+    if (ant.warBand) {
+      const raid = this.war.raid;
+      if (!raid) ant.warBand = false;
+      else {
+        ant.task = AntTask.PATROLLING;
+        if (!onSurface) {
+          if (this.go(ant, 'surface') >= INF) ant.warBand = false;
+          return;
+        }
+        ant.stateTimer -= dt;
+        if (ant.stateTimer <= 0 || !ant.targetPos) {
+          ant.stateTimer = 2.5;
+          const t = this.surfaceTarget(raid.x + ((ant.id % 5) - 2) * 9);
+          this.goTo(ant, t.x, t.y);
+        }
+        return;
+      }
+    }
     const guard = ant.id % 3 !== 0 && !(night && ant.id % 2 === 0) && this.forageWeather();
     ant.task = AntTask.PATROLLING;
     ant.stateTimer -= dt;
