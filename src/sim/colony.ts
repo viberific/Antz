@@ -219,6 +219,12 @@ export class AntColonySimulation {
   /** 0 = nothing planned, 1 = planned expansion, 2 = urgent repair of storm damage */
   public digPlan: Uint8Array = new Uint8Array(N_CELLS);
   private projects: DigProject[] = [];
+  /** the colony is moving house: workers dig a new royal chamber, then the queen and brood relocate into it */
+  private emigration: { newId: number; oldId: number; phase: 'digging' | 'moving'; t: number } | null = null;
+  private emigrationCooldown = 400;
+  private royalStress = 0;
+  /** 0..1+: how badly a rival colony's war is going for us (drives emigration) */
+  public warPressure = 0;
   private planCount = 0;
   private repairCount = 0;
 
@@ -948,6 +954,7 @@ export class AntColonySimulation {
     this.stepDebris(dt);
     this.stepQueenless(dt);
     this.stepNuptialFlight(dt);
+    this.stepEmigration(dt);
     this.stepEntranceSealing(dt);
     this.stepBrood(dt);
     this.stepQueenLaying(dt);
@@ -1914,15 +1921,91 @@ export class AntColonySimulation {
     }
   }
 
+  /**
+   * Nest moving. Real colonies emigrate when the nest turns unsafe (flooding, extreme temperatures, a lost war):
+   * scouts and diggers prepare a new royal chamber on safer ground, then the queen and brood move in.
+   */
+  private stepEmigration(dt: number): void {
+    const queen = this.getQueen();
+    if (!queen) return;
+    this.emigrationCooldown -= dt;
+    const royals = this.chambers.filter((c) => c.type === ChamberType.ROYAL);
+
+    if (!this.emigration) {
+      const royal = royals[0];
+      if (!royal || this.emigrationCooldown > 0 || this.projects.length > 1) return;
+      const t = this.tempAt(royal.x, royal.y);
+      let stress = 0;
+      if (this.chamberFlooded(royal)) stress += 1;
+      if (t < 2 || t > 32) stress += 0.5;
+      if (this.warPressure > 0.8) stress += 0.8;
+      this.royalStress = stress > 0 ? this.royalStress + stress * dt : Math.max(0, this.royalStress - dt * 2);
+      if (this.royalStress < 45) return;
+      const why = this.chamberFlooded(royal) ? 'rising water' : this.warPressure > 0.8 ? 'the war' : 'the extreme temperatures';
+      const maxY = this.floodDepth > 0 ? Math.min(CASE_BOTTOM - 60, this.floodLineY() - 40) : CASE_BOTTOM - 60;
+      this.royalStress = 0;
+      this.emigrationCooldown = 300;
+      // first choice: an existing chamber on safer ground swaps roles with the endangered royal chamber
+      const safe = this.chambers
+        .filter((c) => c.type !== ChamberType.ROYAL && c.type !== ChamberType.NURSERY && c.type !== ChamberType.MIDDEN && !this.chamberFlooded(c) && c.rx >= 36)
+        .filter((c) => {
+          const tc = this.tempAt(c.x, c.y);
+          return tc > 3 && tc < 31 && c.y - this.grid.surfaceY[clamp(Math.floor(c.x / CELL_SIZE), 0, GRID_W - 1)] > 50;
+        })
+        .sort((a, b) => b.rx - a.rx)[0];
+      if (safe) {
+        const oldType = safe.type;
+        safe.type = ChamberType.ROYAL;
+        royal.type = oldType;
+        for (const fk of STATIC_FIELDS) this.fieldDirty[fk] = true;
+        this.emigration = { newId: safe.id, oldId: royal.id, phase: 'moving', t: 0 };
+        this.log(`The nest is no longer safe (${why}): the colony is moving the queen to the ${oldType.toLowerCase()}`, 'danger');
+        return;
+      }
+      if (!this.planNewProject(ChamberType.ROYAL, Math.max(SURFACE_BASE_Y + 130, maxY))) return;
+      const proj = this.projects[this.projects.length - 1];
+      this.emigration = { newId: proj.id, oldId: royal.id, phase: 'digging', t: 0 };
+      this.log(`The nest is no longer safe (${why}): workers begin digging a new royal chamber`, 'danger');
+      return;
+    }
+
+    const em = this.emigration;
+    em.t += dt;
+    const fresh = this.chambers.find((c) => c.id === em.newId);
+    if (em.phase === 'digging') {
+      if (!fresh) {
+        if (em.t > 1800 || !this.projects.some((p) => p.id === em.newId)) this.emigration = null; // gave up
+        return;
+      }
+      // the new chamber is ready: it becomes the royal chamber, the old one is handed over to the brood
+      const old = this.chambers.find((c) => c.id === em.oldId);
+      if (old) old.type = ChamberType.NURSERY;
+      for (const fk of STATIC_FIELDS) this.fieldDirty[fk] = true;
+      em.phase = 'moving';
+      em.t = 0;
+      this.log('The colony is moving house: the queen is led to her new chamber', 'good');
+      return;
+    }
+    if (!fresh || em.t > 900) {
+      this.emigration = null;
+      return;
+    }
+    if (this.isInsideChamber(queen, fresh, 1.0)) {
+      this.emigration = null;
+      this.emigrationCooldown = 1500;
+      this.log('The queen has settled into her new royal chamber', 'good');
+    }
+  }
+
   /** Picks a site for a new chamber near the existing nest and plans the tunnel + chamber cells. */
-  private planNewProject(type: ChamberType): boolean {
+  private planNewProject(type: ChamberType, maxY: number = CASE_BOTTOM - 60): boolean {
     let best: { x: number; y: number; rx: number; ry: number; tx: number; ty: number; score: number } | null = null;
     const depthBias = Math.min(1, this.chambers.length / 10);
     for (let attempt = 0; attempt < 70; attempt++) {
       const rx = 40 + Math.random() * 18;
       const ry = 20 + Math.random() * 8;
       const x = CASE_LEFT + 110 + Math.random() * (CASE_RIGHT - CASE_LEFT - 220);
-      const y = SURFACE_BASE_Y + 110 + Math.random() * (CASE_BOTTOM - SURFACE_BASE_Y - 170);
+      const y = SURFACE_BASE_Y + 110 + Math.random() * Math.max(10, maxY - SURFACE_BASE_Y - 110);
       let tooClose = false;
       for (const c of this.chambers.concat(this.projects as unknown as Chamber[])) {
         if (Math.abs(c.x - x) < c.rx + rx + 36 && Math.abs(c.y - y) < c.ry + ry + 40) {
