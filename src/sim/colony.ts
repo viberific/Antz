@@ -24,6 +24,8 @@ import {
   Particle,
   PayloadType,
   PlantSprout,
+  Creature,
+  CreatureKind,
   SURFACE_BASE_Y,
   SurfaceProp,
   Vec2,
@@ -54,7 +56,7 @@ const DAY_LENGTH = 200;
 
 export type Season = 'Spring' | 'Summer' | 'Autumn' | 'Winter';
 
-type CollapseCause = 'settling' | 'saturation' | 'rain' | 'drought' | 'thaw' | 'span' | 'abandoned' | 'footsteps';
+type CollapseCause = 'settling' | 'saturation' | 'rain' | 'drought' | 'thaw' | 'span' | 'abandoned' | 'footsteps' | 'anteater';
 
 export interface Climate {
   tempC: number;
@@ -173,6 +175,8 @@ export class AntColonySimulation {
   public fallenAnts: FallenAnt[] = [];
   public particles: Particle[] = [];
   public sprouts: PlantSprout[] = [];
+  public creatures: Creature[] = [];
+  private creatureTimers: Record<CreatureKind, number> = { bird: 150, spider: 120, antlion: 200, anteater: 900, worm: 400 };
   public surfaceProps: SurfaceProp[] = [];
   public rootPolylines: Vec2[][] = [];
   public events: ColonyEvent[] = [];
@@ -978,6 +982,7 @@ export class AntColonySimulation {
     this.buildHash();
     this.refreshClaims();
     this.stepWar(dt);
+    this.stepCreatures(dt);
     this.stepIntruders(dt);
     this.stepAnts(dt);
     this.stepGroupTransport(dt);
@@ -2396,6 +2401,316 @@ export class AntColonySimulation {
     }
   }
 
+  // ================================================================================================================
+  // Wildlife: predators on the surface, an earthworm underground
+  // ================================================================================================================
+
+  private makeCreature(kind: CreatureKind, x: number, y: number, state: string, extra: Partial<Creature> = {}): Creature {
+    const c: Creature = { id: this.allocId(), kind, x, y, vx: 0, vy: 0, dir: 1, state, timer: 0, phase: Math.random() * 6, hits: 0, tx: x, ...extra };
+    this.creatures.push(c);
+    return c;
+  }
+
+  /** Ants near (x, y) that can run, scatter away from it. */
+  private scatterAnts(x: number, y: number, r: number, panic = 1): void {
+    this.forAntsNear(x, y, r, (a) => {
+      if (a.caste === AntCaste.QUEEN || a.caste === AntCaste.SOLDIER || a.flying || a.buried !== undefined || a.carriedById != null) return;
+      if (!this.isOutside(a.x, a.y) || (a.bold ?? 0.5) > 0.88 / panic) return;
+      const away = a.x >= x ? 1 : -1;
+      const t = this.surfaceTarget(a.x + away * 80);
+      this.goTo(a, t.x, t.y);
+      a.task = AntTask.FLEEING;
+    });
+  }
+
+  /** One surface ant within reach is caught; soldiers and bold foragers get a hit in before it dies. */
+  private snatchAnt(x: number, y: number, reach: number): Ant | null {
+    let victim: Ant | null = null;
+    let best = reach;
+    this.forAntsNear(x, y, reach + 8, (a) => {
+      if (a.caste === AntCaste.QUEEN || a.flying || a.buried !== undefined || !this.isOutside(a.x, a.y)) return;
+      const d = Math.hypot(a.x - x, a.y - y);
+      if (d < best) {
+        best = d;
+        victim = a;
+      }
+    });
+    if (!victim) return null;
+    const v = victim as Ant;
+    this.killAnt(this.ants.indexOf(v), 'combat');
+    return v;
+  }
+
+  private defendersNear(x: number, y: number, r: number): number {
+    let n = 0;
+    this.forAntsNear(x, y, r, (a) => {
+      if (a.caste === AntCaste.SOLDIER || (a.bold ?? 0.5) > 0.6) n++;
+    });
+    return n;
+  }
+
+  private stepCreatures(dt: number): void {
+    const day = !this.isNight();
+    const mild = this.forageWeather() && this.season !== 'Winter';
+    const has = (k: CreatureKind) => this.creatures.some((c) => c.kind === k);
+    for (const k of Object.keys(this.creatureTimers) as CreatureKind[]) {
+      this.creatureTimers[k] -= dt;
+      if (this.creatureTimers[k] > 0 || this.ants.length < 15) continue;
+      this.creatureTimers[k] = 600 + Math.random() * 900;
+      if (has(k)) continue;
+      const surfaceAnts = this.ants.filter((a) => this.isOutside(a.x, a.y));
+      if (k === 'bird' && day && mild) {
+        const fromLeft = Math.random() < 0.5;
+        const target = surfaceAnts.length ? surfaceAnts[Math.floor(Math.random() * surfaceAnts.length)].x : CASE_LEFT + 200 + Math.random() * 900;
+        const c = this.makeCreature('bird', fromLeft ? CASE_LEFT + 10 : CASE_RIGHT - 10, CASE_TOP + 40, 'arriving', { dir: fromLeft ? 1 : -1, tx: clamp(target, CASE_LEFT + 80, CASE_RIGHT - 80) });
+        this.log('A bird swoops down looking for a meal', 'danger');
+        void c;
+      } else if (k === 'spider' && mild && this.sprouts.length > 0) {
+        const hosts = this.sprouts.filter((s) => s.kind !== 'moss' && Math.abs(s.x - this.entrancePos.x) > 90 && Math.abs(s.x - SIDE_ENTRANCE_X) > 60);
+        if (hosts.length) {
+          const h = hosts[Math.floor(Math.random() * hosts.length)];
+          this.makeCreature('spider', h.x, this.surfaceTarget(h.x).y, 'waiting', { life: 900 + Math.random() * 900 });
+          this.log('A spider spins a web beside the foraging trail', 'danger');
+        }
+      } else if (k === 'antlion' && this.season !== 'Winter') {
+        const x = CASE_LEFT + 140 + Math.random() * (CASE_RIGHT - CASE_LEFT - 280);
+        if (Math.abs(x - this.entrancePos.x) > 110 && Math.abs(x - SIDE_ENTRANCE_X) > 80) {
+          this.makeCreature('antlion', x, this.surfaceTarget(x).y, 'lurking', { life: 2000 + Math.random() * 1500 });
+          this.log('An antlion has dug a sand pit on the foraging ground', 'danger');
+        }
+      } else if (k === 'anteater' && day && mild) {
+        const fromLeft = Math.random() < 0.5;
+        this.makeCreature('anteater', fromLeft ? CASE_LEFT + 24 : CASE_RIGHT - 24, this.surfaceTarget(fromLeft ? CASE_LEFT + 24 : CASE_RIGHT - 24).y, 'approach', {
+          dir: fromLeft ? 1 : -1,
+          tx: this.entrancePos.x + (fromLeft ? -34 : 34),
+        });
+        this.log('An anteater lumbers out of the undergrowth', 'danger');
+      } else if (k === 'worm' && this.season !== 'Winter' && !this.frozen && (this.wetness > 0.05 || Math.random() < 0.5)) {
+        const x = CASE_LEFT + 140 + Math.random() * (CASE_RIGHT - CASE_LEFT - 280);
+        const y = this.grid.surfaceY[clamp(Math.floor(x / CELL_SIZE), 0, GRID_W - 1)] + 70 + Math.random() * 260;
+        const g = this.grid.worldToGrid(x, y);
+        if (this.canExcavate(this.grid.idx(g.gx, g.gy)) && y < CASE_BOTTOM - 70) {
+          const dir: 1 | -1 = Math.random() < 0.5 ? 1 : -1;
+          this.makeCreature('worm', x, y, 'burrowing', { dir, left: 140 + Math.random() * 180, trail: [] });
+          this.log('An earthworm is tunnelling through the soil', 'good');
+        }
+      }
+    }
+
+    for (let i = this.creatures.length - 1; i >= 0; i--) {
+      const c = this.creatures[i];
+      c.phase += dt;
+      c.timer -= dt;
+      let gone = false;
+      if (c.kind === 'bird') gone = this.stepBird(c, dt);
+      else if (c.kind === 'spider') gone = this.stepSpider(c, dt);
+      else if (c.kind === 'antlion') gone = this.stepAntlion(c, dt);
+      else if (c.kind === 'anteater') gone = this.stepAnteater(c, dt);
+      else gone = this.stepWorm(c, dt);
+      if (gone) this.creatures.splice(i, 1);
+    }
+  }
+
+  private stepBird(c: Creature, dt: number): boolean {
+    const ground = this.surfaceTarget(c.x).y;
+    if (c.state === 'arriving') {
+      const dx = c.tx - c.x;
+      c.dir = dx >= 0 ? 1 : -1;
+      c.x += Math.sign(dx) * Math.min(Math.abs(dx), 150 * dt);
+      const want = Math.abs(dx) < 120 ? ground - 4 : CASE_TOP + 60;
+      c.y += (want - c.y) * Math.min(1, dt * 1.6);
+      if (Math.abs(dx) < 3 && Math.abs(c.y - (ground - 4)) < 6) {
+        c.state = 'pecking';
+        c.timer = 14 + Math.random() * 10;
+        c.y = ground - 4;
+        c.vx = 0;
+      }
+      this.scatterAnts(c.x, c.y, 120, 1.3);
+      return false;
+    }
+    if (c.state === 'pecking') {
+      c.y = this.surfaceTarget(c.x).y - 4;
+      // hops along the ground toward the nearest foragers
+      c.vx = 0;
+      let nearest: Ant | null = null;
+      let best = 160;
+      this.forAntsNear(c.x, c.y, 160, (a) => {
+        if (!this.isOutside(a.x, a.y)) return;
+        const d = Math.abs(a.x - c.x);
+        if (d < best) {
+          best = d;
+          nearest = a;
+        }
+      });
+      if (nearest) {
+        const n = nearest as Ant;
+        c.dir = n.x >= c.x ? 1 : -1;
+        if (Math.abs(n.x - c.x) > 14) {
+          c.x += c.dir * 32 * dt;
+          c.vx = c.dir * 32;
+        }
+      }
+      this.scatterAnts(c.x, c.y, 90, 1.3);
+      if (Math.floor(c.phase * 0.62) !== Math.floor((c.phase - dt) * 0.62)) {
+        const got = Math.random() < 0.35 ? this.snatchAnt(c.x + c.dir * 8, c.y + 4, 20) : null;
+        if (got) this.log('A bird snatched a forager', 'danger');
+        this.spark(c.x + c.dir * 8, c.y + 4, '#fcd34d');
+      }
+      c.hits += this.defendersNear(c.x, c.y, 30) > 2 ? dt * 0.6 : 0;
+      if (c.timer <= 0 || c.hits > 4) {
+        c.state = 'leaving';
+        c.dir = c.x < (CASE_LEFT + CASE_RIGHT) / 2 ? -1 : 1;
+        if (c.hits > 4) this.log('Soldiers drove the bird off', 'good');
+      }
+      return false;
+    }
+    c.x += c.dir * 170 * dt;
+    c.y -= 70 * dt;
+    return c.x < CASE_LEFT - 30 || c.x > CASE_RIGHT + 30 || c.y < CASE_TOP - 40;
+  }
+
+  private stepSpider(c: Creature, dt: number): boolean {
+    c.life = (c.life ?? 600) - dt;
+    c.y = this.surfaceTarget(c.x).y;
+    // foragers wander into the web; the spider darts out and wraps one now and then
+    c.vy = Math.max(0, c.vy - dt);
+    if (c.state === 'waiting') {
+      if (c.vy <= 0 && Math.random() < dt * 0.25) {
+        const victim = this.snatchAnt(c.x, c.y - 8, 22);
+        if (victim) {
+          c.state = 'wrapping';
+          c.timer = 4;
+          c.vy = 40 + Math.random() * 40;
+          this.log('A forager was caught in a spider web', 'danger');
+        }
+      }
+    } else if (c.timer <= 0) c.state = 'waiting';
+    c.hits += this.defendersNear(c.x, c.y, 36) >= 5 ? dt * 0.5 : 0;
+    if (c.hits > 3) {
+      this.log('A crowd of ants drove the spider away', 'good');
+      return true;
+    }
+    return c.life <= 0;
+  }
+
+  private stepAntlion(c: Creature, dt: number): boolean {
+    c.life = (c.life ?? 600) - dt;
+    c.y = this.surfaceTarget(c.x).y;
+    if (c.state === 'flinging' && c.timer <= 0) c.state = 'lurking';
+    c.vy = Math.max(0, c.vy - dt);
+    if (c.vy <= 0 && Math.random() < dt * 0.3) {
+      const a = this.snatchAnt(c.x, c.y, 9);
+      if (a) {
+        c.state = 'flinging';
+        c.timer = 2.2;
+        c.vy = 30 + Math.random() * 40;
+        this.log('An ant slid into the antlion pit', 'danger');
+      }
+    }
+    return c.life <= 0;
+  }
+
+  private stepAnteater(c: Creature, dt: number): boolean {
+    const ground = this.surfaceTarget(c.x).y;
+    c.y = ground;
+    const edgeX = c.dir > 0 ? CASE_RIGHT + 40 : CASE_LEFT - 40;
+    if (c.state === 'approach') {
+      const dx = c.tx - c.x;
+      c.dir = dx >= 0 ? 1 : -1;
+      c.x += Math.sign(dx) * Math.min(Math.abs(dx), 24 * dt);
+      c.vx = c.dir * 24;
+      if (Math.abs(dx) < 2) {
+        c.state = 'digging';
+        c.timer = 22;
+        c.vx = 0;
+      }
+      this.scatterAnts(c.x, c.y, 70, 1.2);
+      return false;
+    }
+    if (c.state === 'digging') {
+      this.shake = Math.max(this.shake, 0.35);
+      this.scatterAnts(c.x, c.y, 60, 1.2);
+      if (Math.floor(c.phase * 0.5) !== Math.floor((c.phase - dt) * 0.5)) {
+        // long sticky tongue flicks out at the foragers streaming from the nest
+        const got = Math.random() < 0.6 ? this.snatchAnt(c.x + c.dir * 40, c.y, 34) : null;
+        if (got) this.log('The anteater licked up an ant', 'danger');
+      }
+      if (Math.floor(c.phase * 0.25) !== Math.floor((c.phase - dt) * 0.25)) {
+        // claws rake the mound over the entrance
+        const gx0 = Math.floor((c.x + c.dir * 18) / CELL_SIZE);
+        for (let gx = gx0 - 2; gx <= gx0 + 2; gx++) {
+          const sg = Math.floor(this.grid.surfaceY[clamp(gx, 0, GRID_W - 1)] / CELL_SIZE);
+          for (let gy = sg + 1; gy < sg + 7; gy++) {
+            const i = gy * GRID_W + gx;
+            if (this.grid.terrain[i] === CellType.TUNNEL && Math.random() < 0.3) {
+              this.collapseAt(gx, gy, 'anteater', this.cellInUse(i), 2);
+              this.lastCollapseTime = this.simTime;
+              break;
+            }
+          }
+        }
+        this.shake = Math.max(this.shake, 0.7);
+      }
+      c.hits += this.defendersNear(c.x + c.dir * 20, c.y, 30) >= 4 ? dt * 0.4 : 0;
+      if (c.timer <= 0 || c.hits > 3) {
+        c.state = 'leaving';
+        c.dir = c.x < (CASE_LEFT + CASE_RIGHT) / 2 ? -1 : 1;
+        this.log(c.hits > 3 ? 'Biting soldiers drove the anteater away' : 'The anteater wanders off', c.hits > 3 ? 'good' : undefined);
+      }
+      return false;
+    }
+    c.x += c.dir * 30 * dt;
+    c.vx = c.dir * 30;
+    return Math.abs(c.x - edgeX) < 4 || c.x < CASE_LEFT + 6 || c.x > CASE_RIGHT - 6;
+  }
+
+  private stepWorm(c: Creature, dt: number): boolean {
+    const trail = (c.trail ??= []);
+    if (c.state === 'burrowing') {
+      const step = 7 * dt;
+      c.x += c.dir * step;
+      c.y += Math.sin(c.phase * 0.7) * 3 * dt;
+      c.left = (c.left ?? 0) - step;
+      const gx = Math.floor(c.x / CELL_SIZE);
+      const gy = Math.floor(c.y / CELL_SIZE);
+      // the burrow is about two cells tall
+      for (let oy = -1; oy <= 0; oy++) {
+        if (!this.grid.inBounds(gx, gy + oy)) continue;
+        const i = this.grid.idx(gx, gy + oy);
+        if (this.canExcavate(i)) {
+          this.grid.setTerrain(gx, gy + oy, CellType.TUNNEL);
+          this.grid.updateSurfaceColumn(gx);
+          this.fieldDirty.dig = true;
+        }
+      }
+      if (gx < 12 || gx > GRID_W - 12 || this.grid.terrain[this.grid.idx(gx, gy)] === CellType.PEBBLE) c.left = 0;
+      if (trail.length === 0 || Math.hypot(trail[0].x - c.x, trail[0].y - c.y) > 4) {
+        trail.unshift({ x: c.x, y: c.y });
+        if (trail.length > 9) trail.pop();
+      }
+      // ants that meet it just stop and feel it with their antennae
+      if (Math.random() < dt * 2) this.scatterWormEncounter(c);
+      if ((c.left ?? 0) <= 0) {
+        c.state = 'leaving';
+        c.timer = 6;
+      }
+      return false;
+    }
+    // slips off down a side shaft: the body shrinks away into the burrow
+    if (trail.length > 0 && Math.random() < dt * 2.5) trail.pop();
+    return trail.length === 0 || c.timer <= -8;
+  }
+
+  private scatterWormEncounter(c: Creature): void {
+    this.forAntsNear(c.x, c.y, 18, (a) => {
+      if (a.caste === AntCaste.QUEEN || a.payload !== PayloadType.NONE || BUSY_TASKS.has(a.task) || a.flying || a.buried !== undefined) return;
+      a.task = AntTask.GREETING;
+      a.stateTimer = 1.5 + Math.random() * 1.5;
+      a.angle = Math.atan2(c.y - a.y, c.x - a.x);
+      this.stopMoving(a);
+    });
+  }
+
   private makeRival(x: number, behavior: Intruder['behavior'], edge: 'left' | 'right', opts: { holdPost?: number } = {}): void {
     const p = this.surfaceTarget(x);
     const maxHp = 55;
@@ -2903,6 +3218,19 @@ export class AntColonySimulation {
     }
     this.fallenAnts.push({ id: this.allocId(), x: fx, y: fy, angle: ant.angle, carriedByAntId: null, atMidden: false, decayTimer: 25 });
     if (cause === 'combat' && this.war.phase === 'war') this.war.lost++;
+    // nestmates stop to inspect the body (ants recognise death by the fatty acids a corpse gives off) before the
+    // undertakers carry it off; they don't dawdle in the middle of a fight
+    if (this.intruders.length === 0) {
+      let paused = 0;
+      this.forAntsNear(fx, fy, 30, (a) => {
+        if (a.id === ant.id || a.caste === AntCaste.QUEEN || a.payload !== PayloadType.NONE || a.carriedById != null || a.buried !== undefined || a.flying || BUSY_TASKS.has(a.task)) return;
+        a.task = AntTask.GREETING;
+        a.stateTimer = 2 + Math.random() * 2.5;
+        a.angle = Math.atan2(fy - a.y, fx - a.x);
+        this.stopMoving(a);
+        return ++paused >= 4;
+      });
+    }
     this.ants.splice(index, 1);
     if (ant.caste === AntCaste.QUEEN) this.log('The queen has died! The colony cannot raise new workers', 'danger');
     else if (cause === 'buried') this.log('A buried worker suffocated before it could be dug out', 'danger');
@@ -3267,7 +3595,7 @@ export class AntColonySimulation {
     this.footstepTimer -= dt;
     if (this.footstepTimer <= 0) {
       this.footstepTimer = 900 + Math.random() * 1500;
-      if (!this.isNight() || Math.random() < 0.3) this.footsteps();
+      // (no giant footsteps: the colony's only visitors are wildlife)
     }
 
     this.structTimer -= dt;
@@ -3418,6 +3746,7 @@ export class AntColonySimulation {
         span: 'A wide chamber roof sagged and fell',
         abandoned: 'A disused gallery silted up and fell in',
         footsteps: 'Heavy footsteps overhead caved in a shallow tunnel',
+        anteater: 'The anteater\'s claws caved in the entrance tunnel',
       };
       this.log(msg[cause] + (inUse ? ': excavators move in to clear it' : ''), inUse ? 'danger' : 'info');
     }

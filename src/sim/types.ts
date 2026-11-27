@@ -364,3 +364,30 @@ export interface CameraState {
   targetY: number;
   targetZoom: number;
 }
+
+export type CreatureKind = 'bird' | 'spider' | 'antlion' | 'anteater' | 'worm';
+
+/** Wildlife that shares the ground with the colony: predators above the surface, an earthworm below it. */
+export interface Creature {
+  id: number;
+  kind: CreatureKind;
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  /** facing: +1 right, -1 left */
+  dir: 1 | -1;
+  state: string;
+  timer: number;
+  phase: number;
+  /** bites it has taken from defending ants (drives it away when too many) */
+  hits: number;
+  /** goal x (landing spot, dig site...) */
+  tx: number;
+  /** worm: recent positions, head first */
+  trail?: Vec2[];
+  /** worm: sim units of burrow still to dig */
+  left?: number;
+  /** antlion/spider: lifetime left in seconds */
+  life?: number;
+}

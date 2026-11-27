@@ -24,6 +24,7 @@ import {
 } from './models3d';
 import { FormicariumEnvironment3D } from './terrain3d';
 import { FlatCameraController } from './camera2d';
+import { animateCreatureRig, createCreatureRig, disposeCreatureRig, type CreatureRig } from './creatures3d';
 import { resetLegs } from './legs';
 import { MeshBatcher, collectMeshes } from './batcher';
 import {
@@ -163,6 +164,15 @@ export class Formicarium3DRenderer {
   private readonly aphidMesh: THREE.InstancedMesh;
   private readonly debrisMesh: THREE.InstancedMesh;
   private floodKey = '';
+  private readonly creatureRigs = new Map<number, CreatureRig>();
+  private moon!: THREE.Mesh;
+  private moonCanvas!: HTMLCanvasElement;
+  private moonTex!: THREE.CanvasTexture;
+  private moonKey = -1;
+  private fireflies!: THREE.InstancedMesh;
+  private fireflyLevel = 0;
+  private autumnLeaves!: THREE.InstancedMesh;
+  private leafLevel = 0;
 
   private readonly sim: AntColonySimulation;
   private readonly _ray = new THREE.Raycaster();
@@ -317,6 +327,7 @@ export class Formicarium3DRenderer {
     this.crumbMesh = makeInst(new THREE.SphereGeometry(0.036, 6, 4), this.bank.soilCrumbMat, 120, false);
     this.sparkMesh = makeInst(new THREE.IcosahedronGeometry(0.038, 0), sparkMat, 80, false);
     this.batcher = new MeshBatcher(this.scene, !this.isSoftwareGl);
+    this.buildSkyExtras();
 
     // Flat observation camera: pan, pinch/wheel zoom, tap an ant to follow it. No orbiting.
     this.camCtl = new FlatCameraController(
@@ -334,6 +345,171 @@ export class Formicarium3DRenderer {
 
     if (!this.isSoftwareGl) {
       this.renderer.compile(this.scene, this.camera);
+    }
+  }
+
+  private buildSkyExtras(): void {
+    // the moon is a flat canvas disc whose lit crescent is redrawn when the phase changes
+    this.moonCanvas = document.createElement('canvas');
+    this.moonCanvas.width = this.moonCanvas.height = 128;
+    this.moonTex = new THREE.CanvasTexture(this.moonCanvas);
+    this.moonTex.colorSpace = THREE.SRGBColorSpace;
+    const moonGeo = new THREE.PlaneGeometry(1.7, 1.7);
+    this.moon = new THREE.Mesh(moonGeo, new THREE.MeshBasicMaterial({ map: this.moonTex, transparent: true, fog: false, depthWrite: false }));
+    this.moon.position.z = -4;
+    this.moon.visible = false;
+    this.scene.add(this.moon);
+    this.instancedGeos.push(moonGeo);
+
+    const flyGeo = new THREE.IcosahedronGeometry(0.03, 1);
+    const flyMat = new THREE.MeshBasicMaterial({ color: 0xd9ff6e, transparent: true, opacity: 0.95, blending: THREE.AdditiveBlending, depthWrite: false });
+    this.fireflies = new THREE.InstancedMesh(flyGeo, flyMat, 48);
+    this.fireflies.frustumCulled = false;
+    this.fireflies.count = 0;
+    this.scene.add(this.fireflies);
+
+    const leafGeo = new THREE.PlaneGeometry(0.09, 0.06);
+    const leafMat = new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide });
+    this.autumnLeaves = new THREE.InstancedMesh(leafGeo, leafMat, 60);
+    this.autumnLeaves.frustumCulled = false;
+    this.autumnLeaves.count = 0;
+    const c = new THREE.Color();
+    const tones = [0xd9531e, 0xe38a1d, 0xc2352a, 0xe8c040, 0x9a5a22];
+    for (let i = 0; i < 60; i++) this.autumnLeaves.setColorAt(i, c.set(tones[i % tones.length]));
+    this.scene.add(this.autumnLeaves);
+    this.instancedGeos.push(flyGeo, leafGeo);
+    this.extraMats.push(flyMat, leafMat);
+  }
+
+  /** Moon with real phase, fireflies on warm nights, leaves drifting down in autumn. */
+  private syncSky(sim: AntColonySimulation): void {
+    const t = sim.simTime;
+    const ctr = this.camCtl.focusCenterX();
+    const tod = sim.timeOfDay;
+    const n = (((tod - 0.72) % 1) + 1) % 1 / 0.56; // 0 at dusk .. 1 at dawn
+    const nightUp = n > 0 && n < 1;
+    const groundW = simToWorldY(SURFACE_BASE_Y);
+    const lunar = (((Date.now() / 86400000 - 10957.27) % 29.530588) + 29.530588) % 29.530588 / 29.530588; // 0 new
+    const lit = (1 - Math.cos(lunar * Math.PI * 2)) / 2;
+    this.moon.visible = nightUp && lit > 0.04;
+    if (this.moon.visible) {
+      this.moon.position.set(ctr + (n - 0.5) * 16, groundW + 2.0 + Math.sin(n * Math.PI) * 1.6, -4);
+      const key = Math.round(lunar * 60);
+      if (key !== this.moonKey) {
+        this.moonKey = key;
+        const ctx = this.moonCanvas.getContext('2d')!;
+        const R = 60;
+        ctx.clearRect(0, 0, 128, 128);
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(64, 64, R, 0, Math.PI * 2);
+        ctx.clip();
+        ctx.fillStyle = '#eef2ff';
+        ctx.fillRect(0, 0, 128, 128);
+        // the terminator: an ellipse of the unlit part (waxing lit on the right, waning on the left)
+        ctx.globalCompositeOperation = 'destination-out';
+        const waxing = lunar < 0.5;
+        const k = Math.cos(lunar * Math.PI * 2); // 1 new .. -1 full
+        ctx.beginPath();
+        if (k > 0) {
+          // crescent: cut away the dark side plus an ellipse
+          ctx.rect(waxing ? 0 : 64, 0, 64, 128);
+          ctx.ellipse(64, 64, R * k, R, 0, 0, Math.PI * 2);
+        } else {
+          // gibbous: cut away only the thin dark side
+          ctx.ellipse(64, 64, R * -k, R, 0, waxing ? Math.PI / 2 : -Math.PI / 2, waxing ? Math.PI * 1.5 : Math.PI / 2, false);
+        }
+        ctx.fill();
+        ctx.restore();
+        ctx.globalCompositeOperation = 'source-over';
+        this.moonTex.needsUpdate = true;
+      }
+    }
+    this.rimLight.intensity = 0.75 + (nightUp ? lit * 0.55 * Math.sin(n * Math.PI) : 0);
+
+    // fireflies: warm, calm, dark
+    const warm = sim.season === 'Summer' ? 1 : sim.season === 'Winter' ? 0 : 0.5;
+    const calm = sim.rainIntensity() < 0.2 && sim.surfaceTempC > 11 && sim.windStrength < 1.2;
+    const wantFly = sim.isNight() && calm ? warm : 0;
+    this.fireflyLevel += (wantFly - this.fireflyLevel) * 0.02;
+    const nFly = Math.round(this.fireflyLevel * 48);
+    this.fireflies.count = nFly;
+    for (let i = 0; i < nFly; i++) {
+      const bx = ctr + (((i * 37) % 100) / 100 - 0.5) * 22;
+      const x = bx + Math.sin(t * 0.21 + i) * 0.9;
+      const gx = clamp(Math.floor((x / WORLD_SCALE + WORLD_W * 0.5) / CELL_SIZE), 0, GRID_W - 1);
+      const ground = simToWorldY(sim.grid.surfaceY[gx]);
+      const y = ground + 0.3 + (Math.sin(t * 0.3 + i * 1.7) * 0.5 + 0.5) * 1.3;
+      const blink = Math.pow(Math.max(0, Math.sin(t * 1.5 + i * 2.3)), 3);
+      _dummy.position.set(x, y, 0.1 + (((i * 53) % 100) / 100) * 0.5);
+      _dummy.rotation.set(0, 0, 0);
+      _dummy.scale.setScalar(0.05 + blink * 1.3);
+      _dummy.updateMatrix();
+      this.fireflies.setMatrixAt(i, _dummy.matrix);
+    }
+    this.fireflies.instanceMatrix.needsUpdate = true;
+
+    // autumn leaves
+    const wantLeaves = sim.season === 'Autumn' && sim.rainIntensity() < 0.6 && sim.weather !== 'Snow' ? 1 : 0;
+    this.leafLevel += (wantLeaves - this.leafLevel) * 0.01;
+    const nLeaf = Math.round(this.leafLevel * 60);
+    this.autumnLeaves.count = nLeaf;
+    const topW = groundW + 3.2;
+    for (let i = 0; i < nLeaf; i++) {
+      const cycle = (t * (0.035 + (i % 5) * 0.006) + i * 0.173) % 1;
+      const bx = ctr + (((i * 61) % 100) / 100 - 0.5) * 22;
+      const x = bx + Math.sin(t * 0.7 + i) * 0.45 + sim.windStrength * cycle * 1.2;
+      const y = topW - cycle * 3.1;
+      _dummy.position.set(x, y, 0.15 + (((i * 29) % 100) / 100) * 0.5);
+      _dummy.rotation.set(t * 1.3 + i, t * 0.9 + i * 2, Math.sin(t + i) * 1.2);
+      _dummy.scale.setScalar(1);
+      _dummy.updateMatrix();
+      this.autumnLeaves.setMatrixAt(i, _dummy.matrix);
+    }
+    this.autumnLeaves.instanceMatrix.needsUpdate = true;
+    if (this.autumnLeaves.instanceColor) this.autumnLeaves.instanceColor.needsUpdate = true;
+  }
+
+  private syncCreatures(sim: AntColonySimulation): void {
+    const alive = new Set<number>();
+    for (const c of sim.creatures) {
+      alive.add(c.id);
+      let rig = this.creatureRigs.get(c.id);
+      if (!rig) {
+        rig = createCreatureRig(c.kind);
+        this.scene.add(rig.root);
+        this.creatureRigs.set(c.id, rig);
+      }
+      if (c.kind === 'worm' && rig.segs) {
+        const tr = c.trail ?? [];
+        for (let i = 0; i < rig.segs.length; i++) {
+          const s = rig.segs[i];
+          const pt = tr[Math.min(i, tr.length - 1)];
+          s.visible = i < tr.length && !!pt;
+          if (!pt) continue;
+          const z = this.env3d.sampleCavernBackZ(sim, pt.x, pt.y) + 0.07;
+          s.position.set(simToWorldX(pt.x), simToWorldY(pt.y) - 0.04 + Math.sin(sim.simTime * 4 + i * 0.9) * 0.012, z);
+        }
+        continue;
+      }
+      let wy = simToWorldY(c.y);
+      const z = c.kind === 'bird' ? 0.5 : c.kind === 'anteater' ? 0.42 : c.kind === 'spider' ? 0.3 : SOIL_FRONT_Z + 0.03;
+      if (c.kind === 'bird') {
+        // a flying bird's body is centred on c.y; once it touches down its feet are on the ground
+        const gW = simToWorldY(sim.grid.surfaceY[clamp(Math.floor(c.x / CELL_SIZE), 0, GRID_W - 1)]);
+        const h = clamp((simToWorldY(c.y) - gW) / 0.8, 0, 1);
+        wy -= 0.55 * h;
+      }
+      rig.root.position.set(simToWorldX(c.x), wy, z);
+      const sc = c.kind === 'anteater' ? 0.8 : 1;
+      rig.root.scale.set(c.dir * sc, sc, sc);
+      animateCreatureRig(rig, c, sim.simTime);
+    }
+    for (const [id, rig] of this.creatureRigs) {
+      if (alive.has(id)) continue;
+      this.scene.remove(rig.root);
+      disposeCreatureRig(rig);
+      this.creatureRigs.delete(id);
     }
   }
 
@@ -1125,7 +1301,8 @@ export class Formicarium3DRenderer {
         sp.mesh.position.y = simToWorldY(sim.grid.surfaceY[gx]);
       }
       const cut = sim.sprouts[i]?.cut ?? 0;
-      sp.mesh.scale.y += ((1 - cut * 0.45) - sp.mesh.scale.y) * 0.08;
+      const vigor = sim.season === 'Summer' ? 1.05 : sim.season === 'Spring' ? 0.85 : sim.season === 'Autumn' ? 0.72 : 0.45;
+      sp.mesh.scale.y += ((1 - cut * 0.45) * vigor - sp.mesh.scale.y) * 0.04;
       sp.mesh.rotation.z =
         Math.sin(sim.simTime * 2.1 + sp.phase) * (0.045 + Math.abs(sim.windStrength) * 0.06);
     }
@@ -1138,6 +1315,8 @@ export class Formicarium3DRenderer {
     this.syncIntruders(sim, dt);
     this.batcher.end();
     this.syncInstancedEntities(sim);
+    this.syncCreatures(sim);
+    this.syncSky(sim);
 
     this.renderer.render(this.scene, this.camera);
   }
@@ -1147,6 +1326,7 @@ export class Formicarium3DRenderer {
     this.camCtl.dispose();
     this.snowCapMesh.geometry.dispose();
     this.batcher.dispose();
+    for (const rig of this.creatureRigs.values()) disposeCreatureRig(rig);
     this.env3d.dispose();
     this.geo.dispose();
     this.bank.dispose();

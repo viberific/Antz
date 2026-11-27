@@ -97,6 +97,10 @@ export class FlatCameraController {
     this.apply();
   }
 
+  public focusCenterX(): number {
+    return (this.focus.left + this.focus.right) / 2;
+  }
+
   /** Tell the camera what the zoomed-out view should frame (clipped to the case). */
   public setFocus(f: { left: number; right: number; bottom: number; top: number }): void {
     const b = this.bounds;
