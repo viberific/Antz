@@ -31,7 +31,10 @@ function smoothstep(edge0: number, edge1: number, x: number): number {
   return t * t * (3 - 2 * t);
 }
 
-const _dummy = new THREE.Object3D();
+function srgbToLin(c: number): number {
+  return c <= 0.04045 ? c * (1 / 12.92) : Math.pow((c + 0.055) / 1.055, 2.4);
+}
+
 const _col = new THREE.Color();
 
 /**
@@ -181,14 +184,14 @@ function rockNoise(x: number, y: number, z: number, seed: number): number {
  * Finds each connected cluster of rock cells and builds a lumpy stone that fills exactly that footprint: the outline
  * follows the cells, the face is a faceted dome that stands slightly proud of the soil. All stones share one mesh.
  */
-function buildRockGeometry(sim: AntColonySimulation): THREE.BufferGeometry | null {
+function buildRockGeometry(sim: AntColonySimulation, rockSubdiv: 1 | 2 = 2): THREE.BufferGeometry | null {
   const grid = sim.grid;
   const seen = new Uint8Array(GRID_W * GRID_H);
   const half = CELL_SIZE * WORLD_SCALE * 0.5;
   const BINS = 24;
   const positions: number[] = [];
   const colors: number[] = [];
-  const unit = new THREE.IcosahedronGeometry(1, 2);
+  const unit = new THREE.IcosahedronGeometry(1, rockSubdiv);
   const up = unit.attributes.position;
   const col = new THREE.Color();
   let rockIndex = 0;
@@ -298,23 +301,26 @@ export class FormicariumEnvironment3D {
   private readonly solidMesh: THREE.Mesh;
   private readonly curvedCavernMesh: THREE.Mesh;
   private readonly curvedCavernMat: THREE.MeshStandardMaterial;
-  private readonly granuleMesh: THREE.InstancedMesh;
+  private granuleMesh: THREE.InstancedMesh;
+  private readonly granuleGeo: THREE.IcosahedronGeometry;
+  private readonly granuleMat: THREE.Material;
+  private granuleCap: number;
   private readonly backEarthMesh: THREE.Mesh;
   private readonly backEarthCanvas: HTMLCanvasElement;
   private readonly backEarthCtx: CanvasRenderingContext2D;
   private readonly backEarthTex: THREE.CanvasTexture;
 
   private readonly rootMeshes: THREE.Mesh[] = [];
-  private readonly rockMesh: THREE.Mesh | null = null;
+  private rockMesh: THREE.Mesh | null = null;
   private readonly disposables: (THREE.BufferGeometry | THREE.Material | THREE.Texture)[] = [];
 
   private smoothSoilField = new Float32Array(GRID_W * GRID_H);
   private smoothAirField = new Float32Array(GRID_W * GRID_H);
   // scratch storage reused by every rebuildTerrain() (see ScratchF32)
-  private readonly sPositions = new ScratchF32(1 << 19);
-  private readonly sNormals = new ScratchF32(1 << 19);
-  private readonly sUvs = new ScratchF32(1 << 18);
-  private readonly sColors = new ScratchF32(1 << 19);
+  private readonly sPositions = new ScratchF32(1 << 18);
+  private readonly sNormals = new ScratchF32(1 << 18);
+  private readonly sUvs = new ScratchF32(1 << 17);
+  private readonly sColors = new ScratchF32(1 << 18);
   private readonly sCPositions = new ScratchF32(1 << 15);
   private readonly sCUvs = new ScratchF32(1 << 14);
   private readonly sCColors = new ScratchF32(1 << 15);
@@ -323,12 +329,26 @@ export class FormicariumEnvironment3D {
   private readonly fieldB = new Float32Array(GRID_W * GRID_H);
   private readonly airA = new Float32Array(GRID_W * GRID_H);
   private readonly airB = new Float32Array(GRID_W * GRID_H);
+  private readonly cornerWx = new Float32Array(GRID_W * GRID_H);
+  private readonly cornerWy = new Float32Array(GRID_W * GRID_H);
+  private readonly cornerZ0 = new Float32Array(GRID_W * GRID_H);
+  private readonly cornerR = new Float32Array(GRID_W * GRID_H);
+  private readonly cornerG = new Float32Array(GRID_W * GRID_H);
+  private readonly cornerB = new Float32Array(GRID_W * GRID_H);
   private readonly curvedVertexMap = new Int32Array((GRID_W + 1) * (GRID_H + 1));
   private lastRebuildTime = -10;
   private builtTerrainVersion = -1;
   private lastBackTexTime = -10;
 
-  constructor(sim: AntColonySimulation, bank: MaterialBank, maxAnisotropy: number, isSoftwareGl: boolean) {
+  constructor(
+    sim: AntColonySimulation,
+    bank: MaterialBank,
+    maxAnisotropy: number,
+    isSoftwareGl: boolean,
+    rockSubdiv: 1 | 2 = 2,
+    initialGranuleCap = 12000,
+    deferBuild = false
+  ) {
     const leftX = simToWorldX(CASE_LEFT);
     const rightX = simToWorldX(CASE_RIGHT);
     const topY = simToWorldY(CASE_TOP);
@@ -386,17 +406,26 @@ export class FormicariumEnvironment3D {
     this.group.add(this.curvedCavernMesh);
     this.disposables.push(this.curvedCavernMat);
 
-    // 7. Densely Populated Exposed-Surface Tiny Dark-Brown Soil Spheres (1 draw call)
-    const granuleGeo = new THREE.IcosahedronGeometry(1, 0);
-    this.granuleMesh = new THREE.InstancedMesh(granuleGeo, bank.soilFrontMat, MAX_GRANULES);
-    this.granuleMesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(MAX_GRANULES * 3), 3);
-    this.granuleMesh.count = 0;
-    this.granuleMesh.frustumCulled = false;
-    this.granuleMesh.castShadow = false; // sub-ant-sized grains: shadows cost a full extra pass for no visible gain
-    this.granuleMesh.receiveShadow = true;
+    // 7. Densely Populated Exposed-Surface Tiny Dark-Brown Soil Spheres (1 draw call, grows dynamically if dug)
+    this.granuleGeo = new THREE.IcosahedronGeometry(1, 0);
+    this.granuleMat = bank.soilFrontMat;
+    this.granuleCap = Math.min(MAX_GRANULES, Math.max(4096, initialGranuleCap));
+    this.granuleMesh = this.makeGranuleMesh(this.granuleCap);
     this.group.add(this.granuleMesh);
-    this.disposables.push(granuleGeo);
+    this.disposables.push(this.granuleGeo);
 
+    if (!deferBuild) {
+      this.buildRocksAndRoots(sim, bank, isSoftwareGl, rockSubdiv);
+      this.buildInitialTerrain(sim);
+    }
+  }
+
+  public buildRocksAndRoots(
+    sim: AntColonySimulation,
+    bank: MaterialBank,
+    isSoftwareGl: boolean,
+    rockSubdiv: 1 | 2 = 2
+  ): void {
     // 8. 3D Subterranean Roots
     for (const poly of sim.rootPolylines) {
       if (poly.length < 2) continue;
@@ -419,7 +448,7 @@ export class FormicariumEnvironment3D {
     }
 
     // 9. Rocks: one sculpted stone per cluster of rock cells, so what you see is exactly what blocks the ants
-    const rockGeo = buildRockGeometry(sim);
+    const rockGeo = buildRockGeometry(sim, rockSubdiv);
     if (rockGeo) {
       const rockMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.86, metalness: 0.04, flatShading: true });
       this.rockMesh = new THREE.Mesh(rockGeo, rockMat);
@@ -429,9 +458,41 @@ export class FormicariumEnvironment3D {
       this.group.add(this.rockMesh);
       this.disposables.push(rockGeo, rockMat);
     }
+  }
 
+  public buildInitialTerrain(sim: AntColonySimulation): void {
+    this.builtTerrainVersion = sim.grid.terrainVersion;
     this.rebuildTerrain(sim);
     this.updateBackEarthTexture(sim);
+    sim.grid.dirtVisualDirty = false;
+    this.lastRebuildTime = sim.simTime;
+    this.lastBackTexTime = sim.simTime;
+  }
+
+  private makeGranuleMesh(cap: number): THREE.InstancedMesh {
+    const im = new THREE.InstancedMesh(this.granuleGeo, this.granuleMat, cap);
+    im.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(cap * 3), 3);
+    im.count = 0;
+    im.frustumCulled = false;
+    im.castShadow = false; // sub-ant-sized grains: shadows cost a full extra pass for no visible gain
+    im.receiveShadow = true;
+    return im;
+  }
+
+  private growGranuleMesh(): void {
+    const nextCap = Math.min(MAX_GRANULES, Math.round(this.granuleCap * 1.5));
+    if (nextCap <= this.granuleCap) return;
+    const old = this.granuleMesh;
+    const next = this.makeGranuleMesh(nextCap);
+    (next.instanceMatrix.array as Float32Array).set(old.instanceMatrix.array as Float32Array);
+    if (old.instanceColor && next.instanceColor) {
+      (next.instanceColor.array as Float32Array).set(old.instanceColor.array as Float32Array);
+    }
+    this.group.remove(old);
+    old.dispose();
+    this.granuleMesh = next;
+    this.granuleCap = nextCap;
+    this.group.add(next);
   }
 
   /**
@@ -912,8 +973,10 @@ export class FormicariumEnvironment3D {
       };
     };
 
-    // Granule accumulation counter
+    // Granule accumulation counter (writes directly into typed GPU buffers, growing dynamically if needed)
     let granuleCount = 0;
+    let gMatArr = this.granuleMesh.instanceMatrix.array as Float32Array;
+    let gColArr = this.granuleMesh.instanceColor!.array as Float32Array;
     const pushSphere = (
       wx: number,
       wy: number,
@@ -924,13 +987,33 @@ export class FormicariumEnvironment3D {
       cb: number
     ) => {
       if (granuleCount >= MAX_GRANULES) return;
-      _dummy.position.set(wx, wy, wz);
-      _dummy.rotation.set(0, 0, 0);
-      _dummy.scale.setScalar(r);
-      _dummy.updateMatrix();
-      this.granuleMesh.setMatrixAt(granuleCount, _dummy.matrix);
-      _col.setRGB(cr, cg, cb, THREE.SRGBColorSpace);
-      this.granuleMesh.setColorAt(granuleCount, _col);
+      if (granuleCount >= this.granuleCap) {
+        this.growGranuleMesh();
+        gMatArr = this.granuleMesh.instanceMatrix.array as Float32Array;
+        gColArr = this.granuleMesh.instanceColor!.array as Float32Array;
+      }
+      const m = granuleCount * 16;
+      gMatArr[m] = r;
+      gMatArr[m + 1] = 0;
+      gMatArr[m + 2] = 0;
+      gMatArr[m + 3] = 0;
+      gMatArr[m + 4] = 0;
+      gMatArr[m + 5] = r;
+      gMatArr[m + 6] = 0;
+      gMatArr[m + 7] = 0;
+      gMatArr[m + 8] = 0;
+      gMatArr[m + 9] = 0;
+      gMatArr[m + 10] = r;
+      gMatArr[m + 11] = 0;
+      gMatArr[m + 12] = wx;
+      gMatArr[m + 13] = wy;
+      gMatArr[m + 14] = wz;
+      gMatArr[m + 15] = 1;
+
+      const c = granuleCount * 3;
+      gColArr[c] = srgbToLin(cr);
+      gColArr[c + 1] = srgbToLin(cg);
+      gColArr[c + 2] = srgbToLin(cb);
       granuleCount++;
     };
 
@@ -1057,12 +1140,50 @@ export class FormicariumEnvironment3D {
       }
     };
 
-    const makeCornerPt = (gx: number, gy: number): ContourPt => {
-      const sx = sampleSimX(gx);
-      const sy = sampleSimY(gy);
-      const wx = simToWorldX(sx);
-      const wy = simToWorldY(sy);
-      return { sx, sy, wx, wy, z0: frontZAt(wx, wy), col: soilColorAtSim(sx, sy) };
+    const { cornerWx, cornerWy, cornerZ0, cornerR, cornerG, cornerB } = this;
+
+    const getCornerPt = (i: number): ContourPt => ({
+      sx: sampleSimX(i % GRID_W),
+      sy: sampleSimY((i - (i % GRID_W)) / GRID_W),
+      wx: cornerWx[i],
+      wy: cornerWy[i],
+      z0: cornerZ0[i],
+      col: [cornerR[i], cornerG[i], cornerB[i]],
+    });
+
+    const pushFrontQuadIdx = (iBL: number, iBR: number, iTR: number, iTL: number) => {
+      const blx = cornerWx[iBL], bly = cornerWy[iBL], blz = cornerZ0[iBL];
+      const brx = cornerWx[iBR], bry = cornerWy[iBR], brz = cornerZ0[iBR];
+      const trx = cornerWx[iTR], try_ = cornerWy[iTR], trz = cornerZ0[iTR];
+      const tlx = cornerWx[iTL], tly = cornerWy[iTL], tlz = cornerZ0[iTL];
+
+      const blr = cornerR[iBL], blg = cornerG[iBL], blb = cornerB[iBL];
+      const brr = cornerR[iBR], brg = cornerG[iBR], brb = cornerB[iBR];
+      const trr = cornerR[iTR], trg = cornerG[iTR], trb = cornerB[iTR];
+      const tlr = cornerR[iTL], tlg = cornerG[iTL], tlb = cornerB[iTL];
+
+      positions.push3(blx, bly, blz);
+      positions.push3(brx, bry, brz);
+      positions.push3(trx, try_, trz);
+      positions.push3(blx, bly, blz);
+      positions.push3(trx, try_, trz);
+      positions.push3(tlx, tly, tlz);
+
+      for (let k = 0; k < 6; k++) normals.push3(0, 0, 1);
+
+      uvs.push2(blx * 0.25, bly * 0.25);
+      uvs.push2(brx * 0.25, bry * 0.25);
+      uvs.push2(trx * 0.25, try_ * 0.25);
+      uvs.push2(blx * 0.25, bly * 0.25);
+      uvs.push2(trx * 0.25, try_ * 0.25);
+      uvs.push2(tlx * 0.25, tly * 0.25);
+
+      colors.push3(blr, blg, blb);
+      colors.push3(brr, brg, brb);
+      colors.push3(trr, trg, trb);
+      colors.push3(blr, blg, blb);
+      colors.push3(trr, trg, trb);
+      colors.push3(tlr, tlg, tlb);
     };
 
     const interpContourPt = (pA: ContourPt, pB: ContourPt, vA: number, vB: number): ContourPt => {
@@ -1086,21 +1207,47 @@ export class FormicariumEnvironment3D {
       };
     };
 
-    // Precompute dual sample grid corners
-    const cornerPts: ContourPt[] = new Array(len);
+    // Precompute dual sample grid corners into reusable flat typed arrays (zero per-corner heap objects)
     for (let gy = topGy; gy <= bottomGy; gy++) {
+      const sy = sampleSimY(gy);
+      const wy = simToWorldY(sy);
+      const row = gy * GRID_W;
+      const cGy = clamp(gy, minGy, maxGy);
+      const cRow = cGy * GRID_W;
       for (let gx = leftGx; gx <= rightGx; gx++) {
-        cornerPts[gy * GRID_W + gx] = makeCornerPt(gx, gy);
+        const sx = sampleSimX(gx);
+        const wx = simToWorldX(sx);
+        const i = row + gx;
+        cornerWx[i] = wx;
+        cornerWy[i] = wy;
+        cornerZ0[i] = frontZAt(wx, wy);
+
+        const cGx = clamp(gx, minGx, maxGx);
+        const idx = cRow + cGx;
+        let t = terrain[idx];
+        if (t === CellType.AIR || t === CellType.TUNNEL || t === CellType.GLASS_WALL) {
+          t = cGy < 52 ? CellType.TOPSOIL : cGy > 105 ? CellType.DEEP_CLAY : CellType.SUBSOIL;
+        }
+        const m = moisture[idx];
+        const tint =
+          0.5 +
+          0.3 * Math.sin(sx * 0.19 + sy * 0.13) +
+          0.2 * Math.cos(sx * 0.43 - sy * 0.37);
+        const [sr, sg, sb] = granuleColorSrgb(t, m, cGy, tint);
+        cornerR[i] = srgbToLin(sr);
+        cornerG[i] = srgbToLin(sg);
+        cornerB[i] = srgbToLin(sb);
       }
     }
 
     // Emit Marching Squares front cross-section + smooth bevel contour across tank
     for (let gy = topGy; gy < bottomGy; gy++) {
-      for (let gx = leftGx; gx < rightGx; gx++) {
+      let gx = leftGx;
+      while (gx < rightGx) {
         const iTL = gy * GRID_W + gx;
-        const iTR = gy * GRID_W + (gx + 1);
-        const iBR = (gy + 1) * GRID_W + (gx + 1);
-        const iBL = (gy + 1) * GRID_W + gx;
+        const iTR = iTL + 1;
+        const iBR = iTL + GRID_W + 1;
+        const iBL = iTL + GRID_W;
 
         const vTL = fieldA[iTL];
         const vTR = fieldA[iTR];
@@ -1113,18 +1260,39 @@ export class FormicariumEnvironment3D {
           (vBR >= ISO_LEVEL ? 2 : 0) |
           (vBL >= ISO_LEVEL ? 1 : 0);
 
-        if (mask === 0) continue;
-
-        const pTL = cornerPts[iTL];
-        const pTR = cornerPts[iTR];
-        const pBR = cornerPts[iBR];
-        const pBL = cornerPts[iBL];
-
-        if (mask === 15) {
-          pushFrontTri(pBL, pBR, pTR);
-          pushFrontTri(pBL, pTR, pTL);
+        if (mask === 0) {
+          gx++;
           continue;
         }
+
+        if (mask === 15) {
+          // Merge up to 3 consecutive interior solid cells into one quad to cut vertex & shadow-pass load ~3x
+          // while preserving smooth front ripple and soil strata color variation.
+          let runEnd = gx + 1;
+          const maxRun = Math.min(rightGx, gx + 3);
+          while (runEnd < maxRun) {
+            const rTL = gy * GRID_W + runEnd;
+            if (
+              fieldA[rTL] >= ISO_LEVEL &&
+              fieldA[rTL + 1] >= ISO_LEVEL &&
+              fieldA[rTL + GRID_W + 1] >= ISO_LEVEL &&
+              fieldA[rTL + GRID_W] >= ISO_LEVEL
+            ) {
+              runEnd++;
+            } else {
+              break;
+            }
+          }
+          const endTL = gy * GRID_W + runEnd;
+          pushFrontQuadIdx(iBL, endTL + GRID_W, endTL, iTL);
+          gx = runEnd;
+          continue;
+        }
+
+        const pTL = getCornerPt(iTL);
+        const pTR = getCornerPt(iTR);
+        const pBR = getCornerPt(iBR);
+        const pBL = getCornerPt(iBL);
 
         const eTop = (vTL >= ISO_LEVEL) !== (vTR >= ISO_LEVEL) ? interpContourPt(pTL, pTR, vTL, vTR) : pTL;
         const eRight = (vTR >= ISO_LEVEL) !== (vBR >= ISO_LEVEL) ? interpContourPt(pTR, pBR, vTR, vBR) : pTR;
@@ -1227,6 +1395,7 @@ export class FormicariumEnvironment3D {
             break;
           }
         }
+        gx++;
       }
     }
 
@@ -1258,8 +1427,8 @@ export class FormicariumEnvironment3D {
       const vLT = fieldA[gy * GRID_W + leftGx];
       const vLB = fieldA[(gy + 1) * GRID_W + leftGx];
       if (vLT >= ISO_LEVEL || vLB >= ISO_LEVEL) {
-        const pTop = cornerPts[gy * GRID_W + leftGx];
-        const pBot = cornerPts[(gy + 1) * GRID_W + leftGx];
+        const pTop = getCornerPt(gy * GRID_W + leftGx);
+        const pBot = getCornerPt((gy + 1) * GRID_W + leftGx);
         const aTop = vLT >= ISO_LEVEL ? pTop : interpContourPt(pTop, pBot, vLT, vLB);
         const aBot = vLB >= ISO_LEVEL ? pBot : interpContourPt(pTop, pBot, vLT, vLB);
         pushSideWallSpan(aTop.wx, aTop.wy, aBot.wy, aTop.z0, aBot.z0, -1, aTop.col, aBot.col);
@@ -1268,8 +1437,8 @@ export class FormicariumEnvironment3D {
       const vRT = fieldA[gy * GRID_W + rightGx];
       const vRB = fieldA[(gy + 1) * GRID_W + rightGx];
       if (vRT >= ISO_LEVEL || vRB >= ISO_LEVEL) {
-        const pTop = cornerPts[gy * GRID_W + rightGx];
-        const pBot = cornerPts[(gy + 1) * GRID_W + rightGx];
+        const pTop = getCornerPt(gy * GRID_W + rightGx);
+        const pBot = getCornerPt((gy + 1) * GRID_W + rightGx);
         const aTop = vRT >= ISO_LEVEL ? pTop : interpContourPt(pTop, pBot, vRT, vRB);
         const aBot = vRB >= ISO_LEVEL ? pBot : interpContourPt(pTop, pBot, vRT, vRB);
         pushSideWallSpan(aTop.wx, aTop.wy, aBot.wy, aTop.z0, aBot.z0, 1, aTop.col, aBot.col);
@@ -1278,8 +1447,8 @@ export class FormicariumEnvironment3D {
 
     const nBot: [number, number, number] = [0, -1, 0];
     for (let gx = leftGx; gx < rightGx; gx++) {
-      const pL = cornerPts[bottomGy * GRID_W + gx];
-      const pR = cornerPts[bottomGy * GRID_W + (gx + 1)];
+      const pL = getCornerPt(bottomGy * GRID_W + gx);
+      const pR = getCornerPt(bottomGy * GRID_W + (gx + 1));
       const cBL: [number, number, number] = [pL.col[0] * 0.62, pL.col[1] * 0.62, pL.col[2] * 0.62];
       const cBR: [number, number, number] = [pR.col[0] * 0.62, pR.col[1] * 0.62, pR.col[2] * 0.62];
       pushTri(pR.wx, pR.wy, pR.z0, 1, 0, pL.wx, pL.wy, pL.z0, 0, 0, pL.wx, pL.wy, SOIL_BACK_Z, 0, 1, nBot, nBot, nBot, pR.col, pL.col, cBL);

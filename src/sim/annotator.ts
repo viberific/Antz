@@ -116,18 +116,25 @@ export class Annotator {
   private readonly seenEvents = new Set<string>();
   private readonly taskSince = new Map<number, { task: AntTask; since: number }>();
   private trackClock = 0;
+  private clock = 0;
+  private offscreenFor = 0;
   private primed = false;
+
+  public hasActive(): boolean {
+    return this.active !== null;
+  }
 
   /** Advance one frame. Returns what to draw, or null when nothing is showing. */
   public update(sim: AntColonySimulation, dt: number, host: AnnotatorHost): AnnotationView | null {
-    const now = sim.simTime;
-    this.pollEvents(sim);
-    this.trackTasks(sim, dt);
+    this.clock += dt;
+    const now = this.clock;
+    this.pollEvents(sim, now);
+    this.trackTasks(sim, dt, now);
 
     if (this.active) {
       if (!this.ending) {
         this.alpha = Math.min(1, this.alpha + dt / FADE_IN);
-        if (!this.enabled || !this.stillValid(sim, host, now)) this.ending = true;
+        if (!this.enabled || !this.stillValid(sim, host, now, dt)) this.ending = true;
       }
       if (this.ending) {
         this.alpha -= dt / FADE_OUT;
@@ -135,6 +142,7 @@ export class Annotator {
           this.alpha = 0;
           this.active = null;
           this.ending = false;
+          this.offscreenFor = 0;
           this.gap = host.mode() === 'follow' ? 2 : GAP_MIN + Math.random() * (GAP_MAX - GAP_MIN);
         }
       }
@@ -158,7 +166,7 @@ export class Annotator {
 
   // ---------------------------------------------------------------- events
 
-  private pollEvents(sim: AntColonySimulation): void {
+  private pollEvents(sim: AntColonySimulation, now: number): void {
     const fresh = sim.events.filter((e) => !this.seenEvents.has(`${e.time}|${e.text}`));
     for (const e of fresh) this.seenEvents.add(`${e.time}|${e.text}`);
     if (this.seenEvents.size > 64) {
@@ -176,19 +184,19 @@ export class Annotator {
       const note = EVENT_NOTES.find((n) => n.match.test(e.text));
       if (!note || this.pending.some((p) => p.note.id === note.id)) continue;
       const last = this.shown.get('event:' + note.id);
-      if (last !== undefined && sim.simTime - last < note.cooldown) continue;
-      this.pending.push({ note, at: sim.simTime });
+      if (last !== undefined && now - last < note.cooldown) continue;
+      this.pending.push({ note, at: now });
       if (this.pending.length > 5) this.pending.shift();
     }
   }
 
-  private trackTasks(sim: AntColonySimulation, dt: number): void {
+  private trackTasks(sim: AntColonySimulation, dt: number, now: number): void {
     this.trackClock += dt;
     if (this.trackClock < 0.25) return;
     this.trackClock = 0;
     for (const a of sim.ants) {
       const t = this.taskSince.get(a.id);
-      if (!t || t.task !== a.task) this.taskSince.set(a.id, { task: a.task, since: sim.simTime });
+      if (!t || t.task !== a.task) this.taskSince.set(a.id, { task: a.task, since: now });
     }
     if (this.taskSince.size > sim.ants.length + 64) {
       const live = new Set(sim.ants.map((a) => a.id));
@@ -198,26 +206,44 @@ export class Annotator {
 
   // ---------------------------------------------------------------- lifecycle
 
-  private stillValid(sim: AntColonySimulation, host: AnnotatorHost, now: number): boolean {
+  private stillValid(sim: AntColonySimulation, host: AnnotatorHost, now: number, dt: number): boolean {
     const a = this.active!;
     const age = now - a.startedAt;
     if (a.view.layout === 'banner') return age < a.duration;
     // an event that matters more than any one ant takes the screen, once the current caption has had time to be read
     if (age > HOLD_MIN && this.bannerWaiting(now, host)) return false;
-    if (age > a.duration) return false;
+    if (age >= a.duration) return false;
     const s = a.subject;
     if (!s) return false;
-    const { w, h } = host.size();
-    const p = host.locate(s);
-    if (!p || p.x < w * 0.04 || p.x > w * 0.96 || p.y < h * 0.08 || p.y > h * 0.92) return false;
+
+    const following = host.mode() === 'follow';
     if (s.kind === 'ant') {
       const ant = sim.ants.find((q) => q.id === s.id);
-      if (!ant || ant.task !== a.task) return false;
-      if (host.mode() === 'follow' && host.followId() !== s.id) return false;
-    } else if (host.mode() === 'follow') {
+      if (!ant || ant.carriedById != null) return false;
+      if (following) {
+        if (host.followId() !== s.id) return false;
+        if (ant.task !== a.task) return false;
+      }
+    } else if (following) {
       return false;
+    } else if (s.kind === 'creature') {
+      if (!sim.creatures.some((c) => c.id === s.id)) return false;
+    } else if (s.kind === 'intruder') {
+      if (!sim.intruders.some((m) => m.id === s.id)) return false;
     }
-    return true;
+
+    const { w, h } = host.size();
+    const p = host.locate(s);
+    if (!p) return false;
+    const inSafe = p.x >= w * 0.02 && p.x <= w * 0.98 && p.y >= h * 0.04 && p.y <= h * 0.96;
+    if (inSafe) {
+      this.offscreenFor = 0;
+      return true;
+    }
+    const nearFrame = p.x >= -14 && p.x <= w + 14 && p.y >= -14 && p.y <= h + 14;
+    this.offscreenFor += dt;
+    const grace = nearFrame ? (age < HOLD_MIN ? 1.5 : 0.5) : 0.35;
+    return this.offscreenFor < grace;
   }
 
   private startNext(sim: AntColonySimulation, host: AnnotatorHost, now: number): void {
@@ -268,6 +294,7 @@ export class Annotator {
     this.active = { view, subject, task, startedAt: now, duration };
     this.alpha = 0;
     this.ending = false;
+    this.offscreenFor = 0;
   }
 
   // ---------------------------------------------------------------- choosing
@@ -291,7 +318,7 @@ export class Annotator {
     const ant = sim.ants.find((a) => a.id === id);
     if (!ant || !TASK_NOTES[ant.task]) return null;
     const since = this.taskSince.get(id);
-    if (since && sim.simTime - since.since < 0.8) return null;
+    if (since && this.clock - since.since < 0.8) return null;
     return { kind: 'ant', id };
   }
 
@@ -305,7 +332,7 @@ export class Annotator {
 
     const consider = (s: Subject, interest: number, keys: [string, number, number][]): void => {
       const p = host.locate(s);
-      if (!p || p.x < w * 0.12 || p.x > w * 0.88 || p.y < h * 0.16 || p.y > h * 0.84) return;
+      if (!p || p.x < w * 0.15 || p.x > w * 0.85 || p.y < h * 0.18 || p.y > h * 0.82) return;
       let f = 1;
       for (const [k, span, floor] of keys) f *= this.fresh(k, now, span, floor);
       // show something different before anything comes round again: the newer it is in the history, the harder it is held back
@@ -323,7 +350,7 @@ export class Annotator {
       const note = TASK_NOTES[a.task];
       if (!note || a.carriedById != null) continue;
       const since = this.taskSince.get(a.id);
-      if (!since || now - since.since < 1.2) continue;
+      if (!since || now - since.since < 0.5) continue;
       let interest = note.interest;
       if (a.caste === AntCaste.QUEEN || a.caste === AntCaste.GYNE || a.caste === AntCaste.MALE) interest += 1.2;
       consider({ kind: 'ant', id: a.id }, interest, [

@@ -1,15 +1,21 @@
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { AntColonySimulation } from './colony';
+import { NatureAudioEngine } from './audio';
 import {
   MaterialBank,
   SOIL_BACK_Z,
   SOIL_FRONT_Z,
   WORLD_SCALE,
-  detectSoftwareWebGL,
   simToWorldX,
   simToWorldY,
 } from './materials3d';
+import {
+  createFastStudioEnvTexture,
+  detectDeviceProfile,
+  probePreContextHints,
+  type DeviceProfile,
+} from './deviceTier';
 import {
   AntRig,
   GeometryBank,
@@ -107,6 +113,7 @@ function clamp(v: number, min: number, max: number): number {
 }
 
 export class Formicarium3DRenderer {
+  public readonly profile: DeviceProfile;
   public readonly isSoftwareGl: boolean;
   public readonly renderer: THREE.WebGLRenderer;
   public readonly scene: THREE.Scene;
@@ -114,6 +121,9 @@ export class Formicarium3DRenderer {
   public readonly camCtl: FlatCameraController;
   /** told whenever the camera mode changes (for the on-screen controls) */
   public onCameraMode: ((m: CameraMode) => void) | null = null;
+  public onContextLost: (() => void) | null = null;
+  public onContextRestored: (() => void) | null = null;
+  public readonly audio = new NatureAudioEngine();
   private readonly activity = new ActivityDirector();
   private readonly annotator = new Annotator();
   private overlay: AnnotationOverlay | null = null;
@@ -134,6 +144,7 @@ export class Formicarium3DRenderer {
     out.set(wx, wy - 0.025, wz);
   };
   private readonly envMapTex: THREE.Texture;
+  private envSourceTex: THREE.Texture | null = null;
 
   private readonly sunLight: THREE.DirectionalLight;
   private readonly rimLight: THREE.DirectionalLight;
@@ -168,6 +179,9 @@ export class Formicarium3DRenderer {
 
   private disposed = false;
   private lightningFlash = 0;
+  private pendingLightningAudio = false;
+  private bootReady = false;
+  private floraBuilt = false;
   private readonly snowMesh: THREE.InstancedMesh;
   private readonly snowCapMesh: THREE.Mesh;
   private snowKey = '';
@@ -192,29 +206,42 @@ export class Formicarium3DRenderer {
   private readonly _ray = new THREE.Raycaster();
   private readonly _plane = new THREE.Plane(new THREE.Vector3(0, 0, 1), -SOIL_FRONT_Z);
 
-  constructor(container: HTMLElement, sim: AntColonySimulation) {
+  private readonly handleContextLost = (e: Event) => {
+    e.preventDefault();
+    this.onContextLost?.();
+  };
+  private readonly handleContextRestored = () => {
+    this.resize();
+    this.onContextRestored?.();
+  };
+
+  constructor(container: HTMLElement, sim: AntColonySimulation, deferStage = false) {
     this.sim = sim;
     this.container = container;
-    this.isSoftwareGl = detectSoftwareWebGL();
+    const hints = probePreContextHints();
 
     this.renderer = new THREE.WebGLRenderer({
-      antialias: !this.isSoftwareGl,
+      antialias: hints.antialias,
       powerPreference: 'high-performance',
     });
+    this.profile = detectDeviceProfile(this.renderer);
+    this.isSoftwareGl = this.profile.isSoftwareGl;
+
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 1.15;
-    // Phones are fill-rate bound: 1.5x is visually close to their native 3x at a fraction of the pixel cost.
-    const coarse = typeof window.matchMedia === 'function' && window.matchMedia('(pointer: coarse)').matches;
-    this.renderer.setPixelRatio(this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, coarse ? 1.5 : 2));
-    this.renderer.shadowMap.enabled = !this.isSoftwareGl;
-    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, this.profile.maxDpr));
+    this.renderer.shadowMap.enabled = this.profile.shadows;
+    this.renderer.shadowMap.type =
+      this.profile.tier === 'efficiency' ? THREE.PCFShadowMap : THREE.PCFSoftShadowMap;
     this.renderer.setSize(container.clientWidth || window.innerWidth, container.clientHeight || window.innerHeight);
 
     this.renderer.domElement.style.display = 'block';
     this.renderer.domElement.style.width = '100%';
     this.renderer.domElement.style.height = '100%';
     this.renderer.domElement.style.touchAction = 'none';
+    this.renderer.domElement.addEventListener('webglcontextlost', this.handleContextLost, false);
+    this.renderer.domElement.addEventListener('webglcontextrestored', this.handleContextRestored, false);
     container.appendChild(this.renderer.domElement);
 
     this.scene = new THREE.Scene();
@@ -224,14 +251,21 @@ export class Formicarium3DRenderer {
     const aspect = (container.clientWidth || window.innerWidth) / Math.max(1, container.clientHeight || window.innerHeight);
     this.camera = new THREE.PerspectiveCamera(42, aspect, 0.2, 160);
 
-    // Studio RoomEnvironment reflection map
+    // Studio reflection map: full RoomEnvironment on high desktop, ~2ms equirectangular studio map on mobile/balanced
     const pmrem = new THREE.PMREMGenerator(this.renderer);
-    this.envMapTex = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+    if (this.profile.envMode === 'pmrem-room') {
+      const room = new RoomEnvironment();
+      this.envMapTex = pmrem.fromScene(room, 0.04).texture;
+      room.dispose();
+    } else {
+      const studioTex = createFastStudioEnvTexture();
+      this.envSourceTex = studioTex;
+      this.envMapTex = pmrem.fromEquirectangular(studioTex).texture;
+    }
     this.scene.environment = this.envMapTex;
     pmrem.dispose();
 
-    const maxAniso = this.renderer.capabilities.getMaxAnisotropy();
-    this.bank = new MaterialBank(this.isSoftwareGl, maxAniso);
+    this.bank = new MaterialBank(this.isSoftwareGl, this.profile.maxAnisotropy, this.profile.physicalMaterials);
     this.geo = createGeometryBank();
 
     // 3-point + warm subterranean nest lighting
@@ -240,8 +274,10 @@ export class Formicarium3DRenderer {
 
     this.sunLight = new THREE.DirectionalLight(0xfff1d6, 2.2);
     this.sunLight.position.set(8, 16, 14);
-    this.sunLight.castShadow = !this.isSoftwareGl;
-    this.sunLight.shadow.mapSize.set(1024, 1024);
+    this.sunLight.castShadow = this.profile.shadows;
+    if (this.profile.shadowMapSize > 0) {
+      this.sunLight.shadow.mapSize.set(this.profile.shadowMapSize, this.profile.shadowMapSize);
+    }
     this.sunLight.shadow.camera.near = 2;
     this.sunLight.shadow.camera.far = 48;
     this.sunLight.shadow.camera.left = -18;
@@ -263,24 +299,16 @@ export class Formicarium3DRenderer {
     this.scene.add(this.chamberLight);
 
     // Build 3D formicarium case, dynamic 3D soil granules, roots, pebbles
-    this.env3d = new FormicariumEnvironment3D(sim, this.bank, maxAniso, this.isSoftwareGl);
+    this.env3d = new FormicariumEnvironment3D(
+      sim,
+      this.bank,
+      this.profile.maxAnisotropy,
+      this.isSoftwareGl,
+      this.profile.rockSubdiv,
+      this.profile.granuleCapInitial,
+      deferStage
+    );
     this.scene.add(this.env3d.group);
-
-    // Build static 3D surface props & animated sprouts
-    for (const prop of sim.surfaceProps) {
-      const m = createSurfacePropMesh(prop, this.bank, this.geo);
-      m.position.set(simToWorldX(prop.x), simToWorldY(prop.y), 0.10 + Math.sin(prop.seed) * 0.22);
-      this.scene.add(m);
-    }
-    for (const sp of sim.sprouts) {
-      const m = createSproutMesh(sp, this.bank, this.geo);
-      const wx = simToWorldX(sp.x);
-      const wy = simToWorldY(sp.y);
-      const wz = 0.10 + Math.sin(sp.x * 0.23) * 0.34;
-      m.position.set(wx, wy, wz);
-      this.scene.add(m);
-      this.sproutMeshes.push({ mesh: m, phase: sp.swayPhase, baseX: wx, baseY: wy });
-    }
 
     // Create InstancedMeshes for brood, food, droplets, fallen ants, and particles
     const makeInst = (
@@ -343,6 +371,10 @@ export class Formicarium3DRenderer {
     this.batcher = new MeshBatcher(this.scene, !this.isSoftwareGl);
     this.buildSkyExtras();
 
+    if (!deferStage) {
+      this.buildFlora(sim);
+    }
+
     // Flat observation camera: pan, pinch/wheel zoom, tap an ant to follow it. No orbiting.
     this.camCtl = new FlatCameraController(
       this.camera,
@@ -359,13 +391,107 @@ export class Formicarium3DRenderer {
 
     this.camCtl.onModeChange = (m) => {
       if (m === 'drift') this.activity.reset();
+      if (this.bootReady) this.audio.playUiTick();
       this.onCameraMode?.(m);
     };
     this.overlay = new AnnotationOverlay(this.container);
+  }
+
+  private buildFlora(sim: AntColonySimulation): void {
+    if (this.floraBuilt) return;
+    this.floraBuilt = true;
+    for (const prop of sim.surfaceProps) {
+      const m = createSurfacePropMesh(prop, this.bank, this.geo);
+      m.position.set(simToWorldX(prop.x), simToWorldY(prop.y), 0.10 + Math.sin(prop.seed) * 0.22);
+      this.scene.add(m);
+    }
+    for (const sp of sim.sprouts) {
+      const m = createSproutMesh(sp, this.bank, this.geo);
+      const wx = simToWorldX(sp.x);
+      const wy = simToWorldY(sp.y);
+      const wz = 0.10 + Math.sin(sp.x * 0.23) * 0.34;
+      m.position.set(wx, wy, wz);
+      this.scene.add(m);
+      this.sproutMeshes.push({ mesh: m, phase: sp.swayPhase, baseX: wx, baseY: wy });
+    }
+  }
+
+  /**
+   * Executes remaining deferred terrain/flora stages and compiles WebGL shaders cleanly while
+   * streaming accurate progress percentages and stage descriptions to the loading curtain.
+   */
+  public async warmup(
+    sim: AntColonySimulation,
+    onProgress?: (pct: number, stage: string) => void
+  ): Promise<void> {
+    if (this.disposed) return;
+    const yieldFrame = () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+
+    onProgress?.(38, 'Placing stones & roots');
+    await yieldFrame();
+    if (this.disposed) return;
+    this.env3d.buildRocksAndRoots(sim, this.bank, this.isSoftwareGl, this.profile.rockSubdiv);
+
+    onProgress?.(56, 'Sculpting soil & granules');
+    await yieldFrame();
+    if (this.disposed) return;
+    this.env3d.buildInitialTerrain(sim);
+
+    onProgress?.(72, 'Growing surface plants');
+    await yieldFrame();
+    if (this.disposed) return;
+    this.buildFlora(sim);
+
+    onProgress?.(82, 'Populating the colony');
+    await yieldFrame();
+    if (this.disposed) return;
+    this.camCtl.update(1 / 60, null);
+    this.updateCameraFocus(sim);
+    this.updateLightingAndWeather(sim);
+    this.batcher.begin();
+    this.syncAnts(sim, 1 / 60);
+    this.syncIntruders(sim, 1 / 60);
+    this.batcher.end();
+    this.syncInstancedEntities(sim);
+    this.syncCreatures(sim);
+    this.syncSky(sim);
+    this.camera.updateMatrixWorld();
+
+    onProgress?.(88, 'Compiling lighting & shaders');
+    await yieldFrame();
+    if (this.disposed) return;
 
     if (!this.isSoftwareGl) {
-      this.renderer.compile(this.scene, this.camera);
+      if (typeof this.renderer.compileAsync === 'function') {
+        let compiling = true;
+        const startT = performance.now();
+        let lastPulseAt = 0;
+        let lastPct = 88;
+        const pulse = () => {
+          if (!compiling || this.disposed) return;
+          const now = performance.now();
+          const elapsed = (now - startT) / 1000;
+          const pct = Math.floor(88 + 7.5 * (1 - Math.exp(-elapsed / 0.75)));
+          if (now - lastPulseAt >= 100 && pct > lastPct) {
+            lastPulseAt = now;
+            lastPct = pct;
+            onProgress?.(pct, 'Compiling lighting & shaders');
+          }
+          requestAnimationFrame(pulse);
+        };
+        requestAnimationFrame(pulse);
+        try {
+          await this.renderer.compileAsync(this.scene, this.camera);
+        } finally {
+          compiling = false;
+        }
+      } else {
+        this.renderer.compile(this.scene, this.camera);
+      }
     }
+
+    this.bootReady = true;
+    onProgress?.(98, 'Waking the colony');
   }
 
   public get annotationsOn(): boolean {
@@ -679,7 +805,9 @@ export class Formicarium3DRenderer {
     if (!hit) return false;
     const sx = _pick.x / WORLD_SCALE + WORLD_W * 0.5;
     const sy = WORLD_H * 0.5 - _pick.y / WORLD_SCALE;
-    return this.sim.dropFoodFromTap(sx, sy);
+    const dropped = this.sim.dropFoodFromTap(sx, sy);
+    if (dropped) this.audio.playFoodDrop(sx, sy, this.camera, this.camCtl);
+    return dropped;
   }
 
   /** Picks the ant drawn nearest a canvas-local pixel and starts following it. */
@@ -701,6 +829,8 @@ export class Formicarium3DRenderer {
       }
     }
     if (best < 0) return false;
+    const pickedAnt = this.sim.ants.find((a) => a.id === best);
+    if (pickedAnt) this.audio.playTapAnt(pickedAnt.x, this.camera);
     this.camCtl.follow(best);
     return true;
   }
@@ -738,7 +868,10 @@ export class Formicarium3DRenderer {
     const cloud = sim.climate.cloud;
     const weatherDim = clamp(1 - cloud * 0.38 - rain * 0.22 - (sim.weather === 'Fog' ? 0.15 : 0), 0.35, 1);
     // thunderstorms: occasional lightning flashes
-    if (sim.weather === 'Thunderstorm' && this.lightningFlash <= 0 && Math.random() < 0.004) this.lightningFlash = 1;
+    if (sim.weather === 'Thunderstorm' && this.lightningFlash <= 0 && Math.random() < 0.004) {
+      this.lightningFlash = 1;
+      this.pendingLightningAudio = true;
+    }
     const flash = this.lightningFlash > 0 ? Math.max(0, this.lightningFlash) * (0.6 + 0.4 * Math.sin(this.lightningFlash * 40)) : 0;
     this.lightningFlash -= 0.06;
     this.sunLight.intensity = (0.35 + dayFactor * 2.1) * weatherDim * (1 - cloud * 0.35) + flash * 3;
@@ -1391,8 +1524,8 @@ export class Formicarium3DRenderer {
     }
     // drift mode glides toward wherever the colony is busiest
     if (this.camCtl.mode === 'drift') {
-      const hs = this.activity.update(sim, dt);
-      if (hs) this.camCtl.setDriftTarget(simToWorldX(hs.x), simToWorldY(hs.y));
+      const hs = this.activity.update(sim, dt, this.annotator.hasActive());
+      if (hs) this.camCtl.setDriftTarget(simToWorldX(hs.x), simToWorldY(hs.y), hs.dist);
       else this.camCtl.setDriftTarget(null);
     }
     this.camCtl.update(dt, followPos);
@@ -1441,11 +1574,18 @@ export class Formicarium3DRenderer {
     this.camCtl.setCaptionHold(!!note);
     this.overlay?.update(note, note?.subject ? this.locate(sim, note.subject) : null, dt, size);
 
+    const lightningOnset = this.pendingLightningAudio;
+    this.pendingLightningAudio = false;
+    this.audio.update(sim, this.camera, this.camCtl, dt, { lightningOnset });
+
     this.renderer.render(this.scene, this.camera);
   }
 
   public dispose(): void {
     this.disposed = true;
+    this.audio.dispose();
+    this.renderer.domElement.removeEventListener('webglcontextlost', this.handleContextLost);
+    this.renderer.domElement.removeEventListener('webglcontextrestored', this.handleContextRestored);
     this.camCtl.dispose();
     this.overlay?.dispose();
     this.flyTex.dispose();
@@ -1456,6 +1596,7 @@ export class Formicarium3DRenderer {
     this.geo.dispose();
     this.bank.dispose();
     this.envMapTex.dispose();
+    this.envSourceTex?.dispose();
     for (const g of this.instancedGeos) g.dispose();
     for (const m of this.extraMats) m.dispose();
     this.renderer.dispose();

@@ -178,8 +178,8 @@ export class MaterialBank {
   public readonly walnutWood: THREE.MeshStandardMaterial;
   public readonly brushedBrass: THREE.MeshStandardMaterial;
   public readonly studioTable: THREE.MeshStandardMaterial;
-  public readonly frontGlass: THREE.MeshPhysicalMaterial;
-  public readonly sideGlass: THREE.MeshPhysicalMaterial;
+  public readonly frontGlass: THREE.MeshStandardMaterial;
+  public readonly sideGlass: THREE.MeshStandardMaterial;
   public readonly soilFrontMat: THREE.MeshStandardMaterial;
   public readonly soilWallMat: THREE.MeshStandardMaterial;
   public readonly rootMat: THREE.MeshStandardMaterial;
@@ -194,17 +194,17 @@ export class MaterialBank {
 
   // Payloads, foods, brood, droplets
   public readonly seedMat: THREE.MeshStandardMaterial;
-  public readonly honeydewMat: THREE.MeshPhysicalMaterial;
+  public readonly honeydewMat: THREE.MeshStandardMaterial;
   public readonly proteinMat: THREE.MeshStandardMaterial;
   public readonly fungusMat: THREE.MeshStandardMaterial;
   public readonly soilCrumbMat: THREE.MeshStandardMaterial;
   public readonly eggMat: THREE.MeshStandardMaterial;
-  public readonly larvaMat: THREE.MeshPhysicalMaterial;
+  public readonly larvaMat: THREE.MeshStandardMaterial;
   public readonly pupaMat: THREE.MeshStandardMaterial;
-  public readonly waterMat: THREE.MeshPhysicalMaterial;
+  public readonly waterMat: THREE.MeshStandardMaterial;
   public readonly fallenAntMat: THREE.MeshStandardMaterial;
 
-  constructor(isSoftwareGl: boolean, maxAnisotropy: number) {
+  constructor(_isSoftwareGl: boolean, maxAnisotropy: number, physicalMaterials = true) {
     this.soilGrainTex = createSoilGrainTexture(maxAnisotropy);
     this.woodTex = createWoodGrainTexture(maxAnisotropy);
     this.tableTex = createTableSlateTexture(maxAnisotropy);
@@ -296,29 +296,47 @@ export class MaterialBank {
       new THREE.MeshStandardMaterial({ map: this.tableTex, roughness: 0.85, metalness: 0.06 })
     );
     this.frontGlass = reg(
-      new THREE.MeshPhysicalMaterial({
-        color: 0xe6f4ff,
-        roughness: 0.04,
-        metalness: 0.0,
-        transparent: true,
-        opacity: 0.08,
-        ior: 1.52,
-        reflectivity: 0.9,
-        clearcoat: 1.0,
-        depthWrite: false,
-      })
+      physicalMaterials
+        ? new THREE.MeshPhysicalMaterial({
+            color: 0xe6f4ff,
+            roughness: 0.04,
+            metalness: 0.0,
+            transparent: true,
+            opacity: 0.08,
+            ior: 1.52,
+            reflectivity: 0.9,
+            clearcoat: 1.0,
+            depthWrite: false,
+          })
+        : new THREE.MeshStandardMaterial({
+            color: 0xe6f4ff,
+            roughness: 0.04,
+            metalness: 0.14,
+            transparent: true,
+            opacity: 0.09,
+            depthWrite: false,
+          })
     );
     this.sideGlass = reg(
-      new THREE.MeshPhysicalMaterial({
-        color: 0xd2ebfc,
-        roughness: 0.08,
-        metalness: 0.04,
-        transparent: true,
-        opacity: 0.24,
-        ior: 1.52,
-        clearcoat: 0.9,
-        depthWrite: false,
-      })
+      physicalMaterials
+        ? new THREE.MeshPhysicalMaterial({
+            color: 0xd2ebfc,
+            roughness: 0.08,
+            metalness: 0.04,
+            transparent: true,
+            opacity: 0.24,
+            ior: 1.52,
+            clearcoat: 0.9,
+            depthWrite: false,
+          })
+        : new THREE.MeshStandardMaterial({
+            color: 0xd2ebfc,
+            roughness: 0.08,
+            metalness: 0.16,
+            transparent: true,
+            opacity: 0.24,
+            depthWrite: false,
+          })
     );
 
     // Soil & natural terrain
@@ -372,16 +390,26 @@ export class MaterialBank {
       new THREE.MeshStandardMaterial({ color: 0xd9ad62, roughness: 0.62, metalness: 0.04, flatShading: true })
     );
     this.honeydewMat = reg(
-      new THREE.MeshPhysicalMaterial({
-        color: 0xf59e0b,
-        emissive: 0x78350f,
-        emissiveIntensity: 0.22,
-        roughness: 0.14,
-        metalness: 0.05,
-        clearcoat: 1.0,
-        transparent: true,
-        opacity: 0.9,
-      })
+      physicalMaterials
+        ? new THREE.MeshPhysicalMaterial({
+            color: 0xf59e0b,
+            emissive: 0x78350f,
+            emissiveIntensity: 0.22,
+            roughness: 0.14,
+            metalness: 0.05,
+            clearcoat: 1.0,
+            transparent: true,
+            opacity: 0.9,
+          })
+        : new THREE.MeshStandardMaterial({
+            color: 0xf59e0b,
+            emissive: 0x78350f,
+            emissiveIntensity: 0.22,
+            roughness: 0.12,
+            metalness: 0.08,
+            transparent: true,
+            opacity: 0.9,
+          })
     );
     this.proteinMat = reg(
       new THREE.MeshStandardMaterial({ color: 0xbe6d58, roughness: 0.52, metalness: 0.06, flatShading: true })
@@ -403,28 +431,44 @@ export class MaterialBank {
       new THREE.MeshStandardMaterial({ color: 0xf6f0de, roughness: 0.34, metalness: 0.02, flatShading: false })
     );
     this.larvaMat = reg(
-      new THREE.MeshPhysicalMaterial({
-        color: 0xffffff,
-        vertexColors: true,
-        roughness: 0.34,
-        metalness: 0.01,
-        clearcoat: 0.42,
-        clearcoatRoughness: 0.36,
-        flatShading: false,
-      })
+      physicalMaterials
+        ? new THREE.MeshPhysicalMaterial({
+            color: 0xffffff,
+            vertexColors: true,
+            roughness: 0.34,
+            metalness: 0.01,
+            clearcoat: 0.42,
+            clearcoatRoughness: 0.36,
+            flatShading: false,
+          })
+        : new THREE.MeshStandardMaterial({
+            color: 0xffffff,
+            vertexColors: true,
+            roughness: 0.28,
+            metalness: 0.02,
+            flatShading: false,
+          })
     );
     this.pupaMat = reg(
       new THREE.MeshStandardMaterial({ color: 0xcba675, roughness: 0.62, metalness: 0.02, flatShading: false })
     );
     this.waterMat = reg(
-      new THREE.MeshPhysicalMaterial({
-        color: 0xbae6fd,
-        roughness: 0.06,
-        metalness: 0.02,
-        transparent: true,
-        opacity: 0.8,
-        clearcoat: 1.0,
-      })
+      physicalMaterials
+        ? new THREE.MeshPhysicalMaterial({
+            color: 0xbae6fd,
+            roughness: 0.06,
+            metalness: 0.02,
+            transparent: true,
+            opacity: 0.8,
+            clearcoat: 1.0,
+          })
+        : new THREE.MeshStandardMaterial({
+            color: 0xbae6fd,
+            roughness: 0.06,
+            metalness: 0.1,
+            transparent: true,
+            opacity: 0.8,
+          })
     );
     this.wingMat = reg(
       new THREE.MeshStandardMaterial({

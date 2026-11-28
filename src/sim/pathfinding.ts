@@ -39,6 +39,7 @@ export class ColonyGrid {
   private heapScore: Float32Array;
   private visitStamp: Uint32Array;
   private currentStamp: number = 1;
+  private moistAccum: number = 0;
 
   constructor() {
     const size = GRID_W * GRID_H;
@@ -664,84 +665,92 @@ export class ColonyGrid {
     const alarmDecay = Math.exp(-0.22 * dt);
     const digDecay = Math.exp(-0.012 * dt);
 
+    const food = this.foodPheromone;
+    const home = this.homePheromone;
+    const alarm = this.alarmPheromone;
+    const dig = this.digCue;
+    const terrain = this.terrain;
+
     const len = GRID_W * GRID_H;
     for (let i = 0; i < len; i++) {
-      if (this.foodPheromone[i] > 0.002) {
-        this.foodPheromone[i] *= foodDecay;
-      } else {
-        this.foodPheromone[i] = 0;
-      }
-      if (this.homePheromone[i] > 0.002) {
-        this.homePheromone[i] *= homeDecay;
-      } else {
-        this.homePheromone[i] = 0;
-      }
-      if (this.alarmPheromone[i] > 0.003) {
-        this.alarmPheromone[i] *= alarmDecay;
-      } else {
-        this.alarmPheromone[i] = 0;
-      }
-      if (this.digCue[i] > 0.002) {
-        // Dig cues stay active longer inside solid soil until excavated
-        if (this.terrain[i] === CellType.TUNNEL || this.terrain[i] === CellType.AIR) {
-          this.digCue[i] = 0;
+      const fv = food[i];
+      if (fv !== 0) food[i] = fv > 0.002 ? fv * foodDecay : 0;
+      const hv = home[i];
+      if (hv !== 0) home[i] = hv > 0.002 ? hv * homeDecay : 0;
+      const av = alarm[i];
+      if (av !== 0) alarm[i] = av > 0.003 ? av * alarmDecay : 0;
+      const dv = dig[i];
+      if (dv !== 0) {
+        if (dv <= 0.002 || terrain[i] === CellType.TUNNEL || terrain[i] === CellType.AIR) {
+          dig[i] = 0;
         } else {
-          this.digCue[i] *= digDecay;
+          dig[i] = dv * digDecay;
         }
-      } else {
-        this.digCue[i] = 0;
       }
     }
 
-    // Subterranean moisture percolation & evaporation (subsampled per frame for speed)
-    const rainBonus = rain > 0 ? 0.1 * rain * dt : fog ? 0.025 * dt : 0;
-    const evap = rain > 0 || fog ? 0.0015 * dt : (0.003 + dryness * 0.008) * dt;
+    // Subterranean moisture percolation & evaporation change slowly; run at ~2 Hz to eliminate per-frame spikes
+    this.moistAccum += dt;
+    if (this.moistAccum < 0.45) return;
+    const mDt = this.moistAccum;
+    this.moistAccum = 0;
+
+    const moisture = this.moisture;
+    const surfaceY = this.surfaceY;
+    const rainBonus = rain > 0 ? 0.1 * rain * mDt : fog ? 0.025 * mDt : 0;
+    const evap = rain > 0 || fog ? 0.0015 * mDt : (0.003 + dryness * 0.008) * mDt;
 
     for (let gx = 8; gx < GRID_W - 8; gx++) {
-      const surfGy = Math.floor(this.surfaceY[gx] / CELL_SIZE);
+      const surfGy = Math.floor(surfaceY[gx] / CELL_SIZE);
       if (rainBonus > 0 && surfGy >= 0 && surfGy < GRID_H) {
         const si = surfGy * GRID_W + gx;
-        this.moisture[si] = Math.min(1, this.moisture[si] + rainBonus);
+        moisture[si] = Math.min(1, moisture[si] + rainBonus);
       }
     }
 
     // Percolate moisture slowly downward & laterally
     for (let gy = GRID_H - 10; gy >= 35; gy--) {
+      const row = gy * GRID_W;
+      const surfThresh = gy * CELL_SIZE - 12;
       for (let gx = 9; gx < GRID_W - 9; gx++) {
-        const i = gy * GRID_W + gx;
-        const t = this.terrain[i];
+        const i = row + gx;
+        const t = terrain[i];
         if (t === CellType.AIR || t === CellType.GLASS_WALL || t === CellType.PEBBLE) continue;
 
-        let m = this.moisture[i];
+        let m = moisture[i];
         if (t === CellType.TUNNEL) {
-          m = Math.max(0.05, m - evap * 0.8);
-          this.moisture[i] = m;
+          moisture[i] = Math.max(0.05, m - evap * 0.8);
           continue;
         }
 
         // Topsoil evaporates slightly when clear
-        if (gy * CELL_SIZE <= this.surfaceY[gx] + 12) {
+        if (surfThresh <= surfaceY[gx]) {
           m = Math.max(0.08, m - evap);
         }
 
         // Gravity percolation into cell below
-        const belowIdx = (gy + 1) * GRID_W + gx;
-        const belowT = this.terrain[belowIdx];
-        if (belowT !== CellType.GLASS_WALL && belowT !== CellType.PEBBLE && m > this.moisture[belowIdx] + 0.04) {
-          const transfer = (m - this.moisture[belowIdx]) * 0.09 * dt;
-          m -= transfer;
-          this.moisture[belowIdx] = Math.min(1, this.moisture[belowIdx] + transfer);
+        const belowIdx = i + GRID_W;
+        const belowT = terrain[belowIdx];
+        if (belowT !== CellType.GLASS_WALL && belowT !== CellType.PEBBLE) {
+          const belowM = moisture[belowIdx];
+          if (m > belowM + 0.04) {
+            const transfer = (m - belowM) * 0.09 * mDt;
+            m -= transfer;
+            moisture[belowIdx] = Math.min(1, belowM + transfer);
+          }
         }
 
         // Lateral diffusion
         const rightIdx = i + 1;
-        if (this.terrain[rightIdx] !== CellType.GLASS_WALL && this.terrain[rightIdx] !== CellType.AIR) {
-          const diff = (m - this.moisture[rightIdx]) * 0.05 * dt;
+        const rightT = terrain[rightIdx];
+        if (rightT !== CellType.GLASS_WALL && rightT !== CellType.AIR) {
+          const rightM = moisture[rightIdx];
+          const diff = (m - rightM) * 0.05 * mDt;
           m -= diff;
-          this.moisture[rightIdx] = Math.max(0, Math.min(1, this.moisture[rightIdx] + diff));
+          moisture[rightIdx] = Math.max(0, Math.min(1, rightM + diff));
         }
 
-        this.moisture[i] = Math.max(0.05, Math.min(1, m));
+        moisture[i] = Math.max(0.05, Math.min(1, m));
       }
     }
   }

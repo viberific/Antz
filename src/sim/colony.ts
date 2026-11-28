@@ -37,9 +37,9 @@ function clamp(v: number, min: number, max: number): number {
 }
 
 function wrapAngle(a: number): number {
-  while (a > Math.PI) a -= Math.PI * 2;
-  while (a < -Math.PI) a += Math.PI * 2;
-  return a;
+  if (!Number.isFinite(a)) return 0;
+  const twoPi = Math.PI * 2;
+  return ((a + Math.PI) % twoPi + twoPi) % twoPi - Math.PI;
 }
 
 function lerpAngle(a: number, b: number, t: number): number {
@@ -50,7 +50,7 @@ function lerpAngle(a: number, b: number, t: number): number {
 /** Sustainable colony size: roughly what the surface food supply (and the renderer) can carry. */
 const MAX_COLONY = 160;
 const MAX_BROOD = 60;
-const SIDE_ENTRANCE_X = 405;
+export const SIDE_ENTRANCE_X = 405;
 /** sim seconds per day/night cycle when no real clock is available (tests / headless runs) */
 const DAY_LENGTH = 200;
 
@@ -280,7 +280,7 @@ export class AntColonySimulation {
   private queenlessTimer = 120;
   private lastFamineLog = -999;
   private sealTimer = 0;
-  private sealed = false;
+  public sealed = false;
   private sealedCells: number[] = [];
   /** A* searches still allowed this step */
   private pathBudget = 0;
@@ -288,12 +288,15 @@ export class AntColonySimulation {
   // --- flow fields ------------------------------------------------------------------------------------------------
   private fields: Record<FieldKey, Float32Array>;
   private fieldDirty: Record<FieldKey, boolean>;
+  private fieldReady: Record<FieldKey, boolean>;
   private fieldAge: Record<FieldKey, number>;
   private fieldTerrainVersion = -1;
+  public needsInitialSave = false;
 
   // --- per-step caches --------------------------------------------------------------------------------------------
-  private hashHead = new Int32Array(HASH_W * HASH_H);
-  private hashNext = new Int32Array(1024);
+  private hashHead = new Int32Array(HASH_W * HASH_H).fill(-1);
+  private hashNext = new Int32Array(1024).fill(-1);
+  private hashDirty = true;
   private storedFoodCache = 0;
   private claimedBrood = new Set<number>();
   private claimedDig = new Set<number>();
@@ -317,9 +320,11 @@ export class AntColonySimulation {
       threat: mk(),
     };
     this.fieldDirty = {} as Record<FieldKey, boolean>;
+    this.fieldReady = {} as Record<FieldKey, boolean>;
     this.fieldAge = {} as Record<FieldKey, number>;
     for (const k of Object.keys(this.fields) as FieldKey[]) {
       this.fieldDirty[k] = true;
+      this.fieldReady[k] = false;
       this.fieldAge[k] = 99;
     }
     try {
@@ -329,12 +334,16 @@ export class AntColonySimulation {
     }
     if (!this.loadState()) {
       this.initWorld();
-      this.saveState();
+      this.needsInitialSave = true;
     }
-    for (const k of Object.keys(this.fields) as FieldKey[]) this.rebuildField(k);
+    // Warm only core navigation fields upfront; remaining fields warm 1-per-tick (or on demand via ensureField).
+    this.rebuildField('surface');
+    this.rebuildField('royal');
+    this.rebuildField('nursery');
     this.fieldTerrainVersion = this.grid.terrainVersion;
     // treat the whole existing nest as freshly used so nothing falls in the moment the game opens
     this.lastVisit.fill(this.simTime);
+    this.buildHash();
   }
 
   private allocId(): number {
@@ -978,6 +987,7 @@ export class AntColonySimulation {
     if (caste === AntCaste.SOLDIER) ant.bold = Math.max(ant.bold ?? 0.5, 0.65);
     ant.speed *= 0.93 + (ant.industry ?? 0.5) * 0.14;
     this.ants.push(ant);
+    this.hashDirty = true;
     return ant;
   }
 
@@ -1079,6 +1089,7 @@ export class AntColonySimulation {
       this.pherAccum = 0;
     }
 
+    this.buildHash();
     this.updateFields(dt);
     this.stepDroplets(dt);
     this.stepEcosystem(dt);
@@ -1507,6 +1518,13 @@ export class AntColonySimulation {
       for (const k of STATIC_FIELDS) this.fieldDirty[k] = true;
       this.fieldDirty.dig = true;
     }
+    // Background warmup: build 1 remaining startup field per step until all 10 are ready.
+    for (const k of Object.keys(this.fields) as FieldKey[]) {
+      if (!this.fieldReady[k]) {
+        this.rebuildField(k);
+        return;
+      }
+    }
     if (this.intruders.length > 0 || this.fieldDirty.threat) {
       if (this.fieldAge.threat > 0.35) this.rebuildField('threat');
     }
@@ -1637,7 +1655,13 @@ export class AntColonySimulation {
     if (sources.length === 0) f.fill(INF);
     else this.grid.buildFlowField(f, sources, costs);
     this.fieldDirty[k] = false;
+    this.fieldReady[k] = true;
     this.fieldAge[k] = 0;
+  }
+
+  private ensureField(k: FieldKey): Float32Array {
+    if (!this.fieldReady[k]) this.rebuildField(k);
+    return this.fields[k];
   }
 
   private antCell(ant: { x: number; y: number }): number {
@@ -1651,7 +1675,7 @@ export class AntColonySimulation {
   }
 
   private fieldDist(k: FieldKey, x: number, y: number): number {
-    return this.fields[k][this.antCell({ x, y })];
+    return this.ensureField(k)[this.antCell({ x, y })];
   }
 
   /** Builds a short downhill route on a flow field. Returns the remaining cost at the ant's cell. */
@@ -1662,7 +1686,7 @@ export class AntColonySimulation {
       ant.pathIndex = 0;
     }
     ant.targetPos = null;
-    const f = this.fields[k];
+    const f = this.ensureField(k);
     let i = this.antCell(ant);
     let d = f[i];
     const path: Vec2[] = [];
@@ -1803,7 +1827,11 @@ export class AntColonySimulation {
 
   private buildHash(): void {
     this.hashHead.fill(-1);
-    if (this.hashNext.length < this.ants.length) this.hashNext = new Int32Array(this.ants.length * 2);
+    if (this.hashNext.length < this.ants.length) {
+      this.hashNext = new Int32Array(Math.max(1024, this.ants.length * 2)).fill(-1);
+    } else if (this.ants.length > 0) {
+      this.hashNext.fill(-1, 0, this.ants.length);
+    }
     for (let i = 0; i < this.ants.length; i++) {
       const a = this.ants[i];
       const hx = clamp(Math.floor(a.x / HASH_CELL), 0, HASH_W - 1);
@@ -1812,26 +1840,32 @@ export class AntColonySimulation {
       this.hashNext[i] = this.hashHead[h];
       this.hashHead[h] = i;
     }
+    this.hashDirty = false;
   }
 
   /** Calls `cb` for every ant within `r` of (x, y). Return true from cb to stop early. */
   private forAntsNear(x: number, y: number, r: number, cb: (a: Ant) => boolean | void): void {
+    if (this.hashDirty) this.buildHash();
     const x0 = clamp(Math.floor((x - r) / HASH_CELL), 0, HASH_W - 1);
     const x1 = clamp(Math.floor((x + r) / HASH_CELL), 0, HASH_W - 1);
     const y0 = clamp(Math.floor((y - r) / HASH_CELL), 0, HASH_H - 1);
     const y1 = clamp(Math.floor((y + r) / HASH_CELL), 0, HASH_H - 1);
     const r2 = r * r;
+    const n = this.ants.length;
     for (let hy = y0; hy <= y1; hy++) {
       for (let hx = x0; hx <= x1; hx++) {
         let i = this.hashHead[hy * HASH_W + hx];
-        while (i !== -1) {
+        let guard = 0;
+        while (i >= 0 && i < n && guard++ < n) {
           const a = this.ants[i];
           if (a) {
             const dx = a.x - x;
             const dy = a.y - y;
             if (dx * dx + dy * dy <= r2 && cb(a)) return;
           }
-          i = this.hashNext[i];
+          const next = this.hashNext[i];
+          if (next === i) break;
+          i = next;
         }
       }
     }
@@ -3062,6 +3096,12 @@ export class AntColonySimulation {
 
       const g = this.grid.worldToGrid(m.x, m.y);
       const underground = m.y > this.grid.surfaceY[g.gx] + 8 || this.grid.terrain[this.grid.idx(g.gx, g.gy)] === CellType.TUNNEL;
+      const mainSurfY = this.grid.surfaceY[clamp(Math.floor(this.entrancePos.x / CELL_SIZE), 0, GRID_W - 1)];
+      const sideSurfY = this.grid.surfaceY[clamp(Math.floor(SIDE_ENTRANCE_X / CELL_SIZE), 0, GRID_W - 1)];
+      const inEntranceZone =
+        (Math.abs(m.x - this.entrancePos.x) < 46 && m.y >= mainSurfY - 12 && m.y <= mainSurfY + 26) ||
+        (Math.abs(m.x - SIDE_ENTRANCE_X) < 36 && m.y >= sideSurfY - 12 && m.y <= sideSurfY + 24);
+      const ci = this.antCell(m);
       const shelterX = (m.homeEdge ?? 'left') === 'left' ? CASE_LEFT + 72 : CASE_RIGHT - 72;
 
       // pick where to go
@@ -3069,8 +3109,12 @@ export class AntColonySimulation {
       let goalX = this.entrancePos.x;
       let directTarget: Vec2 | null = null;
       if (retreating) {
-        if (underground) fieldKey = 'surface';
-        else goalX = shelterX;
+        const surfDist = this.fields.surface[ci];
+        if (underground && (surfDist < INF || this.nearestOnField(this.fields.surface, ci, 3) >= 0) && surfDist > 0.5) {
+          fieldKey = 'surface';
+        } else {
+          goalX = shelterX;
+        }
       } else {
         let prey: Ant | null = null;
         if (m.behavior === 'hunting_ants') {
@@ -3098,8 +3142,9 @@ export class AntColonySimulation {
         }
         if (prey) {
           const p = prey as Ant;
-          if (underground) directTarget = { x: p.x, y: p.y };
-          else goalX = p.x;
+          const sameSideSurface = !underground && !inEntranceZone && this.isOutside(p.x, p.y) && Math.abs(p.x - this.entrancePos.x) > 40 && Math.abs(p.x - SIDE_ENTRANCE_X) > 32;
+          if (sameSideSurface) goalX = p.x;
+          else directTarget = { x: p.x, y: p.y };
         } else if (food) {
           goalX = food.x;
           if (Math.abs(food.x - m.x) < 10 && Math.abs(food.y - m.y) < 12) {
@@ -3113,8 +3158,37 @@ export class AntColonySimulation {
         } else {
           // raid inside the nest
           const key: FieldKey = m.species === 'mite' || m.species === 'centipede' ? 'nursery' : 'granary';
-          if (underground || Math.abs(m.x - this.entrancePos.x) < 22 || Math.abs(m.x - SIDE_ENTRANCE_X) < 18) fieldKey = key;
-          else goalX = Math.abs(m.x - SIDE_ENTRANCE_X) < Math.abs(m.x - this.entrancePos.x) * 0.6 ? SIDE_ENTRANCE_X : this.entrancePos.x;
+          const targetField = this.ensureField(key);
+          const nestReachable = targetField[ci] < INF || this.nearestOnField(targetField, ci, 4) >= 0;
+          if ((underground || inEntranceZone) && nestReachable) {
+            fieldKey = key;
+          } else if (nestReachable) {
+            const mainCell = this.antCell({ x: this.entrancePos.x, y: mainSurfY + 6 });
+            const sideCell = this.antCell({ x: SIDE_ENTRANCE_X, y: sideSurfY + 6 });
+            const mainOpen = targetField[mainCell] < INF || this.nearestOnField(targetField, mainCell, 3) >= 0;
+            const sideOpen = targetField[sideCell] < INF || this.nearestOnField(targetField, sideCell, 3) >= 0;
+            if (mainOpen && !sideOpen) goalX = this.entrancePos.x;
+            else if (sideOpen && !mainOpen) goalX = SIDE_ENTRANCE_X;
+            else goalX = Math.abs(m.x - SIDE_ENTRANCE_X) < Math.abs(m.x - this.entrancePos.x) * 0.65 ? SIDE_ENTRANCE_X : this.entrancePos.x;
+          } else {
+            // Entrances are sealed or blocked: hunt surface ants or patrol outside instead of jamming at the door
+            let surfacePrey: Ant | null = null;
+            let bestD = 360;
+            this.forAntsNear(m.x, m.y, 360, (a) => {
+              if (a.caste === AntCaste.QUEEN || !this.isOutside(a.x, a.y)) return;
+              const d = Math.abs(a.x - m.x);
+              if (d < bestD) {
+                bestD = d;
+                surfacePrey = a;
+              }
+            });
+            if (surfacePrey) {
+              goalX = (surfacePrey as Ant).x;
+            } else {
+              goalX = this.entrancePos.x + Math.sin(this.simTime * 0.45 + m.id) * 70;
+              if (!m.warrior && (m.age ?? 0) > 35) m.behavior = 'retreating';
+            }
+          }
           if (underground) {
             // steal from the granary / prey on brood once there
             if (key === 'granary') {
@@ -3143,21 +3217,31 @@ export class AntColonySimulation {
 
       // movement
       if (fieldKey) {
-        const f = this.fields[fieldKey];
-        const ci = this.antCell(m);
+        const f = this.ensureField(fieldKey);
         if (!m.path || (m.pathIndex ?? 0) >= m.path.length) {
-          const nxt = this.grid.descend(f, ci);
-          const nxt2 = nxt >= 0 ? this.grid.descend(f, nxt) : -1;
+          let cur = ci;
           m.path = [];
-          for (const c of [nxt, nxt2]) {
-            if (c < 0) break;
-            const gx = c % GRID_W;
-            m.path.push(this.grid.gridToWorld(gx, (c - gx) / GRID_W));
+          if (f[cur] >= INF) {
+            const near = this.nearestOnField(f, cur, 4);
+            if (near >= 0) {
+              cur = near;
+              const nx = near % GRID_W;
+              m.path.push(this.grid.gridToWorld(nx, (near - nx) / GRID_W));
+            }
+          }
+          if (f[cur] < INF) {
+            for (let s = 0; s < 4; s++) {
+              const nxt = this.grid.descend(f, cur);
+              if (nxt < 0) break;
+              cur = nxt;
+              const gx = cur % GRID_W;
+              m.path.push(this.grid.gridToWorld(gx, (cur - gx) / GRID_W));
+              if (f[cur] <= 0) break;
+            }
           }
           m.pathIndex = 0;
           if (m.path.length === 0 && f[ci] <= 0.5 && fieldKey === 'surface') {
-            // reached open ground: walk home along the surface next step
-            m.y = this.grid.surfaceY[g.gx] - 3;
+            m.y = this.grid.surfaceY[g.gx] - 2.5;
           }
         }
         const wp = m.path && (m.pathIndex ?? 0) < m.path.length ? m.path[m.pathIndex ?? 0] : directTarget;
@@ -3177,15 +3261,24 @@ export class AntColonySimulation {
         m.path = [];
         const dir = goalX >= m.x ? 1 : -1;
         if (Math.abs(goalX - m.x) > 2) {
-          const nx = clamp(m.x + dir * speed * dt, CASE_LEFT + 16, CASE_RIGHT - 16);
-          const surfY = this.grid.surfaceY[clamp(Math.floor(nx / CELL_SIZE), 0, GRID_W - 1)] - 2.5;
-          m.x = nx;
-          m.y = m.y + (surfY - m.y) * Math.min(1, dt * 10);
-          m.angle = dir > 0 ? 0 : Math.PI;
+          const look = Math.min(Math.abs(goalX - m.x), Math.max(CELL_SIZE, speed * dt));
+          const stepX = clamp(m.x + dir * look, CASE_LEFT + 16, CASE_RIGHT - 16);
+          const surfY = this.grid.surfaceY[clamp(Math.floor(stepX / CELL_SIZE), 0, GRID_W - 1)] - 2.0;
+          this.moveIntruderToward(m, stepX, surfY, speed, dt);
         }
       }
 
-      this.unstickIntruder(m, dt, goalX, directTarget !== null || fieldKey !== null);
+      const activeField = fieldKey ? this.ensureField(fieldKey) : null;
+      const wpGoal = m.path && (m.pathIndex ?? 0) < m.path.length ? m.path[m.pathIndex ?? 0] : directTarget;
+      this.unstickIntruder(
+        m,
+        dt,
+        goalX,
+        underground || inEntranceZone,
+        retreating,
+        activeField,
+        wpGoal ?? { x: goalX, y: this.grid.surfaceY[clamp(Math.floor(goalX / CELL_SIZE), 0, GRID_W - 1)] - 2 }
+      );
 
       const cg = this.grid.worldToGrid(m.x, m.y);
       if (this.grid.isSolid(cg.gx, cg.gy) || !this.grid.isNavigable(cg.gx, cg.gy)) {
@@ -3259,12 +3352,26 @@ export class AntColonySimulation {
    * other). After a few seconds it forgets its route and hops to the nearest open ground toward the goal; if that
    * does not help either, it gives up and heads home.
    */
-  private unstickIntruder(m: Intruder, dt: number, goalX: number, underground: boolean): void {
+  private unstickIntruder(
+    m: Intruder,
+    dt: number,
+    goalX: number,
+    inPassage: boolean,
+    retreating: boolean,
+    field: Float32Array | null,
+    targetPos: Vec2
+  ): void {
     const idle = m.warrior && m.holdPost !== undefined && !m.roamed;
-    const fighting = m.attackCooldown > 0 || this.countAntsNear(m.x, m.y, 16) > 0;
-    const sx = m.stuckX ?? m.x;
-    const sy = m.stuckY ?? m.y;
-    if (idle || fighting || Math.hypot(m.x - sx, m.y - sy) > 4 || (!underground && Math.abs(goalX - m.x) <= 6)) {
+    const activelyBiting = !retreating && m.attackCooldown > 0.25;
+    if (m.stuckX === undefined || m.stuckY === undefined) {
+      m.stuckX = m.x;
+      m.stuckY = m.y;
+      m.stuckFor = 0;
+      return;
+    }
+    const sx = m.stuckX;
+    const sy = m.stuckY;
+    if (idle || activelyBiting || Math.hypot(m.x - sx, m.y - sy) > 4 || (!inPassage && Math.abs(goalX - m.x) <= 6)) {
       m.stuckX = m.x;
       m.stuckY = m.y;
       m.stuckFor = 0;
@@ -3275,12 +3382,41 @@ export class AntColonySimulation {
     m.path = [];
     m.pathIndex = 0;
     m.lastPathTime = -10;
-    const g = this.grid.worldToGrid(m.x + (goalX >= m.x ? 12 : -12), m.y - 6);
-    const hop = this.grid.findNearestNavigable(g.gx, g.gy, 6);
-    if (hop) {
-      const w = this.grid.gridToWorld(hop.gx, hop.gy);
-      m.x = w.x;
-      m.y = w.y;
+    const mg = this.grid.worldToGrid(m.x, m.y);
+    let hopped = false;
+    if (field) {
+      let bestIdx = -1;
+      let bestCost = field[this.antCell(m)];
+      for (let dy = -5; dy <= 5; dy++) {
+        for (let dx = -5; dx <= 5; dx++) {
+          const nx = mg.gx + dx;
+          const ny = mg.gy + dy;
+          if (!this.grid.inBounds(nx, ny)) continue;
+          const idx = ny * GRID_W + nx;
+          if (!this.grid.nav[idx] || this.grid.isSolid(nx, ny)) continue;
+          if (field[idx] < bestCost - 0.5) {
+            bestCost = field[idx];
+            bestIdx = idx;
+          }
+        }
+      }
+      if (bestIdx >= 0) {
+        const w = this.grid.gridToWorld(bestIdx % GRID_W, Math.floor(bestIdx / GRID_W));
+        m.x = w.x;
+        m.y = w.y;
+        hopped = true;
+      }
+    }
+    if (!hopped) {
+      const dirX = Math.sign(targetPos.x - m.x || (goalX >= m.x ? 1 : -1));
+      const dirY = Math.sign(targetPos.y - m.y);
+      const g = this.grid.worldToGrid(m.x + dirX * 12, m.y + dirY * 6);
+      const hop = this.grid.findNearestNavigable(g.gx, g.gy, 6);
+      if (hop) {
+        const w = this.grid.gridToWorld(hop.gx, hop.gy);
+        m.x = w.x;
+        m.y = w.y;
+      }
     }
     m.stuckX = m.x;
     m.stuckY = m.y;
@@ -3293,25 +3429,65 @@ export class AntColonySimulation {
     const dx = tx - m.x;
     const dy = ty - m.y;
     const dist = Math.hypot(dx, dy);
-    if (dist < 1) {
+    if (dist < 1.2) {
       m.pathIndex = (m.pathIndex ?? 0) + 1;
       return;
     }
-    if (dist < 4 && m.path && (m.pathIndex ?? 0) < m.path.length) m.pathIndex = (m.pathIndex ?? 0) + 1;
+    if (dist < 4.5 && m.path && (m.pathIndex ?? 0) < m.path.length) m.pathIndex = (m.pathIndex ?? 0) + 1;
     const a = Math.atan2(dy, dx);
     const step = Math.min(dist, speed * dt);
-    const nx = m.x + Math.cos(a) * step;
-    const ny = m.y + Math.sin(a) * step;
-    const ng = this.grid.worldToGrid(nx, ny);
-    if (this.grid.isNavigable(ng.gx, ng.gy)) {
+    const nx = clamp(m.x + Math.cos(a) * step, CASE_LEFT + 16, CASE_RIGHT - 16);
+    const ny = clamp(m.y + Math.sin(a) * step, CASE_TOP + 12, CASE_BOTTOM - 12);
+    const isOpen = (px: number, py: number) => {
+      const g = this.grid.worldToGrid(px, py);
+      return !this.grid.isSolid(g.gx, g.gy) && this.grid.isNavigable(g.gx, g.gy);
+    };
+    const climbY = m.y - Math.max(2.6, step * 1.25);
+    if (isOpen(nx, ny)) {
       m.x = nx;
       m.y = ny;
+    } else if (dy > 1 && isOpen(m.x, ny)) {
+      m.y = ny;
+    } else if (dy <= 1 && isOpen(nx, climbY)) {
+      m.x = nx;
+      m.y = climbY;
+    } else if (dy <= 1 && isOpen(m.x, climbY)) {
+      m.y = climbY;
+    } else if (isOpen(nx, m.y)) {
+      m.x = nx;
+    } else if (isOpen(m.x, ny)) {
+      m.y = ny;
     } else {
-      const gX = this.grid.worldToGrid(nx, m.y);
-      const gY = this.grid.worldToGrid(m.x, ny);
-      if (this.grid.isNavigable(gX.gx, gX.gy)) m.x = nx;
-      else if (this.grid.isNavigable(gY.gx, gY.gy)) m.y = ny;
-      else m.path = [];
+      // Corner-round toward the best open adjacent cell in the target's direction
+      const cg = this.grid.worldToGrid(m.x, m.y);
+      let bestX = m.x;
+      let bestY = m.y;
+      let bestScore = Infinity;
+      for (let oy = -1; oy <= 1; oy++) {
+        for (let ox = -1; ox <= 1; ox++) {
+          if (ox === 0 && oy === 0) continue;
+          const cx = cg.gx + ox;
+          const cy = cg.gy + oy;
+          if (!this.grid.inBounds(cx, cy) || this.grid.isSolid(cx, cy) || !this.grid.isNavigable(cx, cy)) continue;
+          const w = this.grid.gridToWorld(cx, cy);
+          const sc = Math.hypot(tx - w.x, ty - w.y);
+          if (sc < bestScore) {
+            bestScore = sc;
+            bestX = w.x;
+            bestY = w.y;
+          }
+        }
+      }
+      if (bestScore < Infinity) {
+        const ba = Math.atan2(bestY - m.y, bestX - m.x);
+        const bx = m.x + Math.cos(ba) * Math.min(step, Math.hypot(bestX - m.x, bestY - m.y));
+        const by = m.y + Math.sin(ba) * Math.min(step, Math.hypot(bestX - m.x, bestY - m.y));
+        if (isOpen(bx, by)) {
+          m.x = bx;
+          m.y = by;
+        }
+      }
+      m.path = [];
     }
     m.angle = lerpAngle(m.angle, a, Math.min(1, dt * 10));
   }
@@ -3371,7 +3547,9 @@ export class AntColonySimulation {
       a: { id: number; x: number; y: number },
       b: { id: number; x: number; y: number },
       minDist: number,
-      strength: number
+      strength: number,
+      weightA = 1,
+      weightB = 1
     ) => {
       let dx = b.x - a.x;
       let dy = b.y - a.y;
@@ -3390,14 +3568,14 @@ export class AntColonySimulation {
       const push = Math.min(0.9 * dt * 60, overlap * strength * Math.min(1, dt * 18));
       const sign = a.id < b.id ? 1 : -1;
       const dodge = push * 0.9 * sign;
-      const ax = a.x - dx * push - dy * dodge;
-      const ay = a.y - dy * push + dx * dodge;
+      const ax = a.x - (dx * push + dy * dodge) * weightA;
+      const ay = a.y - (dy * push - dx * dodge) * weightA;
       if (canOccupy(ax, ay)) {
         a.x = ax;
         a.y = ay;
       }
-      const bx = b.x + dx * push + dy * dodge;
-      const by = b.y + dy * push - dx * dodge;
+      const bx = b.x + (dx * push + dy * dodge) * weightB;
+      const by = b.y + (dy * push - dx * dodge) * weightB;
       if (canOccupy(bx, by)) {
         b.x = bx;
         b.y = by;
@@ -3424,9 +3602,12 @@ export class AntColonySimulation {
         if (Math.abs(m.x - o.x) > 16 || Math.abs(m.y - o.y) > 16) continue;
         nudgePair(m, o, 12, 0.65);
       }
-      const standoff = m.species === 'rival_ant' || m.species === 'mite' ? 9.0 : 12.0;
+      const small = m.species === 'rival_ant' || m.species === 'mite';
+      const standoff = small ? 8.0 : 10.5;
+      const pushStr = m.behavior === 'retreating' ? 0.35 : 0.48;
+      const intruderYield = small ? 0.3 : 0.12;
       this.forAntsNear(m.x, m.y, standoff, (a) => {
-        if (!this.pinned(a)) nudgePair(a, m, standoff, 0.65);
+        if (!this.pinned(a)) nudgePair(a, m, standoff, pushStr, 1.0, intruderYield);
       });
     }
   }
@@ -3479,6 +3660,7 @@ export class AntColonySimulation {
       });
     }
     this.ants.splice(index, 1);
+    this.hashDirty = true;
     if (ant.caste === AntCaste.QUEEN) this.log('The queen has died! The colony cannot raise new workers', 'danger');
     else if (cause === 'buried') this.log('A buried worker suffocated before it could be dug out', 'danger');
     else if (cause === 'combat') this.log(`${/^[aeiou]/i.test(ant.caste) ? 'An' : 'A'} ${ant.caste.toLowerCase()} fell defending the colony`, 'danger');
@@ -4923,6 +5105,7 @@ export class AntColonySimulation {
     if (ant.y < CASE_TOP + 6 || ant.x < CASE_LEFT + 4 || ant.x > CASE_RIGHT - 4) {
       this.unlinkAnt(ant);
       this.ants.splice(index, 1);
+      this.hashDirty = true;
       this.counters.flights++;
       return false;
     }
@@ -6429,6 +6612,7 @@ export class AntColonySimulation {
       for (const fa of this.fallenAnts) if (fa.carriedByAntId !== null && !ids.has(fa.carriedByAntId)) fa.carriedByAntId = null;
       for (const sp of this.sprouts) sp.y = this.grid.surfaceY[clamp(Math.floor(sp.x / CELL_SIZE), 0, GRID_W - 1)];
       this.sanitizeAntPositions();
+      this.buildHash();
       return true;
     } catch {
       return false;
